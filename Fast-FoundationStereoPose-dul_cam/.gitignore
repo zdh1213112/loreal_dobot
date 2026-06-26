@@ -1,0 +1,61 @@
+# Python/cache/editor artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+*.vscode
+.codex
+.claude/
+
+# Ignore weight files but keep required FFS config
+weights/**
+!weights/
+!weights/.gitkeep
+!weights/23-36-37/
+!weights/23-36-37/cfg.yaml
+
+# SAM2 checkpoints (users download separately per README)
+SAM2_streaming/checkpoints/
+SAM2_streaming/__pycache__/
+SAM2_streaming/sam2/__pycache__/
+
+# Model weights and serialized artifacts
+*.pth
+*.pkl
+*.pt
+*.ts
+*.onnx
+*.engine
+*.ckpt
+*.safetensors
+
+# Temporary captures and generated media/point clouds
+DepthCamera_*.json
+DepthCapture_*.png
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+*.avi
+*.mov
+*.bag
+*.ply
+*.pcd
+
+# Local datasets and generated outputs
+d415_dataset/
+demo_data/
+output_docker/
+output/
+calibration/calib_imgs/
+
+# dul_cam runtime artifacts
+dul_cam/__pycache__/

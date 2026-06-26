@@ -1,0 +1,71 @@
+camera:
+  serial: "254622078230"
+  width: 1280
+  height: 720
+  fps: 30
+  min_depth_m: 0.15
+  max_depth_m: 1.60
+  depth_stride: 2
+  yolo_weights: "/home/zdh/yolo_one/yolo_easy_deploy/outputs/train/obb_demo-4/weights/best.pt"
+  yolo_conf: 0.50
+  target_selection: "leftmost_x"
+  depth_window_px: 4
+
+planner:
+  obstacle_clearance_m: 0.10
+  approach_offset_m: 0.12
+  step_size_m: 0.04
+  edge_resolution_m: 0.02
+  goal_tolerance_m: 0.03
+  max_iterations: 4000
+  goal_sample_rate: 0.20
+  workspace_margin_m: 0.08
+  start_exclusion_radius_m: 0.12
+  target_exclusion_radius_m: 0.05
+  pregrasp_exclusion_radius_m: 0.05
+  smoothing_passes: 200
+  random_seed: 7
+  remove_support_plane: true
+  support_plane_distance_threshold_m: 0.012
+  support_plane_normal_cos_threshold: 0.80
+  support_plane_min_points: 1500
+
+robot:
+  driver_root: "/home/zdh/dobot_nova5/_staging_dobot_nova5_driver"
+  ip: "192.168.111.102"
+  dashboard_port: 29999
+  feedback_port: 30004
+  startup_joint: [178.0, -7.60, 90.0, 2.40, -90.0, -1.50]
+  startup_speed: 35
+  auto_enable: false
+  go_to_start: false
+  linear_speed: 20
+  linear_acc: 40
+  joint_speed: 25
+  joint_acc: 40
+  use_robot_feedback_for_start: true
+  manual_start_cam_xyz: [0.0, 0.0, 0.45]
+  handeye_base_to_d435:
+    [
+      0.9938108, 0.10750777, -0.02796736, -0.02212362452,
+      0.10480691, -0.99087883, -0.08470334, 0.63295122513,
+      -0.03681853, 0.08124792, -0.99601364, 1.3125790433,
+      0.0, 0.0, 0.0, 1.0
+    ]
+  grasp_x_flip_deg: 180.0
+  grasp_pitch_bias_deg: 0.0
+  grasp_yaw_bias_deg: -90.0
+  grasp_roll_extra_deg: 0.0
+  auto_close_gripper_after_grasp: false
+  # dh_enable: false
+  dh_enable: true
+  dh_tool_identify: 1
+  dh_slave_id: 1
+  dh_force: 30
+  dh_grasp_force: 30
+  dh_max_opening_m: 0.095
+  dh_wait_timeout_s: 10.0
+
+ui:
+  preview_width: 960
+  preview_height: 540

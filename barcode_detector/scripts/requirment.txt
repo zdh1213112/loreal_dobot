@@ -1,0 +1,2 @@
+pip install onnx onnxslim onnxruntime -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install ultralytics torch torchvision

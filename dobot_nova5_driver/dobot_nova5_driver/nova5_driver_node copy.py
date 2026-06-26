@@ -1,0 +1,882 @@
+import math
+import os
+import sys
+import threading
+from typing import Optional
+
+import numpy as np
+import rclpy
+from geometry_msgs.msg import PoseStamped
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.node import Node
+
+if __package__ in (None, ""):
+    CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+    PACKAGE_ROOT = os.path.dirname(CURRENT_DIR)
+    if PACKAGE_ROOT not in sys.path:
+        sys.path.insert(0, PACKAGE_ROOT)
+    from dobot_nova5_driver.controller import DobotNova5Controller, ROBOT_MODE_TEXT, TcpPose
+else:
+    from .controller import DobotNova5Controller, ROBOT_MODE_TEXT, TcpPose
+
+try:
+    from PySide6 import QtCore
+    from PySide6.QtCore import QTimer, Signal
+    from PySide6.QtWidgets import (
+        QApplication,
+        QDoubleSpinBox,
+        QFormLayout,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QPushButton,
+        QScrollArea,
+        QSpinBox,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    QT_BINDING = "PySide6"
+except ImportError:
+    try:
+        from PyQt5 import QtCore
+        from PyQt5.QtCore import QTimer, pyqtSignal as Signal
+        from PyQt5.QtWidgets import (
+            QApplication,
+            QDoubleSpinBox,
+            QFormLayout,
+            QGridLayout,
+            QGroupBox,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QMainWindow,
+            QPushButton,
+            QScrollArea,
+            QSpinBox,
+            QVBoxLayout,
+            QWidget,
+        )
+
+        QT_BINDING = "PyQt5"
+    except ImportError:
+        from PySide2 import QtCore
+        from PySide2.QtCore import QTimer, Signal
+        from PySide2.QtWidgets import (
+            QApplication,
+            QDoubleSpinBox,
+            QFormLayout,
+            QGridLayout,
+            QGroupBox,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QMainWindow,
+            QPushButton,
+            QScrollArea,
+            QSpinBox,
+            QVBoxLayout,
+            QWidget,
+        )
+
+        QT_BINDING = "PySide2"
+
+
+POSE_AXES = ("X", "Y", "Z", "Rx", "Ry", "Rz")
+JOINT_AXES = ("J1", "J2", "J3", "J4", "J5", "J6")
+
+
+def quaternion_to_euler_deg(x: float, y: float, z: float, w: float) -> tuple[float, float, float]:
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.copysign(math.pi / 2.0, sinp)
+    else:
+        pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+
+def quaternion_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm == 0.0:
+        return np.eye(3, dtype=np.float64)
+    x /= norm
+    y /= norm
+    z /= norm
+    w /= norm
+
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def euler_deg_to_rotation_matrix(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    rx = math.radians(rx_deg)
+    ry = math.radians(ry_deg)
+    rz = math.radians(rz_deg)
+
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+
+    rx_mat = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
+    ry_mat = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
+    rz_mat = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return rz_mat @ ry_mat @ rx_mat
+
+
+def rotation_matrix_to_euler_deg(rot: np.ndarray) -> tuple[float, float, float]:
+    sy = -float(rot[2, 0])
+    sy = max(-1.0, min(1.0, sy))
+    pitch = math.asin(sy)
+    cos_pitch = math.cos(pitch)
+
+    if abs(cos_pitch) > 1e-8:
+        roll = math.atan2(float(rot[2, 1]), float(rot[2, 2]))
+        yaw = math.atan2(float(rot[1, 0]), float(rot[0, 0]))
+    else:
+        roll = 0.0
+        yaw = math.atan2(-float(rot[0, 1]), float(rot[1, 1]))
+
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+
+def make_transform(rotation: np.ndarray, translation_xyz: tuple[float, float, float]) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = np.array(translation_xyz, dtype=np.float64)
+    return transform
+
+
+def tcp_pose_to_transform(pose: TcpPose) -> np.ndarray:
+    rotation = euler_deg_to_rotation_matrix(pose.rx, pose.ry, pose.rz)
+    return make_transform(rotation, (pose.x, pose.y, pose.z))
+
+
+def pose_stamped_to_transform(msg: PoseStamped) -> np.ndarray:
+    quat = msg.pose.orientation
+    rotation = quaternion_to_rotation_matrix(quat.x, quat.y, quat.z, quat.w)
+    pos = msg.pose.position
+    return make_transform(rotation, (pos.x, pos.y, pos.z))
+
+
+def transform_to_tcp_pose(transform: np.ndarray) -> TcpPose:
+    rotation = transform[:3, :3]
+    x, y, z = transform[:3, 3]
+    rx_deg, ry_deg, rz_deg = rotation_matrix_to_euler_deg(rotation)
+    return TcpPose(x=float(x), y=float(y), z=float(z), rx=rx_deg, ry=ry_deg, rz=rz_deg)
+
+
+class Nova5DriverNode(Node):
+    def __init__(self) -> None:
+        super().__init__("nova5_driver_node")
+
+        self.declare_parameter("robot_ip", "192.168.5.102")
+        self.declare_parameter("dashboard_port", 29999)
+        self.declare_parameter("feedback_port", 30004)
+        self.declare_parameter("go_to_start", False)
+        self.declare_parameter("auto_enable", False)
+        self.declare_parameter("startup_joint", [178.0, -7.60, 90.0, 2.40, -90.0, -1.50])
+        self.declare_parameter("startup_speed", 20)
+        self.declare_parameter("motion_topic", "/target_pose_tool")
+        self.declare_parameter("tcp_pose_topic", "/nova5/current_tcp_pose")
+        self.declare_parameter("linear_speed", 10)
+        self.declare_parameter("target_z_lift_m", 0.30)
+
+        self._controller = DobotNova5Controller(
+            robot_ip=self.get_parameter("robot_ip").value,
+            dashboard_port=int(self.get_parameter("dashboard_port").value),
+            feedback_port=int(self.get_parameter("feedback_port").value),
+            startup_joint=[float(v) for v in self.get_parameter("startup_joint").value],
+            startup_speed=int(self.get_parameter("startup_speed").value),
+        )
+        self._controller.connect(
+            go_to_start=bool(self.get_parameter("go_to_start").value),
+            auto_enable=bool(self.get_parameter("auto_enable").value),
+        )
+
+        self._latest_target_pose: Optional[TcpPose] = None
+        self._latest_target_source: str = "none"
+        self._latest_raw_target_pose: Optional[TcpPose] = None
+        self._latest_raw_frame_id: str = "none"
+        self._drag_enabled = False
+        self._coord_type = "user"
+        self._motion_lock = threading.Lock()
+        self._latest_pose_lock = threading.Lock()
+
+        self._tcp_pub = self.create_publisher(
+            PoseStamped,
+            self.get_parameter("tcp_pose_topic").value,
+            10,
+        )
+        self._pose_sub = self.create_subscription(
+            PoseStamped,
+            self.get_parameter("motion_topic").value,
+            self._target_pose_callback,
+            10,
+        )
+        self._timer = self.create_timer(0.1, self._publish_tcp_pose)
+
+        self.get_logger().info("Nova5 driver connected and ready.")
+
+    def destroy_node(self):
+        try:
+            self._controller.disconnect()
+        finally:
+            super().destroy_node()
+
+    def latest_target_pose(self) -> Optional[TcpPose]:
+        with self._latest_pose_lock:
+            if self._latest_target_pose is None:
+                return None
+            pose = self._latest_target_pose
+            return TcpPose(pose.x, pose.y, pose.z, pose.rx, pose.ry, pose.rz)
+
+    def set_latest_target_pose(self, pose: TcpPose, source: str) -> None:
+        with self._latest_pose_lock:
+            self._latest_target_pose = TcpPose(pose.x, pose.y, pose.z, pose.rx, pose.ry, pose.rz)
+            self._latest_target_source = source
+
+    def latest_raw_target_pose(self) -> Optional[TcpPose]:
+        with self._latest_pose_lock:
+            if self._latest_raw_target_pose is None:
+                return None
+            pose = self._latest_raw_target_pose
+            return TcpPose(pose.x, pose.y, pose.z, pose.rx, pose.ry, pose.rz)
+
+    def latest_raw_frame_id(self) -> str:
+        with self._latest_pose_lock:
+            return self._latest_raw_frame_id
+
+    def latest_target_source(self) -> str:
+        with self._latest_pose_lock:
+            return self._latest_target_source
+
+    def _store_raw_target_pose(self, pose: TcpPose, frame_id: str) -> None:
+        with self._latest_pose_lock:
+            self._latest_raw_target_pose = TcpPose(pose.x, pose.y, pose.z, pose.rx, pose.ry, pose.rz)
+            self._latest_raw_frame_id = frame_id
+
+    def execute_latest_target(self) -> None:
+        target = self.latest_target_pose()
+        if target is None:
+            raise RuntimeError("No latest target pose has been received yet")
+        with self._motion_lock:
+            self._controller.move_linear_tcp(
+                target,
+                speed=int(self.get_parameter("linear_speed").value),
+            )
+        self.get_logger().info(
+            f"Executed latest target x={target.x:.3f} y={target.y:.3f} z={target.z:.3f} "
+            f"rx={target.rx:.2f} ry={target.ry:.2f} rz={target.rz:.2f}"
+        )
+
+    def move_to_startup(self) -> None:
+        with self._motion_lock:
+            self._controller.move_to_startup()
+
+    def manual_move_linear(self, pose: TcpPose) -> None:
+        self.set_latest_target_pose(pose, "manual_target")
+        with self._motion_lock:
+            self._controller.move_linear_tcp(
+                pose,
+                speed=int(self.get_parameter("linear_speed").value),
+            )
+
+    def power_on(self) -> None:
+        self._controller.power_on()
+
+    def enable_robot(self) -> None:
+        self._controller.enable_robot()
+
+    def disable_robot(self) -> None:
+        self._controller.disable_robot()
+
+    def clear_error(self) -> None:
+        self._controller.clear_error()
+
+    def reset_robot(self) -> None:
+        self._controller.reset_robot()
+
+    def stop_motion(self) -> None:
+        self._controller.stop_motion()
+
+    def pause_motion(self) -> None:
+        self._controller.pause_motion()
+
+    def continue_motion(self) -> None:
+        self._controller.continue_motion()
+
+    def apply_speed_factor(self, speed: int) -> None:
+        self._controller.set_speed_factor(speed)
+
+    def set_user_index(self, index: int) -> None:
+        self._controller.set_user_index(index)
+
+    def set_tool_index(self, index: int) -> None:
+        self._controller.set_tool_index(index)
+
+    def set_coord_type(self, coord_type: str) -> None:
+        if coord_type not in ("user", "tool"):
+            raise ValueError(f"Unsupported coord_type: {coord_type}")
+        self._coord_type = coord_type
+
+    def toggle_drag(self) -> bool:
+        if self._drag_enabled:
+            self._controller.stop_drag()
+            self._drag_enabled = False
+        else:
+            self._controller.start_drag()
+            self._drag_enabled = True
+        return self._drag_enabled
+
+    def start_jog(self, axis_id: str, user: int = 0, tool: int = 0) -> None:
+        coord_type = 1 if self._coord_type == "user" else 2
+        self._controller.move_jog(axis_id=axis_id, coord_type=coord_type, user=user, tool=tool)
+
+    def stop_jog(self) -> None:
+        self._controller.move_jog("")
+
+    def read_current_pose(self) -> TcpPose:
+        return self._controller.read_pose()
+
+    def current_tcp_pose(self) -> TcpPose:
+        return self._controller.current_tcp_pose()
+
+    def current_joint(self) -> list[float]:
+        return self._controller.current_joint()
+
+    def robot_mode_text(self) -> str:
+        return ROBOT_MODE_TEXT.get(self._controller.robot_mode, str(self._controller.robot_mode))
+
+    def current_command_id(self) -> int:
+        return self._controller.current_command_id()
+
+    def _target_pose_callback(self, msg: PoseStamped) -> None:
+        raw_rx_deg, raw_ry_deg, raw_rz_deg = quaternion_to_euler_deg(
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+            msg.pose.orientation.w,
+        )
+        raw_target = TcpPose(
+            x=float(msg.pose.position.x),
+            y=float(msg.pose.position.y),
+            z=float(msg.pose.position.z),
+            rx=raw_rx_deg,
+            ry=raw_ry_deg,
+            rz=raw_rz_deg,
+        )
+        frame_id = msg.header.frame_id.strip() or "base"
+        self._store_raw_target_pose(raw_target, frame_id)
+
+        try:
+            if frame_id == "base":
+                target = raw_target
+                source = f"{self.get_parameter('motion_topic').value} [base]"
+            elif frame_id == "tool0":
+                current_tcp = self.current_tcp_pose()
+                base_tool = tcp_pose_to_transform(current_tcp)
+                tool_target = pose_stamped_to_transform(msg)
+                base_target = base_tool @ tool_target
+                target = transform_to_tcp_pose(base_target)
+                source = f"{self.get_parameter('motion_topic').value} [tool0->base]"
+            else:
+                self.get_logger().error(
+                    f"Unsupported frame_id '{frame_id}'. Only 'base' and 'tool0' are supported."
+                )
+                return
+        except Exception as exc:
+            self.get_logger().error(f"Failed to convert target pose from {frame_id} to base: {exc}")
+            return
+
+        # Raise the final base-frame execution target by a fixed Z offset.
+        z_lift_m = float(self.get_parameter("target_z_lift_m").value)
+        target = TcpPose(
+            x=target.x,
+            y=target.y,
+            z=target.z + z_lift_m,
+            rx=target.rx,
+            ry=target.ry,
+            rz=target.rz,
+        )
+
+        self.set_latest_target_pose(target, source)
+        self.get_logger().info(
+            f"Received target frame={frame_id}, cached base target: "
+            f"x={target.x:.3f} y={target.y:.3f} z={target.z:.3f} "
+            f"rx={target.rx:.2f} ry={target.ry:.2f} rz={target.rz:.2f}"
+        )
+
+    def _publish_tcp_pose(self) -> None:
+        try:
+            tcp = self.current_tcp_pose()
+        except Exception:
+            return
+
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base"
+        msg.pose.position.x = tcp.x
+        msg.pose.position.y = tcp.y
+        msg.pose.position.z = tcp.z
+        msg.pose.orientation.x = 0.0
+        msg.pose.orientation.y = 0.0
+        msg.pose.orientation.z = 0.0
+        msg.pose.orientation.w = 1.0
+        self._tcp_pub.publish(msg)
+
+
+class WorkerThread(QtCore.QThread):
+    finished = Signal(bool, str, object)
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self) -> None:
+        try:
+            result = self._fn(*self._args, **self._kwargs)
+        except Exception as exc:
+            self.finished.emit(False, str(exc), None)
+            return
+        self.finished.emit(True, "OK", result)
+
+
+class Nova5ControlWindow(QMainWindow):
+    def __init__(self, node: Nova5DriverNode):
+        super().__init__()
+        self.node = node
+        self._worker: Optional[WorkerThread] = None
+
+        self.pose_display_edits: dict[str, QLineEdit] = {}
+        self.joint_display_edits: dict[str, QLineEdit] = {}
+        self.target_spinboxes: dict[str, QDoubleSpinBox] = {}
+        self.latest_target_edits: dict[str, QLineEdit] = {}
+        self.latest_raw_target_edits: dict[str, QLineEdit] = {}
+
+        self.setWindowTitle("Nova5 Driver Control")
+        self.resize(1080, 760)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QHBoxLayout(central)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
+
+        self._build_status_group(left_layout)
+        self._build_command_group(left_layout)
+        self._build_feedback_group(left_layout)
+        self._build_latest_raw_target_group(left_layout)
+        self._build_latest_target_group(left_layout)
+        self._build_target_group(left_layout)
+        self._build_test_group(left_layout)
+        left_layout.addStretch(1)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+        right_layout.setSpacing(8)
+        self._build_jog_group(right_layout)
+        self._build_log_group(right_layout)
+        right_layout.addStretch(1)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left_panel)
+
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setWidget(right_panel)
+
+        root_layout.addWidget(left_scroll, 3)
+        root_layout.addWidget(right_scroll, 2)
+
+        self._ui_timer = QTimer(self)
+        self._ui_timer.setInterval(200)
+        self._ui_timer.timeout.connect(self.refresh_ui)
+        self._ui_timer.start()
+        self.refresh_ui()
+
+    def _build_status_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("Nova5 状态")
+        layout = QFormLayout(box)
+
+        self.ip_label = QLabel(self.node.get_parameter("robot_ip").value)
+        self.mode_label = QLabel("-")
+        self.command_id_label = QLabel("-")
+        self.topic_label = QLabel(self.node.get_parameter("motion_topic").value)
+        self.coord_label = QLabel("user")
+        self.qt_binding_label = QLabel(QT_BINDING)
+
+        layout.addRow("机械臂 IP", self.ip_label)
+        layout.addRow("RobotMode", self.mode_label)
+        layout.addRow("当前命令 ID", self.command_id_label)
+        layout.addRow("订阅话题", self.topic_label)
+        layout.addRow("点动坐标系", self.coord_label)
+        layout.addRow("Qt 绑定", self.qt_binding_label)
+        parent_layout.addWidget(box)
+
+    def _build_command_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("基础控制")
+        layout = QGridLayout(box)
+
+        self.speed_factor_spin = QSpinBox()
+        self.speed_factor_spin.setRange(1, 100)
+        self.speed_factor_spin.setValue(20)
+        self.user_index_spin = QSpinBox()
+        self.user_index_spin.setRange(0, 9)
+        self.tool_index_spin = QSpinBox()
+        self.tool_index_spin.setRange(0, 9)
+
+        self.power_button = QPushButton("上电")
+        self.enable_button = QPushButton("使能")
+        self.disable_button = QPushButton("下使能")
+        self.clear_error_button = QPushButton("清错")
+        self.reset_button = QPushButton("复位")
+        self.stop_button = QPushButton("停止")
+        self.pause_button = QPushButton("暂停")
+        self.continue_button = QPushButton("继续")
+        self.drag_button = QPushButton("进入拖拽")
+        self.read_pose_button = QPushButton("读取姿态")
+        self.sync_target_button = QPushButton("当前值写入目标")
+        self.apply_speed_button = QPushButton("下发速度")
+        self.user_coord_button = QPushButton("点动坐标: User")
+        self.tool_coord_button = QPushButton("点动坐标: Tool")
+        self.go_home_button = QPushButton("回初始位姿")
+
+        layout.addWidget(self.power_button, 0, 0)
+        layout.addWidget(self.enable_button, 0, 1)
+        layout.addWidget(self.disable_button, 0, 2)
+        layout.addWidget(self.clear_error_button, 1, 0)
+        layout.addWidget(self.reset_button, 1, 1)
+        layout.addWidget(self.stop_button, 1, 2)
+        layout.addWidget(self.pause_button, 2, 0)
+        layout.addWidget(self.continue_button, 2, 1)
+        layout.addWidget(self.drag_button, 2, 2)
+
+        layout.addWidget(QLabel("速度 %"), 3, 0)
+        layout.addWidget(self.speed_factor_spin, 3, 1)
+        layout.addWidget(self.apply_speed_button, 3, 2)
+        layout.addWidget(QLabel("User"), 4, 0)
+        layout.addWidget(self.user_index_spin, 4, 1)
+        layout.addWidget(QLabel("Tool"), 5, 0)
+        layout.addWidget(self.tool_index_spin, 5, 1)
+        layout.addWidget(self.user_coord_button, 4, 2)
+        layout.addWidget(self.tool_coord_button, 5, 2)
+        layout.addWidget(self.read_pose_button, 6, 0)
+        layout.addWidget(self.sync_target_button, 6, 1)
+        layout.addWidget(self.go_home_button, 6, 2)
+
+        self.power_button.clicked.connect(lambda: self.run_action("PowerOn", self.node.power_on))
+        self.enable_button.clicked.connect(lambda: self.run_action("EnableRobot", self.node.enable_robot))
+        self.disable_button.clicked.connect(lambda: self.run_action("DisableRobot", self.node.disable_robot))
+        self.clear_error_button.clicked.connect(lambda: self.run_action("ClearError", self.node.clear_error))
+        self.reset_button.clicked.connect(lambda: self.run_action("ResetRobot", self.node.reset_robot))
+        self.stop_button.clicked.connect(lambda: self.run_action("Stop", self.node.stop_motion))
+        self.pause_button.clicked.connect(lambda: self.run_action("Pause", self.node.pause_motion))
+        self.continue_button.clicked.connect(lambda: self.run_action("Continue", self.node.continue_motion))
+        self.drag_button.clicked.connect(self.toggle_drag)
+        self.read_pose_button.clicked.connect(self.sync_feedback_to_target)
+        self.sync_target_button.clicked.connect(self.sync_feedback_to_target)
+        self.apply_speed_button.clicked.connect(
+            lambda: self.run_action(
+                "SpeedFactor",
+                self.node.apply_speed_factor,
+                int(self.speed_factor_spin.value()),
+            )
+        )
+        self.user_coord_button.clicked.connect(lambda: self.set_coord_type("user"))
+        self.tool_coord_button.clicked.connect(lambda: self.set_coord_type("tool"))
+        self.go_home_button.clicked.connect(lambda: self.run_action("MoveToStartup", self.node.move_to_startup))
+
+        parent_layout.addWidget(box)
+
+    def _build_feedback_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("当前位姿")
+        layout = QHBoxLayout(box)
+
+        tcp_box = QGroupBox("TCP")
+        tcp_layout = QFormLayout(tcp_box)
+        for axis in POSE_AXES:
+            edit = QLineEdit("0.000")
+            edit.setReadOnly(True)
+            self.pose_display_edits[axis] = edit
+            tcp_layout.addRow(axis, edit)
+
+        joint_box = QGroupBox("关节")
+        joint_layout = QFormLayout(joint_box)
+        for axis in JOINT_AXES:
+            edit = QLineEdit("0.000")
+            edit.setReadOnly(True)
+            self.joint_display_edits[axis] = edit
+            joint_layout.addRow(axis, edit)
+
+        layout.addWidget(tcp_box)
+        layout.addWidget(joint_box)
+        parent_layout.addWidget(box)
+
+    def _build_latest_target_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("最新订阅目标(Base执行值)")
+        layout = QFormLayout(box)
+
+        self.latest_target_source_label = QLabel("none")
+        layout.addRow("来源", self.latest_target_source_label)
+
+        for axis in POSE_AXES:
+            edit = QLineEdit("0.000")
+            edit.setReadOnly(True)
+            self.latest_target_edits[axis] = edit
+            layout.addRow(axis, edit)
+
+        parent_layout.addWidget(box)
+
+    def _build_latest_raw_target_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("最新订阅原始值")
+        layout = QFormLayout(box)
+
+        self.latest_raw_frame_label = QLabel("none")
+        layout.addRow("frame_id", self.latest_raw_frame_label)
+
+        for axis in POSE_AXES:
+            edit = QLineEdit("0.000")
+            edit.setReadOnly(True)
+            self.latest_raw_target_edits[axis] = edit
+            layout.addRow(axis, edit)
+
+        parent_layout.addWidget(box)
+
+    def _build_target_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("手动目标位姿")
+        layout = QGridLayout(box)
+
+        for row, axis in enumerate(POSE_AXES):
+            spin = QDoubleSpinBox()
+            spin.setDecimals(3)
+            if row < 3:
+                spin.setRange(-2.0, 2.0)
+                spin.setSingleStep(0.005)
+            else:
+                spin.setRange(-360.0, 360.0)
+                spin.setSingleStep(1.0)
+            self.target_spinboxes[axis] = spin
+            layout.addWidget(QLabel(axis), row, 0)
+            layout.addWidget(spin, row, 1)
+
+        self.movl_button = QPushButton("MovL 到手动目标")
+        self.write_latest_button = QPushButton("最新订阅值写入手动目标")
+        self.movl_button.clicked.connect(self.execute_manual_target)
+        self.write_latest_button.clicked.connect(self.copy_latest_to_manual_target)
+
+        layout.addWidget(self.write_latest_button, 6, 0)
+        layout.addWidget(self.movl_button, 6, 1)
+        parent_layout.addWidget(box)
+
+    def _build_test_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("测试执行")
+        layout = QVBoxLayout(box)
+
+        self.test_execute_button = QPushButton("测试执行最新订阅目标")
+        self.test_execute_button.clicked.connect(
+            lambda: self.run_action("ExecuteLatestTarget", self.node.execute_latest_target)
+        )
+
+        tip = QLabel("只有点击这个按钮，机械臂才会执行最近一次订阅到的目标位姿。")
+        tip.setWordWrap(True)
+
+        layout.addWidget(self.test_execute_button)
+        layout.addWidget(tip)
+        parent_layout.addWidget(box)
+
+    def _build_jog_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("XYZRxRyRz 点动")
+        layout = QGridLayout(box)
+        layout.addWidget(QLabel("按下开始点动，松开停止。"), 0, 0, 1, 3)
+
+        for row, axis in enumerate(POSE_AXES, start=1):
+            minus_btn = QPushButton(f"{axis}-")
+            plus_btn = QPushButton(f"{axis}+")
+            minus_btn.pressed.connect(lambda a=f"{axis}-": self.start_jog(a))
+            minus_btn.released.connect(self.stop_jog)
+            plus_btn.pressed.connect(lambda a=f"{axis}+": self.start_jog(a))
+            plus_btn.released.connect(self.stop_jog)
+            layout.addWidget(QLabel(axis), row, 0)
+            layout.addWidget(minus_btn, row, 1)
+            layout.addWidget(plus_btn, row, 2)
+
+        parent_layout.addWidget(box)
+
+    def _build_log_group(self, parent_layout: QVBoxLayout) -> None:
+        box = QGroupBox("运行信息")
+        layout = QVBoxLayout(box)
+        self.message_label = QLabel("ready")
+        self.message_label.setWordWrap(True)
+        layout.addWidget(self.message_label)
+        parent_layout.addWidget(box)
+
+    def run_action(self, name: str, fn, *args) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self.set_message(f"{name} ignored: previous action still running")
+            return
+        self.set_message(f"{name} running...")
+        self._worker = WorkerThread(fn, *args)
+        self._worker.finished.connect(lambda ok, msg, result, n=name: self._on_action_finished(n, ok, msg, result))
+        self._worker.start()
+
+    def _on_action_finished(self, name: str, ok: bool, msg: str, result: object) -> None:
+        if ok and name == "ToggleDrag":
+            enabled = bool(result)
+            self.drag_button.setText("退出拖拽" if enabled else "进入拖拽")
+        if ok:
+            self.set_message(f"{name} finished")
+        else:
+            self.set_message(f"{name} failed: {msg}")
+        self.refresh_ui()
+
+    def set_message(self, text: str) -> None:
+        self.message_label.setText(text)
+
+    def toggle_drag(self) -> None:
+        self.run_action("ToggleDrag", self.node.toggle_drag)
+
+    def set_coord_type(self, coord_type: str) -> None:
+        self.node.set_coord_type(coord_type)
+        self.coord_label.setText(coord_type)
+        self.set_message(f"Jog coord type set to {coord_type}")
+
+    def sync_feedback_to_target(self) -> None:
+        try:
+            pose = self.node.read_current_pose()
+        except Exception as exc:
+            self.set_message(f"Read current pose failed: {exc}")
+            return
+        self._set_manual_target(pose)
+        self.set_message("Current pose written into manual target")
+
+    def copy_latest_to_manual_target(self) -> None:
+        pose = self.node.latest_target_pose()
+        if pose is None:
+            self.set_message("No latest target received")
+            return
+        self._set_manual_target(pose)
+        self.set_message("Latest subscribed target written into manual target")
+
+    def execute_manual_target(self) -> None:
+        pose = self._manual_target_pose()
+        self.run_action("ManualMovL", self.node.manual_move_linear, pose)
+
+    def start_jog(self, axis_id: str) -> None:
+        user = int(self.user_index_spin.value())
+        tool = int(self.tool_index_spin.value())
+        try:
+            self.node.start_jog(axis_id, user=user, tool=tool)
+        except Exception as exc:
+            self.set_message(f"Start jog failed: {exc}")
+
+    def stop_jog(self) -> None:
+        try:
+            self.node.stop_jog()
+        except Exception as exc:
+            self.set_message(f"Stop jog failed: {exc}")
+
+    def _manual_target_pose(self) -> TcpPose:
+        return TcpPose(
+            x=float(self.target_spinboxes["X"].value()),
+            y=float(self.target_spinboxes["Y"].value()),
+            z=float(self.target_spinboxes["Z"].value()),
+            rx=float(self.target_spinboxes["Rx"].value()),
+            ry=float(self.target_spinboxes["Ry"].value()),
+            rz=float(self.target_spinboxes["Rz"].value()),
+        )
+
+    def _set_manual_target(self, pose: TcpPose) -> None:
+        self.target_spinboxes["X"].setValue(pose.x)
+        self.target_spinboxes["Y"].setValue(pose.y)
+        self.target_spinboxes["Z"].setValue(pose.z)
+        self.target_spinboxes["Rx"].setValue(pose.rx)
+        self.target_spinboxes["Ry"].setValue(pose.ry)
+        self.target_spinboxes["Rz"].setValue(pose.rz)
+
+    def refresh_ui(self) -> None:
+        self.mode_label.setText(self.node.robot_mode_text())
+        self.command_id_label.setText(str(self.node.current_command_id()))
+        self.coord_label.setText(self.node._coord_type)
+
+        try:
+            tcp = self.node.current_tcp_pose()
+            tcp_values = (tcp.x, tcp.y, tcp.z, tcp.rx, tcp.ry, tcp.rz)
+            for axis, value in zip(POSE_AXES, tcp_values):
+                self.pose_display_edits[axis].setText(f"{value:.3f}")
+        except Exception:
+            pass
+
+        try:
+            joints = self.node.current_joint()
+            for axis, value in zip(JOINT_AXES, joints):
+                self.joint_display_edits[axis].setText(f"{value:.3f}")
+        except Exception:
+            pass
+
+        latest = self.node.latest_target_pose()
+        if latest is not None:
+            latest_values = (latest.x, latest.y, latest.z, latest.rx, latest.ry, latest.rz)
+            for axis, value in zip(POSE_AXES, latest_values):
+                self.latest_target_edits[axis].setText(f"{value:.3f}")
+        self.latest_target_source_label.setText(self.node.latest_target_source())
+
+        raw_latest = self.node.latest_raw_target_pose()
+        if raw_latest is not None:
+            raw_values = (raw_latest.x, raw_latest.y, raw_latest.z, raw_latest.rx, raw_latest.ry, raw_latest.rz)
+            for axis, value in zip(POSE_AXES, raw_values):
+                self.latest_raw_target_edits[axis].setText(f"{value:.3f}")
+        self.latest_raw_frame_label.setText(self.node.latest_raw_frame_id())
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = Nova5DriverNode()
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    window = Nova5ControlWindow(node)
+    window.show()
+
+    try:
+        exec_fn = getattr(app, "exec", None)
+        if exec_fn is None:
+            exec_fn = app.exec_
+        exec_fn()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+        spin_thread.join(timeout=1.0)
+
+
+if __name__ == "__main__":
+    main()
