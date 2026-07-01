@@ -8,6 +8,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(realsense2 REQUIRED)
 find_library(ZBAR_LIBRARY zbar)
@@ -46,7 +47,10 @@ endforeach()
 install(PROGRAMS
   scripts/d405_yolo_barcode_node3_pt_flex.py
   scripts/d405_yolo_barcode_node3_pt_flex_filtered.py
+  scripts/d405_yolo_barcode_node3_pt_flex_lowglare_panel.py
   scripts/d405_yolo_pt_common.py
+  scripts/d405_yolo_pt_common_lowglare_panel.py
+  scripts/vision_panel_viewer.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
