@@ -220,6 +220,7 @@ class D405YoloPtBase(Node):
         self.get_logger().info(f"YOLO .pt 模型加载成功: {self.model_path}")
 
         self.pipeline = rs.pipeline()
+        self.pipeline_started = False
         self.color_sensor = None
         config = rs.config()
         if self.camera_sn:
@@ -231,12 +232,11 @@ class D405YoloPtBase(Node):
 
         try:
             profile = self.pipeline.start(config)
+            self.pipeline_started = True
             for sensor in profile.get_device().query_sensors():
                 if sensor.supports(rs.option.enable_auto_exposure):
                     self.color_sensor = sensor
                     self.apply_camera_exposure_settings(sensor)
-                if sensor.supports(rs.option.enable_auto_white_balance):
-                    sensor.set_option(rs.option.enable_auto_white_balance, 1.0 if self.auto_white_balance else 0.0)
             self.get_logger().info(startup_label)
         except Exception as exc:
             self.get_logger().error(f"相机启动失败: {exc}")
@@ -303,10 +303,12 @@ class D405YoloPtBase(Node):
         self.get_logger().info(f"当前手动曝光: exposure={self.exposure:.1f} gain={self.gain:.1f}")
 
     def destroy_node(self) -> bool:
-        try:
-            self.pipeline.stop()
-        except Exception:
-            pass
+        if self.pipeline_started:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+            self.pipeline_started = False
         if self.show and self.standalone_window:
             cv2.destroyAllWindows()
         return super().destroy_node()
@@ -474,9 +476,17 @@ class D405YoloPtBase(Node):
         return True
 
     def get_latest_color_frame(self):
+        if not self.pipeline_started:
+            return None
+
         frames = None
         for _ in range(self.drain_frames):
-            polled = self.pipeline.poll_for_frames()
+            try:
+                polled = self.pipeline.poll_for_frames()
+            except RuntimeError as exc:
+                self.get_logger().warn(f"RealSense 取帧失败，pipeline 未就绪: {exc}")
+                self.pipeline_started = False
+                return None
             if not polled:
                 break
             frames = polled
@@ -488,7 +498,12 @@ class D405YoloPtBase(Node):
                 return None
 
             for _ in range(self.drain_frames - 1):
-                polled = self.pipeline.poll_for_frames()
+                try:
+                    polled = self.pipeline.poll_for_frames()
+                except RuntimeError as exc:
+                    self.get_logger().warn(f"RealSense 取帧失败，pipeline 未就绪: {exc}")
+                    self.pipeline_started = False
+                    return None
                 if not polled:
                     break
                 frames = polled

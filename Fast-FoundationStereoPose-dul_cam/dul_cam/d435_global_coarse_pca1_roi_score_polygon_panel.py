@@ -81,7 +81,8 @@ class GlobalCoarseDetector(Node):
         self.depth_scale = self.profile.get_device().first_depth_sensor().get_depth_scale()
 
         logging.info("Loading YOLO-OBB model...")
-        self.yolo_model = YOLO("/home/zdh/yolo_one/yolo_easy_deploy/outputs/train/obb_demo-15/weights/best.pt")
+        # self.yolo_model = YOLO("/home/zdh/yolo_one/yolo_easy_deploy/outputs/train/obb_demo-15/weights/best.pt")
+        self.yolo_model = YOLO("/home/zdh/yolo_one/yolo_train_xense_load_image/outputs/train/obb_demo625/weights/best.pt")
         logging.info("D435 全局检测节点已启动！正在监控传送带...")
 
     def choose_best_target(self, centers_x, centers_y, obbs, valid_indices):

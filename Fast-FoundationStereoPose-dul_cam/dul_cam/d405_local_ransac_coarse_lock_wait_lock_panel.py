@@ -86,6 +86,7 @@ locked_target_pose_msg = None
 locked_target_msg_time = 0.0
 LOCK_WAIT_TIMEOUT_S = 0.35
 LOCK_FRESHNESS_WINDOW_S = 1.5
+YOLO_BOX_DISPLAY_TTL_S = 0.5
 
 def trigger_callback(msg):
     global global_trigger_flag
@@ -325,6 +326,7 @@ sam2_initialized = need_reset = False
 last_yolo_obbs = None
 last_best_idx = -1
 last_locked_target_uv = None
+last_yolo_obbs_time = 0.0
 
 def project_locked_target_to_pixel():
     if locked_target_pose_msg is None:
@@ -432,6 +434,7 @@ try:
                 
                 last_yolo_obbs = obbs.xyxyxyxy.cpu().numpy()
                 last_best_idx = best_idx
+                last_yolo_obbs_time = time.time()
 
                 corners = last_yolo_obbs[best_idx]
                 x1, y1 = np.min(corners, axis=0)
@@ -445,6 +448,7 @@ try:
                 logging.warning("❌ 精定位失败：YOLO 未能在画面中检测到目标。")
                 last_yolo_obbs = None
                 last_best_idx = -1
+                last_yolo_obbs_time = 0.0
                 
             global_trigger_flag = False
         # =========================================================
@@ -489,6 +493,11 @@ try:
             display = cv2.addWeighted(display, 1 - MASK_ALPHA, overlay, MASK_ALPHA, 0)
             contours, _ = cv2.findContours(current_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(display, contours, -1, (0, 255, 0), 2)
+
+        if last_yolo_obbs is not None and time.time() - last_yolo_obbs_time > YOLO_BOX_DISPLAY_TTL_S:
+            last_yolo_obbs = None
+            last_best_idx = -1
+            last_yolo_obbs_time = 0.0
 
         if last_yolo_obbs is not None:
             for i, corners in enumerate(last_yolo_obbs):
