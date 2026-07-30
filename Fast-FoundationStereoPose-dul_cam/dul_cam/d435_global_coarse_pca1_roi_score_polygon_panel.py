@@ -9,7 +9,9 @@
 
 import json
 import time
+import threading
 import rclpy
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Vector3Stamped, PoseArray, Pose
 from sensor_msgs.msg import CompressedImage
@@ -316,7 +318,6 @@ class GlobalCoarseDetector(Node):
         
         try:
             while rclpy.ok() and not self.quit_requested:
-                rclpy.spin_once(self, timeout_sec=0)
                 frames = self.pipeline.wait_for_frames()
                 color_frame = frames.get_color_frame()
                 depth_frame = frames.get_depth_frame()
@@ -567,9 +568,17 @@ class GlobalCoarseDetector(Node):
 def main():
     rclpy.init()
     node = GlobalCoarseDetector()
-    node.run()
-    node.destroy_node()
-    rclpy.shutdown()
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    try:
+        node.run()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+        spin_thread.join(timeout=1.0)
 
 if __name__ == '__main__':
     main()

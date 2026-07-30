@@ -19,11 +19,23 @@ if __package__ in (None, ""):
     if PACKAGE_ROOT not in sys.path:
         sys.path.insert(0, PACKAGE_ROOT)
     from dobot_nova5_driver.controller import DobotNova5Controller, ROBOT_MODE_TEXT, TcpPose
-    from dobot_nova5_driver.dobot_dh_api import DobotDHConfig, DHGripper, raise_if_error
+    from dobot_nova5_driver.dobot_dh_api import (
+        GRIP_GRIPPED,
+        GRIP_IN_MOTION,
+        DobotDHConfig,
+        DHGripper,
+        raise_if_error,
+    )
     from dobot_nova5_driver.TCP_IP_Python_V4.dobot_api import DobotApiDashboard
 else:
     from .controller import DobotNova5Controller, ROBOT_MODE_TEXT, TcpPose
-    from .dobot_dh_api import DobotDHConfig, DHGripper, raise_if_error
+    from .dobot_dh_api import (
+        GRIP_GRIPPED,
+        GRIP_IN_MOTION,
+        DobotDHConfig,
+        DHGripper,
+        raise_if_error,
+    )
     from .TCP_IP_Python_V4.dobot_api import DobotApiDashboard
 
 try:
@@ -241,6 +253,8 @@ class Nova5DriverNode(Node):
         self.declare_parameter("command_tool_index", 1)
         self.declare_parameter("default_post_grasp_pose_tool_index", 0)
         self.declare_parameter("fine_tool_to_flange_z_m", 0.2285) # 末端D405抓取时，夹爪尖端到法兰中心Z差值
+        self.declare_parameter("fine_grasp_depth_offset_m", -0.008) #负值更深，正值更浅
+        self.declare_parameter("fine_grasp_depth_offset_limit_m", 0.030)
         self.declare_parameter("camera_frame_id", "camera_d405_link")
         self.declare_parameter("coarse_camera_frame_id", "camera_d435_link")
         self.declare_parameter("coarse_hover_z_m", 0.10)  # 粗定位时，夹爪尖端停在目标上方27cm
@@ -249,12 +263,44 @@ class Nova5DriverNode(Node):
         self.declare_parameter("coarse_grasp_pitch_bias_deg", -0.0)
         self.declare_parameter("coarse_grasp_x_flip_deg", 180.0)
         self.declare_parameter("trigger_d405_topic", "/trigger_d405_vision")
+        self.declare_parameter("d405_tracking_snapshot_topic", "/capture_d405_tracking_snapshot")
         self.declare_parameter("gripper_width_topic", "/gripper_target_width")
+        self.declare_parameter("gripper_width_command_deadband_m", 0.0005)
+        self.declare_parameter("gripper_width_command_min_interval_s", 0.5)
+        self.declare_parameter("clearance_push_topic", "/d405/grasp_clearance_push_cam")
+        self.declare_parameter("clearance_contact_topic", "/d405/grasp_clearance_contact_cam")
+        self.declare_parameter("clearance_push_enabled", True)
+        self.declare_parameter("clearance_push_dry_run", False)
+        self.declare_parameter("clearance_result_timeout_s", 2.0)
+        self.declare_parameter("clearance_safe_vector_m", 0.002)
+        self.declare_parameter("clearance_max_push_m", 0.030)
+        self.declare_parameter("clearance_max_sweep_m", 0.070)
+        self.declare_parameter("clearance_push_contact_lift_m", 0.020)
+        self.declare_parameter("clearance_pullback_contact_lift_m", 0.015)
+        self.declare_parameter("clearance_push_linear_speed", 8)
+        self.declare_parameter("clearance_contact_linear_speed", 15)
+        self.declare_parameter("clearance_pullback_linear_speed", 8)
+        self.declare_parameter("clearance_push_settle_s", 0.5)
+        self.declare_parameter("clearance_max_attempts", 5)
+        self.declare_parameter("clearance_post_push_sample_count", 2)
+        self.declare_parameter("clearance_post_push_sample_interval_s", 0.15)
+        self.declare_parameter("clearance_post_push_position_stability_threshold_m", 0.010)
+        self.declare_parameter("clearance_post_push_angle_stability_threshold_deg", 20.0)
+        self.declare_parameter("clearance_post_push_stability_retries", 1)
+        self.declare_parameter("clearance_post_push_stability_retry_delay_s", 0.15)
         # self.declare_parameter("dh_enable", False)
         self.declare_parameter("dh_enable", True) #dh夹爪上使能
         self.declare_parameter("dh_max_opening_m", 0.095)
         self.declare_parameter("dh_force", 30)
         self.declare_parameter("dh_grasp_force", 30)
+        self.declare_parameter("grasp_feedback_enabled", True)
+        self.declare_parameter("grasp_success_min_opening_m", 0.003)
+        self.declare_parameter("grasp_feedback_sample_count", 2)
+        self.declare_parameter("grasp_feedback_sample_interval_s", 0.05)
+        self.declare_parameter("grasp_feedback_settle_timeout_s", 1.0)
+        self.declare_parameter("grasp_feedback_stable_tolerance_m", 0.0005)
+        self.declare_parameter("grasp_validation_lift_m", 0.060)
+        self.declare_parameter("grasp_max_attempts", 2)
         self.declare_parameter("dh_slave_id", 1)
         self.declare_parameter("dh_tool_identify", 1)
         self.declare_parameter("dh_wait_timeout_s", 10.0)
@@ -308,9 +354,14 @@ class Nova5DriverNode(Node):
             "default_transfer_joint",
             [220.0, 12.60, 53.08, 21.70, -90.0, 43.20], #主臂102中转检查点关节角度
         )
+        self.declare_parameter("default_place_via_enabled", True)
+        self.declare_parameter(
+            "default_place_via_pose",
+            [-0.153, 0.432, 0.446, 177.157, -1.201, -2.342], #最终放置前的可达中间点
+        )
         self.declare_parameter(
             "default_place_pose",
-            [-0.153, 0.432, 0.446, 177.157, -1.201, -2.342], #放置位置
+            [-0.433, 0.557, 0.330, -174.7, -2.601, -1.242], #最终放置位置
         )
         self.declare_parameter("secondary_robot_enabled", True)
         self.declare_parameter("secondary_robot_ip", "192.168.111.101")
@@ -344,7 +395,7 @@ class Nova5DriverNode(Node):
             "handeye_base_to_d435",
             [
                 0.9938108, 0.10750777, -0.02796736, -0.1012362452,
-                0.10480691, -0.99087883, -0.08470334, 0.63295122513,
+                0.10480691, -0.99087883, -0.08470334, 0.645295122513,
                 -0.03681853, 0.08124792, -0.99601364, 1.3125790433,
                 0.0, 0.0, 0.0, 1.0,
             ],
@@ -393,6 +444,12 @@ class Nova5DriverNode(Node):
         self._dh_dashboard_is_shared = False
         self._dh_gripper: Optional[DHGripper] = None
         self._latest_gripper_target_width_m: Optional[float] = None
+        self._last_applied_gripper_width_m: Optional[float] = None
+        self._last_gripper_width_command_time = 0.0
+        self._latest_clearance_push_cam: Optional[np.ndarray] = None
+        self._latest_clearance_contact_cam: Optional[np.ndarray] = None
+        self._clearance_msg_count = 0
+        self._clearance_contact_msg_count = 0
         self._gripper_width_tracking_enabled = True
         self._coord_type = "user"
         self._active_robot_key = "primary"
@@ -436,6 +493,11 @@ class Nova5DriverNode(Node):
             self.get_parameter("trigger_d405_topic").value,
             10,
         )
+        self._d405_tracking_snapshot_pub = self.create_publisher(
+            Bool,
+            self.get_parameter("d405_tracking_snapshot_topic").value,
+            10,
+        )
         self._coarse_target_lock_pub = self.create_publisher(
             PoseStamped,
             self.get_parameter("coarse_target_lock_topic").value,
@@ -461,6 +523,18 @@ class Nova5DriverNode(Node):
             Float32,
             self.get_parameter("gripper_width_topic").value,
             self._gripper_target_width_callback,
+            10,
+        )
+        self._clearance_push_sub = self.create_subscription(
+            Vector3Stamped,
+            self.get_parameter("clearance_push_topic").value,
+            self._clearance_push_callback,
+            10,
+        )
+        self._clearance_contact_sub = self.create_subscription(
+            Vector3Stamped,
+            self.get_parameter("clearance_contact_topic").value,
+            self._clearance_contact_callback,
             10,
         )
         self._timer = self.create_timer(0.1, self._publish_tcp_pose)
@@ -737,10 +811,32 @@ class Nova5DriverNode(Node):
         with self._latest_pose_lock:
             return self._coarse_last_error
 
-    def _store_raw_target_pose(self, pose: TcpPose, frame_id: str) -> None:
+    def _store_received_target_pose(
+        self,
+        raw_pose: TcpPose,
+        frame_id: str,
+        base_pose: TcpPose,
+        source: str,
+    ) -> None:
         with self._latest_pose_lock:
-            self._latest_raw_target_pose = TcpPose(pose.x, pose.y, pose.z, pose.rx, pose.ry, pose.rz)
+            self._latest_raw_target_pose = TcpPose(
+                raw_pose.x,
+                raw_pose.y,
+                raw_pose.z,
+                raw_pose.rx,
+                raw_pose.ry,
+                raw_pose.rz,
+            )
             self._latest_raw_frame_id = frame_id
+            self._latest_target_pose = TcpPose(
+                base_pose.x,
+                base_pose.y,
+                base_pose.z,
+                base_pose.rx,
+                base_pose.ry,
+                base_pose.rz,
+            )
+            self._latest_target_source = source
             self._target_msg_count += 1
 
     def _store_raw_coarse_target_pose(self, pose: TcpPose, frame_id: str) -> None:
@@ -966,6 +1062,8 @@ class Nova5DriverNode(Node):
             wait=wait,
             timeout_s=float(self.get_parameter("dh_wait_timeout_s").value),
         )
+        self._last_applied_gripper_width_m = width_m
+        self._last_gripper_width_command_time = time.monotonic()
         self.get_logger().info(
             f"Applied gripper width target {width_m:.4f} m -> normalized={normalized:.3f} raw={int(round(normalized * 1000.0))}"
         )
@@ -980,6 +1078,8 @@ class Nova5DriverNode(Node):
             wait=wait,
             timeout_s=float(self.get_parameter("dh_wait_timeout_s").value),
         )
+        self._last_applied_gripper_width_m = 0.0
+        self._last_gripper_width_command_time = time.monotonic()
         self.get_logger().info(f"Closed DH gripper for grasp with force={grasp_force}.")
 
     def _open_gripper_fully(self, wait: bool = True) -> None:
@@ -990,7 +1090,122 @@ class Nova5DriverNode(Node):
             wait=wait,
             timeout_s=float(self.get_parameter("dh_wait_timeout_s").value),
         )
+        self._last_applied_gripper_width_m = float(self.get_parameter("dh_max_opening_m").value)
+        self._last_gripper_width_command_time = time.monotonic()
         self.get_logger().info("Opened DH gripper to full-open position.")
+
+    def _read_gripper_hold_feedback(self, label: str) -> tuple[float, int]:
+        if self._dh_gripper is None:
+            raise RuntimeError("DH gripper is not enabled or connected")
+        sample_count = max(1, int(self.get_parameter("grasp_feedback_sample_count").value))
+        sample_interval_s = max(
+            0.0,
+            float(self.get_parameter("grasp_feedback_sample_interval_s").value),
+        )
+        settle_timeout_s = max(
+            sample_interval_s,
+            float(self.get_parameter("grasp_feedback_settle_timeout_s").value),
+        )
+        stable_tolerance_m = max(
+            0.0,
+            float(self.get_parameter("grasp_feedback_stable_tolerance_m").value),
+        )
+        max_opening_m = float(self.get_parameter("dh_max_opening_m").value)
+        positions: list[float] = []
+        states: list[int] = []
+        stable_positions: list[float] = []
+        stable_states: list[int] = []
+        deadline = time.monotonic() + settle_timeout_s
+        while time.monotonic() < deadline:
+            positions.append(float(self._dh_gripper.read_position()))
+            states.append(int(self._dh_gripper.read_grip_state()))
+            if len(positions) >= sample_count:
+                candidate_positions = positions[-sample_count:]
+                candidate_states = states[-sample_count:]
+                position_span_m = (
+                    max(candidate_positions) - min(candidate_positions)
+                ) * max_opening_m
+                if (
+                    all(state != GRIP_IN_MOTION for state in candidate_states)
+                    and len(set(candidate_states)) == 1
+                    and position_span_m <= stable_tolerance_m
+                ):
+                    stable_positions = candidate_positions
+                    stable_states = candidate_states
+                    break
+            if sample_interval_s > 0.0:
+                time.sleep(sample_interval_s)
+
+        if not stable_positions:
+            stable_positions = positions[-sample_count:]
+            stable_states = states[-sample_count:]
+            self.get_logger().warning(
+                f"DH grasp feedback [{label}] did not settle within {settle_timeout_s:.2f}s; "
+                "using the final samples and treating any non-GRIP_GRIPPED result as failure."
+            )
+        normalized = float(np.median(np.asarray(stable_positions, dtype=np.float64)))
+        opening_m = normalized * max_opening_m
+        state = stable_states[-1]
+        self.get_logger().info(
+            f"DH grasp feedback [{label}]: opening={opening_m:.4f}m normalized={normalized:.3f} "
+            f"stable_positions={[round(value, 3) for value in stable_positions]} "
+            f"stable_states={stable_states}, all_positions={[round(value, 3) for value in positions]} "
+            f"all_states={states}."
+        )
+        return opening_m, state
+
+    def _read_gripper_hold_feedback_once(self, label: str) -> tuple[float, int]:
+        if self._dh_gripper is None:
+            raise RuntimeError("DH gripper is not enabled or connected")
+        normalized = float(self._dh_gripper.read_position())
+        state = int(self._dh_gripper.read_grip_state())
+        opening_m = normalized * float(self.get_parameter("dh_max_opening_m").value)
+        self.get_logger().info(
+            f"DH grasp quick feedback [{label}]: opening={opening_m:.4f}m "
+            f"normalized={normalized:.3f} state={state}."
+        )
+        return opening_m, state
+
+    def _gripper_object_held(self, label: str, wait_for_stable: bool = True) -> bool:
+        if self._dh_gripper is None or not bool(self.get_parameter("grasp_feedback_enabled").value):
+            return True
+        if wait_for_stable:
+            opening_m, state = self._read_gripper_hold_feedback(label)
+        else:
+            opening_m, state = self._read_gripper_hold_feedback_once(label)
+        min_opening_m = max(0.0, float(self.get_parameter("grasp_success_min_opening_m").value))
+        held = opening_m > min_opening_m and state == GRIP_GRIPPED
+        message = (
+            f"DH grasp {'PASS' if held else 'FAIL'} [{label}]: actual_opening={opening_m:.4f}m, "
+            f"required>{min_opening_m:.4f}m, grip_state={state}."
+        )
+        if held:
+            self.get_logger().info(message)
+        else:
+            self.get_logger().error(message)
+        return held
+
+    def _require_gripper_object_held(self, label: str) -> None:
+        # Transfer-stage checks happen after the gripper has already settled, so
+        # a single register snapshot is sufficient and avoids repeated delays.
+        if not self._gripper_object_held(label, wait_for_stable=False):
+            raise RuntimeError(
+                f"DH gripper no longer holds an object at stage '{label}'; "
+                "stopping all remaining secondary-arm, barcode, transfer and place motions."
+            )
+
+    def _lift_after_grasp_for_validation(self) -> None:
+        lift_m = max(0.0, float(self.get_parameter("grasp_validation_lift_m").value))
+        current = self.read_current_pose()
+        lifted = TcpPose(
+            current.x,
+            current.y,
+            current.z + lift_m,
+            current.rx,
+            current.ry,
+            current.rz,
+        )
+        self._move_linear_with_log(lifted, "Lifted grasp for DH hold validation")
 
     def test_gripper_open_close(self) -> None:
         if self._dh_gripper is None:
@@ -1007,6 +1222,13 @@ class Nova5DriverNode(Node):
             self._latest_gripper_target_width_m = width_m
         if self._dh_gripper is None or not self._gripper_width_tracking_enabled:
             return
+        deadband_m = max(0.0, float(self.get_parameter("gripper_width_command_deadband_m").value))
+        min_interval_s = max(0.0, float(self.get_parameter("gripper_width_command_min_interval_s").value))
+        if self._last_applied_gripper_width_m is not None:
+            width_delta_m = abs(width_m - self._last_applied_gripper_width_m)
+            elapsed_s = time.monotonic() - self._last_gripper_width_command_time
+            if width_delta_m < deadband_m or elapsed_s < min_interval_s:
+                return
         try:
             self._apply_gripper_target_width(width_m, wait=False)
         except Exception as exc:
@@ -1015,6 +1237,432 @@ class Nova5DriverNode(Node):
     def latest_gripper_target_width_m(self) -> Optional[float]:
         with self._latest_pose_lock:
             return self._latest_gripper_target_width_m
+
+    def _clearance_push_callback(self, msg: Vector3Stamped) -> None:
+        frame_id = msg.header.frame_id.strip()
+        if frame_id != self._camera_frame_id:
+            self.get_logger().error(
+                f"Ignoring clearance vector frame_id={frame_id!r}; expected {self._camera_frame_id!r}."
+            )
+            return
+        vector = np.array([msg.vector.x, msg.vector.y, msg.vector.z], dtype=np.float64)
+        if not np.isfinite(vector).all():
+            self.get_logger().error("Ignoring non-finite D405 clearance push vector.")
+            return
+        with self._latest_pose_lock:
+            self._latest_clearance_push_cam = vector
+            self._clearance_msg_count += 1
+
+    def _clearance_contact_callback(self, msg: Vector3Stamped) -> None:
+        frame_id = msg.header.frame_id.strip()
+        if frame_id != self._camera_frame_id:
+            return
+        vector = np.array([msg.vector.x, msg.vector.y, msg.vector.z], dtype=np.float64)
+        if not np.isfinite(vector).all():
+            return
+        with self._latest_pose_lock:
+            self._latest_clearance_contact_cam = vector
+            self._clearance_contact_msg_count += 1
+
+    def latest_clearance_contact_cam(self) -> Optional[np.ndarray]:
+        with self._latest_pose_lock:
+            if self._latest_clearance_contact_cam is None:
+                return None
+            return self._latest_clearance_contact_cam.copy()
+
+    def clearance_contact_msg_count(self) -> int:
+        with self._latest_pose_lock:
+            return self._clearance_contact_msg_count
+
+    def _wait_for_next_clearance_contact(self, previous_count: int, timeout_s: float) -> np.ndarray:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._latest_pose_lock:
+                if (
+                    self._clearance_contact_msg_count > previous_count
+                    and self._latest_clearance_contact_cam is not None
+                ):
+                    return self._latest_clearance_contact_cam.copy()
+            time.sleep(0.02)
+        raise TimeoutError(f"Timed out waiting for D405 clearance contact after count={previous_count}")
+
+    def clearance_msg_count(self) -> int:
+        with self._latest_pose_lock:
+            return self._clearance_msg_count
+
+    def _wait_for_next_clearance_push(self, previous_count: int, timeout_s: float) -> np.ndarray:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._latest_pose_lock:
+                if self._clearance_msg_count > previous_count and self._latest_clearance_push_cam is not None:
+                    return self._latest_clearance_push_cam.copy()
+            time.sleep(0.02)
+        raise TimeoutError(f"Timed out waiting for D405 clearance result after count={previous_count}")
+
+    def _camera_vector_to_base(self, vector_cam: np.ndarray) -> np.ndarray:
+        current_flange = self.current_flange_pose()
+        r_base_to_flange = tcp_pose_to_transform(current_flange)[:3, :3]
+        return r_base_to_flange @ self._handeye_flange_to_cam[:3, :3] @ vector_cam
+
+    def _clearance_push_required(self, vector_cam: np.ndarray) -> bool:
+        threshold_m = max(0.0, float(self.get_parameter("clearance_safe_vector_m").value))
+        return float(np.linalg.norm(vector_cam)) > threshold_m
+
+    def _execute_clearance_push(
+        self,
+        target: TcpPose,
+        contact_base: np.ndarray,
+        push_base: np.ndarray,
+    ) -> None:
+        requested_distance = float(np.linalg.norm(push_base))
+        contact_distance = float(np.linalg.norm(contact_base))
+        max_push_m = max(0.0, float(self.get_parameter("clearance_max_sweep_m").value))
+        if requested_distance <= 1e-9:
+            return
+        if contact_distance <= 1e-9 or contact_distance >= requested_distance:
+            raise RuntimeError(
+                "Invalid clearance geometry: neighbor contact must lie between the SAM center and final sweep point. "
+                f"contact={contact_distance:.4f}m final={requested_distance:.4f}m."
+            )
+        direction_alignment = float(np.dot(contact_base, push_base) / (contact_distance * requested_distance))
+        if direction_alignment < 0.99:
+            raise RuntimeError(
+                "Invalid clearance geometry: contact and final sweep vectors are not collinear. "
+                f"alignment={direction_alignment:.4f}."
+            )
+        if requested_distance > max_push_m:
+            raise RuntimeError(
+                "Clearance sweep exceeds configured maximum; refusing a truncated motion. "
+                f"requested={requested_distance:.4f}m max={max_push_m:.4f}m."
+            )
+
+        current_tcp = self.read_current_pose()
+        hover_pose = TcpPose(target.x, target.y, current_tcp.z, target.rx, target.ry, target.rz)
+        contact_lift_m = max(0.0, float(self.get_parameter("clearance_push_contact_lift_m").value))
+        pullback_lift_m = max(
+            0.0,
+            float(self.get_parameter("clearance_pullback_contact_lift_m").value),
+        )
+        if pullback_lift_m >= contact_lift_m:
+            raise RuntimeError(
+                "Clearance pullback height must be lower than outward-push height: "
+                f"pullback_lift={pullback_lift_m:.4f}m push_lift={contact_lift_m:.4f}m."
+            )
+        contact_pose = TcpPose(target.x, target.y, target.z + contact_lift_m, target.rx, target.ry, target.rz)
+        neighbor_contact_pose = TcpPose(
+            contact_pose.x + float(contact_base[0]),
+            contact_pose.y + float(contact_base[1]),
+            contact_pose.z + float(contact_base[2]),
+            target.rx,
+            target.ry,
+            target.rz,
+        )
+        pushed_pose = TcpPose(
+            contact_pose.x + float(push_base[0]),
+            contact_pose.y + float(push_base[1]),
+            contact_pose.z + float(push_base[2]),
+            target.rx,
+            target.ry,
+            target.rz,
+        )
+        lowered_at_push_end_pose = TcpPose(
+            pushed_pose.x,
+            pushed_pose.y,
+            target.z + pullback_lift_m,
+            target.rx,
+            target.ry,
+            target.rz,
+        )
+        pullback_center_pose = TcpPose(
+            target.x,
+            target.y,
+            target.z + pullback_lift_m,
+            target.rx,
+            target.ry,
+            target.rz,
+        )
+        self.get_logger().warning(
+            "Clearance push-pull planned (high outward sweep -> lower return to SAM center): "
+            f"contact_delta=({contact_base[0]:.4f}, {contact_base[1]:.4f}, {contact_base[2]:.4f})m, "
+            f"final_delta=({push_base[0]:.4f}, {push_base[1]:.4f}, {push_base[2]:.4f})m, "
+            f"outward_z={contact_pose.z:.4f}m, pullback_z={pullback_center_pose.z:.4f}m."
+        )
+        if bool(self.get_parameter("clearance_push_dry_run").value):
+            raise RuntimeError(
+                "Unsafe grasp corridor detected. clearance_push_dry_run=true, so the robot did not push or descend. "
+                "Verify the logged direction/contact height, then explicitly set clearance_push_dry_run:=false."
+            )
+
+        self._set_gripper_width_tracking_enabled(False, "holding gripper closed throughout clearance push")
+        self._move_joint_pose_with_log(hover_pose, "Clearance push: aligned above SAM target")
+        self._close_gripper_for_grasp(wait=True)
+        push_speed = max(1, int(self.get_parameter("clearance_push_linear_speed").value))
+        contact_speed = max(1, int(self.get_parameter("clearance_contact_linear_speed").value))
+        pullback_speed = max(1, int(self.get_parameter("clearance_pullback_linear_speed").value))
+        with self._motion_lock:
+            self._controller.move_linear_tcp(
+                contact_pose,
+                speed=push_speed,
+                accel=int(self.get_parameter("linear_acc").value),
+                user_index=self._motion_user_index(),
+                tool_index=self._command_tool_index(),
+            )
+            self._controller.move_linear_tcp(
+                neighbor_contact_pose,
+                speed=contact_speed,
+                accel=int(self.get_parameter("linear_acc").value),
+                user_index=self._motion_user_index(),
+                tool_index=self._command_tool_index(),
+            )
+            self._controller.move_linear_tcp(
+                pushed_pose,
+                speed=push_speed,
+                accel=int(self.get_parameter("linear_acc").value),
+                user_index=self._motion_user_index(),
+                tool_index=self._command_tool_index(),
+            )
+            self.get_logger().info(
+                f"Clearance push-pull: high outward sweep reached x={pushed_pose.x:.3f} "
+                f"y={pushed_pose.y:.3f} z={pushed_pose.z:.3f}"
+            )
+            self._controller.move_linear_tcp(
+                lowered_at_push_end_pose,
+                speed=pullback_speed,
+                accel=int(self.get_parameter("linear_acc").value),
+                user_index=self._motion_user_index(),
+                tool_index=self._command_tool_index(),
+            )
+            self.get_logger().info(
+                f"Clearance push-pull: lowered at outward endpoint to "
+                f"z={lowered_at_push_end_pose.z:.3f}"
+            )
+            self._controller.move_linear_tcp(
+                pullback_center_pose,
+                speed=pullback_speed,
+                accel=int(self.get_parameter("linear_acc").value),
+                user_index=self._motion_user_index(),
+                tool_index=self._command_tool_index(),
+            )
+            self.get_logger().info(
+                f"Clearance push-pull: low return reached SAM center x={pullback_center_pose.x:.3f} "
+                f"y={pullback_center_pose.y:.3f} z={pullback_center_pose.z:.3f}"
+            )
+            self._controller.move_linear_tcp(
+                hover_pose,
+                speed=push_speed,
+                accel=int(self.get_parameter("linear_acc").value),
+                user_index=self._motion_user_index(),
+                tool_index=self._command_tool_index(),
+            )
+        self.get_logger().info(
+            "Clearance pullback: returned through the SAM center at the lower height, then retracted above it: "
+            f"center_x={target.x:.3f} center_y={target.y:.3f} "
+            f"pullback_z={pullback_center_pose.z:.3f} hover_z={hover_pose.z:.3f}"
+        )
+        width_m = self.latest_gripper_target_width_m()
+        if width_m is None:
+            self._open_gripper_fully(wait=True)
+        else:
+            self._apply_gripper_target_width(width_m, wait=True)
+        self._set_gripper_width_tracking_enabled(True, "clearance push complete; accepting fresh vision width")
+        time.sleep(max(0.0, float(self.get_parameter("clearance_push_settle_s").value)))
+
+    def _push_base_horizontal(self, push_cam: np.ndarray) -> np.ndarray:
+        push_base = self._camera_vector_to_base(push_cam)
+        requested_distance = float(np.linalg.norm(push_cam))
+        push_base[2] = 0.0
+        horizontal_norm = float(np.linalg.norm(push_base))
+        if horizontal_norm <= 1e-6:
+            raise RuntimeError("D405 clearance push direction is vertical in base frame; refusing side push.")
+        return push_base * (requested_distance / horizontal_norm)
+
+    def _resample_and_verify_clearance(
+        self,
+        coarse_object_base_pose: TcpPose,
+    ) -> tuple[bool, np.ndarray, np.ndarray]:
+        sample_count = max(2, int(self.get_parameter("clearance_post_push_sample_count").value))
+        sample_interval_s = max(
+            0.0,
+            float(self.get_parameter("clearance_post_push_sample_interval_s").value),
+        )
+
+        # This topic only arms feedback capture. The D405 keeps its existing SAM track;
+        # publishing /trigger_d405_vision here would rerun YOLO and could select another box.
+        snapshot_msg = Bool()
+        snapshot_msg.data = True
+        self._d405_tracking_snapshot_pub.publish(snapshot_msg)
+        self.get_logger().info(
+            "Clearance push completed; refreshing pose and corridor from the existing D405 SAM track "
+            "without YOLO re-detection or SAM reset."
+        )
+
+        post_push_targets: list[TcpPose] = []
+        post_push_sweeps: list[np.ndarray] = []
+        post_push_contacts: list[np.ndarray] = []
+        used_redetection = False
+
+        def collect_samples() -> None:
+            timeout_s = float(self.get_parameter("clearance_result_timeout_s").value)
+            previous_target_count = self.target_msg_count()
+            previous_clearance_count = self.clearance_msg_count()
+            previous_contact_count = self.clearance_contact_msg_count()
+            for sample_index in range(sample_count):
+                target = self._wait_for_next_fine_target(previous_target_count, timeout_s)
+                sweep_cam = self._wait_for_next_clearance_push(previous_clearance_count, timeout_s)
+                contact_cam = self._wait_for_next_clearance_contact(previous_contact_count, timeout_s)
+                post_push_targets.append(target)
+                post_push_sweeps.append(sweep_cam)
+                post_push_contacts.append(contact_cam)
+                previous_target_count = self.target_msg_count()
+                previous_clearance_count = self.clearance_msg_count()
+                previous_contact_count = self.clearance_contact_msg_count()
+                if sample_index + 1 < sample_count and sample_interval_s > 0.0:
+                    time.sleep(sample_interval_s)
+
+        try:
+            try:
+                collect_samples()
+            except TimeoutError as same_sam_timeout:
+                used_redetection = True
+                post_push_targets.clear()
+                post_push_sweeps.clear()
+                post_push_contacts.clear()
+                self.get_logger().warning(
+                    "Post-push current SAM track produced no complete fresh result; "
+                    f"assuming the track was lost ({same_sam_timeout}). "
+                    "Falling back once to the original D405 YOLO+SAM trigger flow."
+                )
+                self._publish_locked_coarse_target_for_d405(coarse_object_base_pose)
+                trigger_msg = Bool()
+                trigger_msg.data = True
+                self._trigger_d405_pub.publish(trigger_msg)
+                self.get_logger().info(
+                    "Published D405 trigger true after post-push SAM loss; waiting for a newly detected target."
+                )
+                time.sleep(float(self.get_parameter("d405_trigger_delay_s").value))
+                collect_samples()
+
+            post_push_position_threshold_m = float(
+                self.get_parameter("clearance_post_push_position_stability_threshold_m").value
+            )
+            post_push_angle_threshold_deg = float(
+                self.get_parameter("clearance_post_push_angle_stability_threshold_deg").value
+            )
+            stability_retries = max(
+                0,
+                int(self.get_parameter("clearance_post_push_stability_retries").value),
+            )
+            stability_retry_delay_s = max(
+                0.0,
+                float(self.get_parameter("clearance_post_push_stability_retry_delay_s").value),
+            )
+            initial_angle_threshold_deg = float(
+                self.get_parameter("fine_angle_stability_threshold_deg").value
+            )
+            for stability_attempt in range(stability_retries + 1):
+                validation_angle_threshold_deg = (
+                    min(initial_angle_threshold_deg, post_push_angle_threshold_deg)
+                    if stability_attempt < stability_retries
+                    else post_push_angle_threshold_deg
+                )
+                try:
+                    self._validate_fine_target_stability(
+                        post_push_targets,
+                        position_threshold_m=post_push_position_threshold_m,
+                        angle_threshold_deg=validation_angle_threshold_deg,
+                        context="Post-push fine target",
+                    )
+                    break
+                except RuntimeError as exc:
+                    if stability_attempt >= stability_retries:
+                        raise
+                    self.get_logger().warning(
+                        "Post-push same-target samples are temporarily unstable; "
+                        f"discarding them and collecting one fresh window "
+                        f"({stability_attempt + 1}/{stability_retries}): {exc}"
+                    )
+                    post_push_targets.clear()
+                    post_push_sweeps.clear()
+                    post_push_contacts.clear()
+                    if stability_retry_delay_s > 0.0:
+                        time.sleep(stability_retry_delay_s)
+                    collect_samples()
+
+            refreshed_target = self._average_tcp_poses(post_push_targets)
+            refresh_source = "redetected YOLO+SAM" if used_redetection else "same-SAM"
+            self.set_latest_target_pose(
+                refreshed_target,
+                f"{self.get_parameter('motion_topic').value} "
+                f"[post-push {refresh_source} averaged {sample_count} samples]",
+            )
+        finally:
+            self._set_gripper_width_tracking_enabled(
+                False,
+                "post-push tracking refresh/redetection finished or aborted",
+            )
+
+        sweep_norms = [float(np.linalg.norm(vector)) for vector in post_push_sweeps]
+        worst_index = int(np.argmax(sweep_norms))
+        verified_push_cam = post_push_sweeps[worst_index]
+        verified_contact_cam = post_push_contacts[worst_index]
+        refreshed_target = self.latest_target_pose()
+        if refreshed_target is None:
+            raise RuntimeError("Post-push SAM tracking refresh did not produce a target pose.")
+        refresh_mode = "redetected YOLO+SAM" if used_redetection else "same-SAM"
+        self.get_logger().info(
+            f"Post-push {refresh_mode} target updated from {sample_count} samples: "
+            f"x={refreshed_target.x:.3f} y={refreshed_target.y:.3f} z={refreshed_target.z:.3f} "
+            f"rx={refreshed_target.rx:.2f} ry={refreshed_target.ry:.2f} rz={refreshed_target.rz:.2f}; "
+            f"required_sweeps={[round(value, 4) for value in sweep_norms]}m."
+        )
+        if self._clearance_push_required(verified_push_cam):
+            self.get_logger().warning(
+                "Post-push grasp corridor is still unsafe: "
+                f"worst_required_sweep={np.linalg.norm(verified_push_cam):.4f}m "
+                f"from the current {refresh_mode} target. "
+                "Robot remains retracted while the next bounded push is planned."
+            )
+            return False, verified_contact_cam, verified_push_cam
+        self.get_logger().info(
+            "Existing D405 SAM track reports both gripper sides clear; proceeding with its refreshed grasp pose."
+        )
+        return True, verified_contact_cam, verified_push_cam
+
+    def _make_grasp_corridor_clear(
+        self,
+        coarse_object_base_pose: TcpPose,
+        clearance_contact_cam: np.ndarray,
+        clearance_push_cam: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self._clearance_push_required(clearance_push_cam):
+            return clearance_contact_cam, clearance_push_cam
+
+        max_attempts = max(1, int(self.get_parameter("clearance_max_attempts").value))
+        for push_attempt in range(1, max_attempts + 1):
+            self.get_logger().warning(
+                "========== [阶段 2.5] 间隙不足，闭爪高位外推/低位回拨 "
+                f"{push_attempt}/{max_attempts} =========="
+            )
+            target_before_push = self.latest_target_pose()
+            if target_before_push is None:
+                raise RuntimeError("Fine target disappeared before clearance push-pull motion.")
+            self._execute_clearance_push(
+                target_before_push,
+                self._push_base_horizontal(clearance_contact_cam),
+                self._push_base_horizontal(clearance_push_cam),
+            )
+            corridor_is_clear, clearance_contact_cam, clearance_push_cam = (
+                self._resample_and_verify_clearance(coarse_object_base_pose)
+            )
+            if corridor_is_clear:
+                return clearance_contact_cam, clearance_push_cam
+
+        raise RuntimeError(
+            "Grasp corridor remains unsafe after the bounded tracking push-pull loop; "
+            f"attempts={max_attempts}, "
+            f"latest_required_sweep={np.linalg.norm(clearance_push_cam):.4f}m. "
+            "Robot remains retracted."
+        )
 
     def execute_latest_target(self) -> None:
         target = self.latest_target_pose()
@@ -1027,29 +1675,50 @@ class Nova5DriverNode(Node):
         if target is None:
             raise RuntimeError("No latest target pose has been received yet")
 
+        depth_offset_m = float(self.get_parameter("fine_grasp_depth_offset_m").value)
+        depth_offset_limit_m = max(
+            0.0,
+            float(self.get_parameter("fine_grasp_depth_offset_limit_m").value),
+        )
+        if abs(depth_offset_m) > depth_offset_limit_m:
+            raise RuntimeError(
+                "Fine grasp depth offset exceeds configured safety limit: "
+                f"offset={depth_offset_m:.4f}m limit={depth_offset_limit_m:.4f}m."
+            )
+        grasp_target = TcpPose(
+            target.x,
+            target.y,
+            target.z + depth_offset_m,
+            target.rx,
+            target.ry,
+            target.rz,
+        )
+
         current_tcp = self.read_current_pose()
         planar_target = TcpPose(
-            x=target.x,
-            y=target.y,
+            x=grasp_target.x,
+            y=grasp_target.y,
             z=current_tcp.z,
-            rx=target.rx,
-            ry=target.ry,
-            rz=target.rz,
+            rx=grasp_target.rx,
+            ry=grasp_target.ry,
+            rz=grasp_target.rz,
         )
 
         self._move_joint_pose_with_log(planar_target, "Executed staged fine planar move")
 
         with self._motion_lock:
             self._controller.move_linear_tcp(
-                target,
+                grasp_target,
                 speed=int(self.get_parameter("linear_speed").value),
                 accel=int(self.get_parameter("linear_acc").value),
                 user_index=self._motion_user_index(),
                 tool_index=self._command_tool_index(),
             )
         self.get_logger().info(
-            f"Executed staged fine descend x={target.x:.3f} y={target.y:.3f} z={target.z:.3f} "
-            f"rx={target.rx:.2f} ry={target.ry:.2f} rz={target.rz:.2f}"
+            f"Executed staged fine descend x={grasp_target.x:.3f} y={grasp_target.y:.3f} "
+            f"visual_z={target.z:.3f} depth_offset={depth_offset_m:+.4f}m "
+            f"executed_z={grasp_target.z:.3f} rx={grasp_target.rx:.2f} "
+            f"ry={grasp_target.ry:.2f} rz={grasp_target.rz:.2f}"
         )
 
     def _wait_for_next_fine_target(self, previous_count: int, timeout_s: float) -> TcpPose:
@@ -1073,12 +1742,27 @@ class Nova5DriverNode(Node):
             rz=circular_mean_deg([p.rz for p in poses]),
         )
 
-    def _validate_fine_target_stability(self, poses: list[TcpPose]) -> None:
+    def _validate_fine_target_stability(
+        self,
+        poses: list[TcpPose],
+        *,
+        position_threshold_m: Optional[float] = None,
+        angle_threshold_deg: Optional[float] = None,
+        context: str = "Fine target",
+    ) -> None:
         if len(poses) <= 1:
             return
 
-        pos_threshold_m = float(self.get_parameter("fine_position_stability_threshold_m").value)
-        angle_threshold_deg = float(self.get_parameter("fine_angle_stability_threshold_deg").value)
+        pos_threshold_m = (
+            float(self.get_parameter("fine_position_stability_threshold_m").value)
+            if position_threshold_m is None
+            else float(position_threshold_m)
+        )
+        resolved_angle_threshold_deg = (
+            float(self.get_parameter("fine_angle_stability_threshold_deg").value)
+            if angle_threshold_deg is None
+            else float(angle_threshold_deg)
+        )
 
         xs = [p.x for p in poses]
         ys = [p.y for p in poses]
@@ -1101,11 +1785,12 @@ class Nova5DriverNode(Node):
             max(circular_distance_deg(v, rz_center) for v in rzs) * 2.0,
         )
 
-        if pos_span_m > pos_threshold_m or angle_span_deg > angle_threshold_deg:
+        if pos_span_m > pos_threshold_m or angle_span_deg > resolved_angle_threshold_deg:
             raise RuntimeError(
-                "Fine target unstable: "
+                f"{context} unstable: "
                 f"pos_span={pos_span_m:.4f}m threshold={pos_threshold_m:.4f}m, "
-                f"angle_span={angle_span_deg:.2f}deg threshold={angle_threshold_deg:.2f}deg"
+                f"angle_span={angle_span_deg:.2f}deg "
+                f"threshold={resolved_angle_threshold_deg:.2f}deg"
             )
 
     def _apply_motion_profiles(self) -> None:
@@ -1363,14 +2048,17 @@ class Nova5DriverNode(Node):
             )
             return False
         success = accumulated >= accept_total
-        log_method = self.get_logger().info if success else self.get_logger().warning
-        log_method(
+        result_message = (
             f"{label}: user-frame MoveJog {axis_name} completed accumulated={accumulated:.2f}/{target_total:.2f}, "
             f"accept={accept_total:.2f}, success={success}; "
             f"x={after_pose.x:.3f} y={after_pose.y:.3f} z={after_pose.z:.3f} "
             f"rx={after_pose.rx:.2f} ry={after_pose.ry:.2f} rz={after_pose.rz:.2f}; "
             f"J6 {before_joints[5]:.2f}->{after_joints[5]:.2f}"
         )
+        if success:
+            self.get_logger().info(result_message)
+        else:
+            self.get_logger().warning(result_message)
         if success:
             settle_s = max(0.0, float(self.get_parameter("barcode_face_up_after_jog_settle_s").value))
             if settle_s > 0.0:
@@ -1779,6 +2467,7 @@ class Nova5DriverNode(Node):
         )
         secondary_moved_safe = False
         if abs(face_up_after_detect_deg) > 1e-6:
+            self._require_gripper_object_held("before barcode face-up rotation")
             self.get_logger().info("========== [阶段 4.4] 主臂条码朝上翻转前副臂移动到安全位 ==========")
             self.move_secondary_to_safe_before_place()
             secondary_moved_safe = True
@@ -1797,6 +2486,7 @@ class Nova5DriverNode(Node):
                 if bool(self.get_parameter("barcode_face_up_abort_on_failure").value):
                     raise RuntimeError(message)
                 self.get_logger().warning(message + " Continuing to place pose because abort is disabled.")
+            self._require_gripper_object_held("after barcode face-up rotation")
         return True, secondary_moved_safe
 
     def _check_and_flip_until_barcode_face_up(
@@ -1809,6 +2499,9 @@ class Nova5DriverNode(Node):
     ) -> tuple[bool, bool]:
         stable_hits = max(1, int(self.get_parameter("barcode_stable_hits").value))
         for attempt in range(max_steps + 1):
+            self._require_gripper_object_held(
+                f"before barcode check/flip {attempt + 1}/{max_steps + 1}"
+            )
             self._reset_barcode_detection_window()
             self.get_logger().info(
                 f"Checking barcode face at transfer point: attempt {attempt + 1}/{max_steps + 1}, "
@@ -1831,6 +2524,9 @@ class Nova5DriverNode(Node):
                 selected_delta,
                 f"Barcode not found; flip object {attempt + 1}/{max_steps}",
             )
+            self._require_gripper_object_held(
+                f"after barcode flip {attempt + 1}/{max_steps}"
+            )
             if self._barcode_stable_hit_count() >= stable_hits:
                 return self._handle_stable_barcode_face_up(
                     f"during flip attempt {attempt + 1}/{max_steps}",
@@ -1848,6 +2544,7 @@ class Nova5DriverNode(Node):
         face_up_after_detect_deg = float(self.get_parameter("barcode_face_up_after_detect_deg").value)
 
         self.get_logger().info("========== [阶段 4] 抓取后条码检查与搬运流程 ==========")
+        self._require_gripper_object_held("before post-grasp transfer")
         if len(transfer_joint) != 6:
             raise ValueError(f"transfer joint must contain 6 values, got {len(transfer_joint)}")
         self.get_logger().info(
@@ -1860,6 +2557,7 @@ class Nova5DriverNode(Node):
             f"rx={place_pose.rx:.2f} ry={place_pose.ry:.2f} rz={place_pose.rz:.2f}"
         )
         self._move_joint_values_with_log(transfer_joint, "Moved to post-grasp transfer joint target")
+        self._require_gripper_object_held("after post-grasp transfer")
         barcode_found, secondary_moved_safe = self._check_and_flip_until_barcode_face_up(
             rotate_step_deg=rotate_step_deg,
             max_steps=rotate_count,
@@ -1873,20 +2571,32 @@ class Nova5DriverNode(Node):
             )
 
         if not secondary_moved_safe:
+            self._require_gripper_object_held("before secondary safe motion")
             self.get_logger().info("========== [阶段 4.5] 主臂放置前副臂移动到安全位 ==========")
             self.move_secondary_to_safe_before_place()
 
-        self.get_logger().info("========== [阶段 4.6] 主臂移动到最终放置点 ==========")
+        self._require_gripper_object_held("before final place motion")
+        self.get_logger().info("========== [阶段 4.6] 主臂经中间点移动到最终放置点 ==========")
         try:
             self._controller.wait_until_idle(timeout_s=max(0.1, float(self.get_parameter("barcode_face_up_idle_timeout_s").value)))
         except Exception as exc:
             self.get_logger().warning(f"Robot did not report idle before place move; sending place anyway: {exc}")
+        place_via_pose = self.default_place_via_pose()
+        if place_via_pose is not None:
+            self.get_logger().info(
+                f"Preparing to move to place via pose: x={place_via_pose.x:.3f} "
+                f"y={place_via_pose.y:.3f} z={place_via_pose.z:.3f} "
+                f"rx={place_via_pose.rx:.2f} ry={place_via_pose.ry:.2f} rz={place_via_pose.rz:.2f}"
+            )
+            self._move_joint_pose_with_log(place_via_pose, "Moved to place via pose")
+            self._require_gripper_object_held("after place via pose")
         self.get_logger().info(
             f"Preparing to move to post-grasp place pose: x={place_pose.x:.3f} y={place_pose.y:.3f} "
             f"z={place_pose.z:.3f} rx={place_pose.rx:.2f} ry={place_pose.ry:.2f} rz={place_pose.rz:.2f}"
         )
         self._move_joint_pose_with_log(place_pose, "Moved to post-grasp place pose")
         if self._dh_gripper is not None:
+            self._require_gripper_object_held("at final place pose before release")
             self._open_gripper_fully(wait=True)
         self.get_logger().info("Post-grasp place sequence completed.")
 
@@ -1946,7 +2656,7 @@ class Nova5DriverNode(Node):
         coarse_object_base_pose = self.latest_coarse_object_base_pose()
         if coarse_object_base_pose is None:
             raise RuntimeError("No coarse object base pose has been received yet")
-        self._set_gripper_width_tracking_enabled(True, "starting coarse-to-fine vision sequence")
+        self._set_gripper_width_tracking_enabled(False, "coarse move; waiting for a fresh D405 trigger")
         self._move_joint_pose_with_log(coarse_target, "Executed coarse target")
         self._publish_locked_coarse_target_for_d405(coarse_object_base_pose)
         self.get_logger().info(
@@ -1960,9 +2670,12 @@ class Nova5DriverNode(Node):
         max_retries = max(0, int(self.get_parameter("fine_max_retries").value))
 
         success = False
+        clearance_push_cam: Optional[np.ndarray] = None
+        clearance_contact_cam: Optional[np.ndarray] = None
         self.get_logger().info("========== [阶段 2] 启动精定位视觉采样 ==========")
 
         for attempt in range(max_retries + 1):
+            self._set_gripper_width_tracking_enabled(False, "preparing a fresh D405 sampling attempt")
             if attempt > 0:
                 self.get_logger().warning(
                     f"--> [重试机制] 正在进行第 {attempt} 次重新采样..."
@@ -1972,6 +2685,9 @@ class Nova5DriverNode(Node):
             trigger_msg = Bool()
             trigger_msg.data = True
             previous_count = self.target_msg_count()
+            previous_clearance_count = self.clearance_msg_count()
+            previous_contact_count = self.clearance_contact_msg_count()
+            self._set_gripper_width_tracking_enabled(True, "accepting width from this D405 fine-sampling attempt")
             self._publish_locked_coarse_target_for_d405(coarse_object_base_pose)
             self._trigger_d405_pub.publish(trigger_msg)
             self.get_logger().info("Published D405 trigger true.")
@@ -1979,8 +2695,17 @@ class Nova5DriverNode(Node):
             time.sleep(float(self.get_parameter("d405_trigger_delay_s").value))
             try:
                 fine_samples.append(self._wait_for_next_fine_target(previous_count, fine_target_timeout_s))
+                if bool(self.get_parameter("clearance_push_enabled").value):
+                    clearance_push_cam = self._wait_for_next_clearance_push(
+                        previous_clearance_count,
+                        float(self.get_parameter("clearance_result_timeout_s").value),
+                    )
+                    clearance_contact_cam = self._wait_for_next_clearance_contact(
+                        previous_contact_count,
+                        float(self.get_parameter("clearance_result_timeout_s").value),
+                    )
             except TimeoutError:
-                self.get_logger().error("--> 获取初始精定位数据超时！")
+                self.get_logger().error("--> 获取初始精定位或夹爪间隙数据超时！")
                 if attempt < max_retries:
                     time.sleep(0.5)
                 continue
@@ -1988,14 +2713,27 @@ class Nova5DriverNode(Node):
             refine_success = True
             for cycle_index in range(refine_cycles):
                 previous_count = self.target_msg_count()
+                previous_clearance_count = self.clearance_msg_count()
+                previous_contact_count = self.clearance_contact_msg_count()
                 self.get_logger().info(
                     f"Sampling fine refine cycle {cycle_index + 1}/{refine_cycles} from current SAM2 track."
                 )
                 time.sleep(fine_refine_delay_s)
                 try:
                     fine_samples.append(self._wait_for_next_fine_target(previous_count, fine_target_timeout_s))
+                    if bool(self.get_parameter("clearance_push_enabled").value):
+                        clearance_push_cam = self._wait_for_next_clearance_push(
+                            previous_clearance_count,
+                            float(self.get_parameter("clearance_result_timeout_s").value),
+                        )
+                        clearance_contact_cam = self._wait_for_next_clearance_contact(
+                            previous_contact_count,
+                            float(self.get_parameter("clearance_result_timeout_s").value),
+                        )
                 except TimeoutError:
-                    self.get_logger().error(f"--> 第 {cycle_index + 1} 次 Refine 获取数据超时！")
+                    self.get_logger().error(
+                        f"--> 第 {cycle_index + 1} 次 Refine 获取精定位或夹爪间隙数据超时！"
+                    )
                     refine_success = False
                     break
 
@@ -2029,13 +2767,76 @@ class Nova5DriverNode(Node):
 
         if success:
             self.get_logger().info("========== [阶段 3] 自动执行精定位下探 ==========")
-            self._set_gripper_width_tracking_enabled(False, "locking gripper width before final fine approach and grasp")
-            self.execute_latest_target_staged()
-            if self._dh_gripper is not None:
-                self._close_gripper_for_grasp(wait=True)
+            self._set_gripper_width_tracking_enabled(
+                False,
+                "fine samples locked; evaluating clearance before any motion",
+            )
+            if bool(self.get_parameter("clearance_push_enabled").value):
+                if clearance_push_cam is None:
+                    raise RuntimeError("No fresh D405 grasp-clearance result; refusing final descent.")
+                if clearance_contact_cam is None:
+                    raise RuntimeError("No fresh D405 neighbor-contact vector; refusing clearance sweep.")
+                clearance_contact_cam, clearance_push_cam = self._make_grasp_corridor_clear(
+                    coarse_object_base_pose,
+                    clearance_contact_cam,
+                    clearance_push_cam,
+                )
+
+            grasp_max_attempts = max(1, int(self.get_parameter("grasp_max_attempts").value))
+            grasp_succeeded = False
+            for grasp_attempt in range(1, grasp_max_attempts + 1):
+                self.get_logger().info(
+                    f"========== [阶段 3.{grasp_attempt}] 执行抓取并验证夹爪 "
+                    f"{grasp_attempt}/{grasp_max_attempts} =========="
+                )
+                self.execute_latest_target_staged()
+                if self._dh_gripper is not None:
+                    self._close_gripper_for_grasp(wait=True)
+                    self._lift_after_grasp_for_validation()
+                    if self._gripper_object_held(f"after grasp lift {grasp_attempt}/{grasp_max_attempts}"):
+                        grasp_succeeded = True
+                        break
+                else:
+                    grasp_succeeded = True
+                    break
+
+                if grasp_attempt >= grasp_max_attempts:
+                    break
+
+                self.get_logger().warning(
+                    "Empty grasp detected after lift; keeping the robot retracted and refreshing "
+                    "the live D405 target/corridor before one retry."
+                )
+                width_m = self.latest_gripper_target_width_m()
+                if width_m is None:
+                    self._open_gripper_fully(wait=True)
+                else:
+                    self._apply_gripper_target_width(width_m, wait=True)
+                self._set_gripper_width_tracking_enabled(
+                    True,
+                    "empty grasp retry; accepting fresh target width",
+                )
+                corridor_is_clear, clearance_contact_cam, clearance_push_cam = (
+                    self._resample_and_verify_clearance(coarse_object_base_pose)
+                )
+                if not corridor_is_clear:
+                    clearance_contact_cam, clearance_push_cam = self._make_grasp_corridor_clear(
+                        coarse_object_base_pose,
+                        clearance_contact_cam,
+                        clearance_push_cam,
+                    )
+
+            if not grasp_succeeded:
+                raise RuntimeError(
+                    f"Grasp failed: DH gripper closed to the empty threshold after "
+                    f"{grasp_max_attempts} validated attempts. Robot remains lifted; "
+                    "secondary-arm, barcode, transfer and place stages were not started."
+                )
             if secondary_joint is not None:
+                self._require_gripper_object_held("before secondary collaborative motion")
                 self.get_logger().info("========== [阶段 3.5] 触发副臂协同点位 ==========")
                 self.execute_secondary_target_joint(secondary_joint)
+                self._require_gripper_object_held("after secondary collaborative motion")
             if transfer_joint is not None and place_pose is not None:
                 self.execute_post_grasp_place_sequence(transfer_joint, place_pose)
         else:
@@ -2275,6 +3076,19 @@ class Nova5DriverNode(Node):
             f"supported indices are flange={self._flange_tool_index()} and command={self._command_tool_index()}"
         )
 
+    def default_place_via_pose(self) -> Optional[TcpPose]:
+        if not bool(self.get_parameter("default_place_via_enabled").value):
+            return None
+        values = [float(value) for value in self.get_parameter("default_place_via_pose").value]
+        if len(values) != 6:
+            raise ValueError(f"default_place_via_pose must contain 6 values, got {len(values)}")
+        src_tool_index = int(self.get_parameter("default_post_grasp_pose_tool_index").value)
+        return self._convert_absolute_pose_between_tools(
+            TcpPose(*values),
+            src_tool_index,
+            self._command_tool_index(),
+        )
+
     def current_joint(self) -> list[float]:
         return self._controller.current_joint()
 
@@ -2399,8 +3213,6 @@ class Nova5DriverNode(Node):
             rz=raw_rz_deg,
         )
         frame_id = msg.header.frame_id.strip() or "base"
-        self._store_raw_target_pose(raw_target, frame_id)
-
         try:
             if frame_id == "base":
                 target = raw_target
@@ -2486,7 +3298,9 @@ class Nova5DriverNode(Node):
             self.get_logger().error(f"Failed to convert target pose from {frame_id} to base: {exc}")
             return
 
-        self.set_latest_target_pose(target, source)
+        # Make the converted pose and sequence count visible together so waiters
+        # cannot observe a new count while still reading the previous frame's pose.
+        self._store_received_target_pose(raw_target, frame_id, target, source)
         # self.get_logger().info(
         #     f"Received target frame={frame_id}, cached base target: "
         #     f"x={target.x:.3f} y={target.y:.3f} z={target.z:.3f} "
@@ -3028,6 +3842,7 @@ class Nova5ControlWindow(QMainWindow):
                     "or rejected by controller planning."
                 )
             self.set_message(f"{name} failed: {msg}")
+            self.node.get_logger().error(f"{name} failed: {msg}")
         self.refresh_ui()
 
     def set_message(self, text: str) -> None:
