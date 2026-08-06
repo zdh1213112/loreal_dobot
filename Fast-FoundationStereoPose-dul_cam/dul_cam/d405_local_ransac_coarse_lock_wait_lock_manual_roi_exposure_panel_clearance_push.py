@@ -13,6 +13,9 @@
 7. 发布估计夹爪开口宽度到 `/gripper_target_width`，供 Nova5/DH 夹爪控制端使用。
 8. 排除 SAM 目标点后检查夹爪闭合轴两侧点云；间隙不足时发布相机坐标系侧推向量到
    `/d405/grasp_clearance_push_cam`，向量为零表示可直接下夹爪。
+9. 同时沿目标长轴搜索一组成对的 -Y/+Y 夹爪指下探走廊；找到安全截面时，可通过
+   `/d405/grasp_clearance_side_entry_cam` 和 `/d405/grasp_clearance_side_inward_cam`
+   发布替代抓取中心偏移，机械臂在高位对准后垂直下降并直接闭爪。
 
 典型配合：D435 粗定位节点 -> Nova5 粗定位移动并发布锁定目标 -> 本节点等待最新锁定目标后精定位。
 """
@@ -83,6 +86,12 @@ pose_pub = ros_node.create_publisher(PoseStamped, '/target_pose_cam_fine', 10)
 width_pub = ros_node.create_publisher(Float32, '/gripper_target_width', 10)
 clearance_pub = ros_node.create_publisher(Vector3Stamped, '/d405/grasp_clearance_push_cam', 10)
 clearance_contact_pub = ros_node.create_publisher(Vector3Stamped, '/d405/grasp_clearance_contact_cam', 10)
+clearance_side_entry_pub = ros_node.create_publisher(
+    Vector3Stamped, '/d405/grasp_clearance_side_entry_cam', 10
+)
+clearance_side_inward_pub = ros_node.create_publisher(
+    Vector3Stamped, '/d405/grasp_clearance_side_inward_cam', 10
+)
 panel_image_pub = ros_node.create_publisher(CompressedImage, '/vision_panel/d405_local_rgb/image/compressed', 1)
 panel_cloud_pub = ros_node.create_publisher(CompressedImage, '/vision_panel/d405_local_cloud/image/compressed', 1)
 panel_jpeg_quality = 80
@@ -118,6 +127,12 @@ CLEARANCE_MIN_POINTS = 30
 CLEARANCE_NEAR_PERCENTILE = 10.0
 CLEARANCE_PUSH_EXTRA_M = 0.006
 CLEARANCE_MAX_PUSH_M = 0.030
+CLEARANCE_SIDE_ENTRY_GAP_M = 0.004
+CLEARANCE_SIDE_ENTRY_HALF_X_M = 0.010
+CLEARANCE_SIDE_ENTRY_SCAN_STEP_M = 0.005
+CLEARANCE_SIDE_ENTRY_BAND_HALF_Y_M = 0.004
+CLEARANCE_SIDE_ENTRY_Z_MARGIN_M = 0.080
+CLEARANCE_SIDE_ENTRY_MAX_POINTS = 20
 GRASP_FEEDBACK_DIR = "/home/zdh/ffs_ws/grasp_feedback/d405_clearance_push"
 GRASP_FEEDBACK_MAX_RESULT_SAMPLES = 3
 
@@ -138,14 +153,17 @@ def estimate_grasp_clearance_push(points_3d, target_mask, center, extent, axes):
         half[0] + CLEARANCE_CORRIDOR_X_MARGIN_M,
         0.5 * CLEARANCE_GRIPPER_SPAN_X_M,
     )
+    height_common = (
+        # Ignore the broad support plane below the box while retaining nearby
+        # box tops and upper side faces that a descending finger would strike.
+        (local[:, 2] >= CLEARANCE_CORRIDOR_Z_MIN_FRACTION * half[2])
+        & (local[:, 2] <= half[2] + CLEARANCE_CORRIDOR_Z_MARGIN_M)
+    )
     common = (
         # Only the target-center finger footprint matters. Obstacles beside a
         # long box end do not intersect the centered gripper descent path.
         (np.abs(local[:, 0]) <= corridor_half_x)
-        # Ignore the broad support plane below the box while retaining nearby
-        # box tops and upper side faces that a descending finger would strike.
-        & (local[:, 2] >= CLEARANCE_CORRIDOR_Z_MIN_FRACTION * half[2])
-        & (local[:, 2] <= half[2] + CLEARANCE_CORRIDOR_Z_MARGIN_M)
+        & height_common
     )
 
     clearances = []
@@ -182,6 +200,94 @@ def estimate_grasp_clearance_push(points_3d, target_mask, center, extent, axes):
         sweep_distance = obstacle_contact_distance + object_push_distance
         push_cam = obstacle_sign * axes[:, 1] * sweep_distance
 
+    # Search for one local-X grasp section where the two open gripper fingers
+    # can descend simultaneously on opposite -Y/+Y sides of the target.
+    side_entry_half_y = CLEARANCE_SIDE_ENTRY_BAND_HALF_Y_M
+    side_entry_center_distance = (
+        half[1] + CLEARANCE_SIDE_ENTRY_GAP_M + side_entry_half_y
+    )
+    side_entry_scan_half_x = max(0.0, half[0] - CLEARANCE_SIDE_ENTRY_HALF_X_M)
+    scan_step = max(0.001, CLEARANCE_SIDE_ENTRY_SCAN_STEP_M)
+    side_entry_scan_x = np.arange(
+        -side_entry_scan_half_x,
+        side_entry_scan_half_x + 0.5 * scan_step,
+        scan_step,
+        dtype=np.float64,
+    )
+    side_entry_scan_x = np.unique(np.append(side_entry_scan_x, 0.0))
+    side_entry_height_common = (
+        (local[:, 2] >= CLEARANCE_CORRIDOR_Z_MIN_FRACTION * half[2])
+        & (local[:, 2] <= half[2] + CLEARANCE_SIDE_ENTRY_Z_MARGIN_M)
+    )
+    side_entry_candidate_counts = [[], []]
+    for sign in (-1.0, 1.0):
+        entry_center_y = sign * side_entry_center_distance
+        for entry_center_x in side_entry_scan_x:
+            entry_points = (
+                side_entry_height_common
+                & (np.abs(local[:, 0] - entry_center_x) <= CLEARANCE_SIDE_ENTRY_HALF_X_M)
+                & (np.abs(local[:, 1] - entry_center_y) <= side_entry_half_y)
+            )
+            side_index = 0 if sign < 0.0 else 1
+            side_entry_candidate_counts[side_index].append(
+                int(np.count_nonzero(entry_points))
+            )
+
+    safe_pair_indices = [
+        index
+        for index in range(len(side_entry_scan_x))
+        if side_entry_candidate_counts[0][index] <= CLEARANCE_SIDE_ENTRY_MAX_POINTS
+        and side_entry_candidate_counts[1][index] <= CLEARANCE_SIDE_ENTRY_MAX_POINTS
+    ]
+    best_pair_index = min(
+        range(len(side_entry_scan_x)),
+        key=lambda index: (
+            max(
+                side_entry_candidate_counts[0][index],
+                side_entry_candidate_counts[1][index],
+            ),
+            side_entry_candidate_counts[0][index] + side_entry_candidate_counts[1][index],
+            abs(side_entry_scan_x[index]),
+        ),
+    )
+    if safe_pair_indices and any(unsafe_sides):
+        nonzero_safe_pairs = [
+            index for index in safe_pair_indices
+            if abs(side_entry_scan_x[index]) >= 0.5 * scan_step
+        ]
+        if nonzero_safe_pairs:
+            safe_pair_indices = nonzero_safe_pairs
+
+    selected_pair_index = None
+    side_entry_selected_x = 0.0
+    side_entry_cam = np.zeros(3, dtype=np.float64)
+    side_inward_cam = np.zeros(3, dtype=np.float64)
+    if safe_pair_indices:
+        selected_pair_index = min(
+            safe_pair_indices,
+            key=lambda index: (
+                max(
+                    side_entry_candidate_counts[0][index],
+                    side_entry_candidate_counts[1][index],
+                ),
+                side_entry_candidate_counts[0][index] + side_entry_candidate_counts[1][index],
+                abs(side_entry_scan_x[index]),
+            ),
+        )
+        side_entry_selected_x = float(side_entry_scan_x[selected_pair_index])
+        side_entry_cam = axes[:, 0] * side_entry_selected_x
+        side_inward_cam = -side_entry_cam
+
+    display_pair_index = selected_pair_index if selected_pair_index is not None else best_pair_index
+    side_entry_counts = [
+        side_entry_candidate_counts[0][display_pair_index],
+        side_entry_candidate_counts[1][display_pair_index],
+    ]
+    side_entry_best_x = [
+        float(side_entry_scan_x[display_pair_index]),
+        float(side_entry_scan_x[display_pair_index]),
+    ]
+
     return {
         'status': 'blocked_both' if all(unsafe_sides) else ('blocked_one' if any(unsafe_sides) else 'clear'),
         'negative_clearance_m': clearances[0],
@@ -192,6 +298,19 @@ def estimate_grasp_clearance_push(points_3d, target_mask, center, extent, axes):
         'object_push_distance_m': object_push_distance,
         'contact_cam_m': contact_cam,
         'push_cam_m': push_cam,
+        'side_entry_counts': side_entry_counts,
+        'side_entry_sign': 0.0,
+        'side_entry_pair_available': selected_pair_index is not None,
+        'side_entry_center_distance_m': side_entry_center_distance,
+        'side_entry_scan_half_x_m': side_entry_scan_half_x,
+        'side_entry_scan_x_m': side_entry_scan_x,
+        'side_entry_candidate_counts': side_entry_candidate_counts,
+        'side_entry_best_x_m': side_entry_best_x,
+        'side_entry_selected_x_m': side_entry_selected_x,
+        'side_entry_half_x_m': CLEARANCE_SIDE_ENTRY_HALF_X_M,
+        'side_entry_half_y_m': side_entry_half_y,
+        'side_entry_cam_m': side_entry_cam,
+        'side_inward_cam_m': side_inward_cam,
     }
 
 
@@ -211,19 +330,36 @@ def publish_clearance_result(result):
         float(contact[0]), float(contact[1]), float(contact[2])
     )
     clearance_contact_pub.publish(contact_msg)
+    side_entry = np.asarray(result['side_entry_cam_m'], dtype=np.float64)
+    side_entry_msg = Vector3Stamped()
+    side_entry_msg.header = msg.header
+    side_entry_msg.vector.x, side_entry_msg.vector.y, side_entry_msg.vector.z = (
+        float(side_entry[0]), float(side_entry[1]), float(side_entry[2])
+    )
+    clearance_side_entry_pub.publish(side_entry_msg)
+    side_inward = np.asarray(result['side_inward_cam_m'], dtype=np.float64)
+    side_inward_msg = Vector3Stamped()
+    side_inward_msg.header = msg.header
+    side_inward_msg.vector.x, side_inward_msg.vector.y, side_inward_msg.vector.z = (
+        float(side_inward[0]), float(side_inward[1]), float(side_inward[2])
+    )
+    clearance_side_inward_pub.publish(side_inward_msg)
 
     def fmt(value):
         return 'clear' if not np.isfinite(value) else f'{value * 1000.0:.1f}mm'
 
     logging.info(
         '[Clearance] status=%s, -Y=%s (%d pts), +Y=%s (%d pts), '
-        'contact=%.1fmm object_push=%.1fmm sweep_cam=(%.1f, %.1f, %.1f)mm',
+        'contact=%.1fmm object_push=%.1fmm sweep_cam=(%.1f, %.1f, %.1f)mm, '
+        'paired_finger_counts=%s available=%s grasp_x=%.1fmm',
         result['status'],
         fmt(result['negative_clearance_m']), result['negative_points'],
         fmt(result['positive_clearance_m']), result['positive_points'],
         result['obstacle_contact_distance_m'] * 1000.0,
         result['object_push_distance_m'] * 1000.0,
         push[0] * 1000.0, push[1] * 1000.0, push[2] * 1000.0,
+        result['side_entry_counts'], result['side_entry_pair_available'],
+        result['side_entry_selected_x_m'] * 1000.0,
     )
 
 
@@ -244,6 +380,22 @@ def clearance_metadata(result):
         'object_push_distance_m': float(result['object_push_distance_m']),
         'contact_cam_m': np.asarray(result['contact_cam_m'], dtype=float).tolist(),
         'push_cam_m': np.asarray(result['push_cam_m'], dtype=float).tolist(),
+        'side_entry_counts': [int(value) for value in result['side_entry_counts']],
+        'side_entry_sign': float(result['side_entry_sign']),
+        'side_entry_pair_available': bool(result['side_entry_pair_available']),
+        'side_entry_center_distance_m': float(result['side_entry_center_distance_m']),
+        'side_entry_scan_half_x_m': float(result['side_entry_scan_half_x_m']),
+        'side_entry_scan_x_m': np.asarray(result['side_entry_scan_x_m'], dtype=float).tolist(),
+        'side_entry_candidate_counts': [
+            [int(value) for value in counts]
+            for counts in result['side_entry_candidate_counts']
+        ],
+        'side_entry_best_x_m': [float(value) for value in result['side_entry_best_x_m']],
+        'side_entry_selected_x_m': float(result['side_entry_selected_x_m']),
+        'side_entry_half_x_m': float(result['side_entry_half_x_m']),
+        'side_entry_half_y_m': float(result['side_entry_half_y_m']),
+        'side_entry_cam_m': np.asarray(result['side_entry_cam_m'], dtype=float).tolist(),
+        'side_inward_cam_m': np.asarray(result['side_inward_cam_m'], dtype=float).tolist(),
     }
 
 
@@ -260,8 +412,20 @@ def render_clearance_topdown(points_3d, target_mask, center, extent, axes, resul
         half[0] + CLEARANCE_CORRIDOR_X_MARGIN_M,
         0.5 * CLEARANCE_GRIPPER_SPAN_X_M,
     )
-    x_limit = max(0.06, half[0] + CLEARANCE_CORRIDOR_X_MARGIN_M + 0.015)
-    y_limit = max(0.06, half[1] + CLEARANCE_REQUIRED_M + CLEARANCE_SEARCH_EXTRA_M + 0.010)
+    side_entry_distance = float(result['side_entry_center_distance_m'])
+    side_scan_half_x = float(result['side_entry_scan_half_x_m'])
+    side_half_x = float(result['side_entry_half_x_m'])
+    side_half_y = float(result['side_entry_half_y_m'])
+    x_limit = max(
+        0.06,
+        half[0] + CLEARANCE_CORRIDOR_X_MARGIN_M + 0.015,
+        side_scan_half_x + side_half_x + 0.010,
+    )
+    y_limit = max(
+        0.06,
+        half[1] + CLEARANCE_REQUIRED_M + CLEARANCE_SEARCH_EXTRA_M + 0.010,
+        side_entry_distance + side_half_y + 0.010,
+    )
     plot_left, plot_top, plot_right, plot_bottom = 55, 60, canvas_w - 35, canvas_h - 95
 
     def project(local_xy):
@@ -272,6 +436,10 @@ def render_clearance_topdown(points_3d, target_mask, center, extent, axes, resul
     z_common = (
         (local[:, 2] >= CLEARANCE_CORRIDOR_Z_MIN_FRACTION * half[2])
         & (local[:, 2] <= half[2] + CLEARANCE_CORRIDOR_Z_MARGIN_M)
+    )
+    side_z_common = (
+        (local[:, 2] >= CLEARANCE_CORRIDOR_Z_MIN_FRACTION * half[2])
+        & (local[:, 2] <= half[2] + CLEARANCE_SIDE_ENTRY_Z_MARGIN_M)
     )
     visible = z_common & (np.abs(local[:, 0]) <= x_limit) & (np.abs(local[:, 1]) <= y_limit)
     sample_indices = np.flatnonzero(visible)[::max(1, int(np.count_nonzero(visible) / 12000))]
@@ -307,6 +475,76 @@ def render_clearance_topdown(points_3d, target_mask, center, extent, axes, resul
     ])
     cv2.polylines(canvas, [project(required_corners)], True, (0, 210, 210), 1, cv2.LINE_AA)
 
+    side_scan_x = np.asarray(result['side_entry_scan_x_m'], dtype=np.float64)
+    side_candidate_counts = result['side_entry_candidate_counts']
+    side_best_x = result['side_entry_best_x_m']
+    paired_candidate_safe = [
+        side_candidate_counts[0][index] <= CLEARANCE_SIDE_ENTRY_MAX_POINTS
+        and side_candidate_counts[1][index] <= CLEARANCE_SIDE_ENTRY_MAX_POINTS
+        for index in range(len(side_scan_x))
+    ]
+    for side_index, sign in enumerate((-1.0, 1.0)):
+        entry_y = sign * side_entry_distance
+        band_corners = np.array([
+            [-side_scan_half_x, entry_y - CLEARANCE_SIDE_ENTRY_BAND_HALF_Y_M],
+            [side_scan_half_x, entry_y - CLEARANCE_SIDE_ENTRY_BAND_HALF_Y_M],
+            [side_scan_half_x, entry_y + CLEARANCE_SIDE_ENTRY_BAND_HALF_Y_M],
+            [-side_scan_half_x, entry_y + CLEARANCE_SIDE_ENTRY_BAND_HALF_Y_M],
+        ])
+        cv2.polylines(canvas, [project(band_corners)], True, (0, 220, 255), 2, cv2.LINE_AA)
+        candidate_xy = np.column_stack((side_scan_x, np.full_like(side_scan_x, entry_y)))
+        candidate_pixels = project(candidate_xy)
+        for candidate_index, point in enumerate(candidate_pixels):
+            color = (0, 190, 0) if paired_candidate_safe[candidate_index] else (0, 110, 255)
+            cv2.circle(canvas, tuple(point), 2, color, -1, cv2.LINE_AA)
+
+        entry_x = float(side_best_x[side_index])
+        entry_candidate = (
+            ~target_mask
+            & side_z_common
+            & (np.abs(local[:, 0] - entry_x) <= side_half_x)
+            & (np.abs(local[:, 1] - entry_y) <= side_half_y)
+        )
+        for point in project(local[entry_candidate, :2]):
+            cv2.circle(canvas, tuple(point), 2, (0, 80, 255), -1)
+        entry_corners = np.array([
+            [entry_x - side_half_x, entry_y - side_half_y],
+            [entry_x + side_half_x, entry_y - side_half_y],
+            [entry_x + side_half_x, entry_y + side_half_y],
+            [entry_x - side_half_x, entry_y + side_half_y],
+        ])
+        safe = bool(result['side_entry_pair_available'])
+        color = (0, 210, 0) if safe else (0, 80, 255)
+        cv2.polylines(canvas, [project(entry_corners)], True, color, 2, cv2.LINE_AA)
+        label_xy = project(np.array([[entry_x, entry_y + side_half_y]]))[0]
+        cv2.putText(
+            canvas,
+            f"JAW {'-' if sign < 0 else '+'}Y:{result['side_entry_counts'][side_index]} x={entry_x * 1000.0:.0f}",
+            (max(8, label_xy[0] - 70), max(48, label_xy[1] - 7)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    side_entry_local = np.asarray(result['side_entry_cam_m']) @ axes
+    side_inward_local = np.asarray(result['side_inward_cam_m']) @ axes
+    if np.linalg.norm(side_entry_local[:2]) > 1e-6 and np.linalg.norm(side_inward_local[:2]) > 1e-6:
+        side_arrow = project(np.array([
+            side_entry_local[:2],
+            side_entry_local[:2] + side_inward_local[:2],
+        ]))
+        cv2.arrowedLine(
+            canvas,
+            tuple(side_arrow[0]),
+            tuple(side_arrow[1]),
+            (255, 80, 255),
+            3,
+            cv2.LINE_AA,
+            tipLength=0.25,
+        )
+
     push_local = np.asarray(result['push_cam_m']) @ axes
     if np.linalg.norm(push_local[:2]) > 1e-6:
         arrow = project(np.array([[0.0, 0.0], push_local[:2]]))
@@ -320,10 +558,16 @@ def render_clearance_topdown(points_3d, target_mask, center, extent, axes, resul
     cv2.putText(canvas, f"status: {result['status']}", (18, canvas_h - 62), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1, cv2.LINE_AA)
     cv2.putText(
         canvas,
-        f"-Y points={result['negative_points']}  +Y points={result['positive_points']}  "
+        f"-Y={result['negative_points']}  +Y={result['positive_points']}  "
         f"contact={result['obstacle_contact_distance_m'] * 1000.0:.1f}mm  "
         f"push={result['object_push_distance_m'] * 1000.0:.1f}mm",
         (18, canvas_h - 34), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        f"paired_jaws[-Y,+Y]={result['side_entry_counts']}  available={result['side_entry_pair_available']}  "
+        f"grasp_x={result['side_entry_selected_x_m'] * 1000.0:.1f}mm  sweep={np.linalg.norm(result['side_inward_cam_m']) * 1000.0:.1f}mm",
+        (18, canvas_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (230, 230, 230), 1, cv2.LINE_AA,
     )
     return canvas
 
@@ -526,6 +770,13 @@ def save_grasp_feedback(
             'near_percentile': CLEARANCE_NEAR_PERCENTILE,
             'push_extra_m': CLEARANCE_PUSH_EXTRA_M,
             'max_push_m': CLEARANCE_MAX_PUSH_M,
+            'side_entry_gap_m': CLEARANCE_SIDE_ENTRY_GAP_M,
+            'side_entry_half_x_m': CLEARANCE_SIDE_ENTRY_HALF_X_M,
+            'side_entry_scan_step_m': CLEARANCE_SIDE_ENTRY_SCAN_STEP_M,
+            'side_entry_band_half_y_m': CLEARANCE_SIDE_ENTRY_BAND_HALF_Y_M,
+            'side_entry_z_margin_m': CLEARANCE_SIDE_ENTRY_Z_MARGIN_M,
+            'side_entry_max_points': CLEARANCE_SIDE_ENTRY_MAX_POINTS,
+            'side_entry_motion': 'paired_fingers_descend_then_long_axis_sweep_to_sam_center',
         },
     }
     with open(os.path.join(capture_dir, '06_metadata.json'), 'w', encoding='utf-8') as stream:
