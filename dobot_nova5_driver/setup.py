@@ -11,7 +11,25 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
-        (f"share/{package_name}/launch", ["launch/nova5_driver.launch.py"]),
+        (
+            f"share/{package_name}/launch",
+            [
+                "launch/nova5_driver.launch.py",
+                "launch/cosmetic_box_single_arm_cycle.launch.py",
+            ],
+        ),
+        (f"share/{package_name}", ["README_cosmetic_box_single_arm.md"]),
+        (
+            f"share/{package_name}/config",
+            ["config/70-cosmetic-barcode-scanner.rules"],
+        ),
+        (
+            f"share/{package_name}/scripts",
+            [
+                "scripts/grant_cosmetic_barcode_access.sh",
+                "scripts/install_cosmetic_barcode_udev_rule.sh",
+            ],
+        ),
         (
             f"share/{package_name}/dobot_nova5_driver/TCP_IP_Python_V4/files",
             [
@@ -30,6 +48,8 @@ setup(
     entry_points={
         "console_scripts": [
             "nova5_driver_node = dobot_nova5_driver.nova5_driver_node:main",
+            "barcode_scanner_node = dobot_nova5_driver.barcode_scanner_ros_node:main",
+            "nova5_cosmetic_box_cycle = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle:main",
         ],
     },
 )

@@ -879,7 +879,10 @@ class DobotApiDashboard(DobotApi):
         if useJointNear != -1:
             params.append('useJointNear={:d}'.format(useJointNear))
         if JointNear != '':
-            params.append('JointNear={:s}'.format(JointNear))
+            # Dobot TCP/IP V4 parameter names are case-sensitive here.  The
+            # controller expects ``jointNear`` (lowercase j); ``JointNear``
+            # causes InverseKin to return -50001 even for a reachable pose.
+            params.append('jointNear={:s}'.format(JointNear))
         for ii in params:
             string = string + ','+ii
         string = string + ')'

@@ -54,6 +54,11 @@ class DobotNova5Controller:
         self._feedback_thread: threading.Thread | None = None
         self._stop_feedback = threading.Event()
         self._command_lock = threading.Lock()
+        # Incremented by Stop(). Every blocking motion wait captures the epoch
+        # used when its command was submitted, allowing Stop to wake the old
+        # waiter immediately instead of leaving it blocked for 60 seconds on a
+        # command id that the controller has already abandoned.
+        self._motion_cancel_epoch = 0
 
     def connect(self, go_to_start: bool = False, auto_enable: bool = False) -> None:
         self.dashboard = DobotApiDashboard(self.robot_ip, self.dashboard_port)
@@ -171,7 +176,9 @@ class DobotNova5Controller:
     def stop_motion(self) -> None:
         self._ensure_dashboard()
         with self._command_lock:
-            self._raise_if_error(self.dashboard.Stop(), "Stop")
+            response = self.dashboard.Stop()
+            self._motion_cancel_epoch += 1
+            self._raise_if_error(response, "Stop")
         self._wait_until(lambda: self.robot_mode != 10, timeout_s=5.0, detail="robot exit pause after stop")
 
     def wait_until_idle(self, timeout_s: float = 5.0) -> None:
@@ -243,10 +250,14 @@ class DobotNova5Controller:
                 response = self.dashboard.MoveJog("")
             else:
                 response = self.dashboard.MoveJog(axis_id=axis_id, coordtype=coord_type, user=user, tool=tool)
-            self._raise_if_error(
-                response,
-                f"MoveJog({axis_id})",
-            )
+            try:
+                self._raise_if_error(response, f"MoveJog({axis_id})")
+            except RuntimeError as exc:
+                try:
+                    error_detail = str(self.dashboard.GetErrorID()).strip()
+                except Exception as error_exc:
+                    error_detail = f"GetErrorID failed: {error_exc}"
+                raise RuntimeError(f"{exc}; controller_errors={error_detail}") from exc
 
     def read_pose(self, user_index: Optional[int] = None, tool_index: Optional[int] = None) -> TcpPose:
         self._ensure_dashboard()
@@ -270,6 +281,7 @@ class DobotNova5Controller:
     def move_joint(self, joints_deg: list[float], speed: int = 20) -> None:
         self._ensure_dashboard()
         with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
             self._raise_if_error(self.dashboard.SpeedFactor(int(speed)), "SpeedFactor")
             response = self.dashboard.MovJ(
                 float(joints_deg[0]),
@@ -282,7 +294,7 @@ class DobotNova5Controller:
                 v=int(speed),
             )
         command_id = self._require_command_id(response, "MovJ")
-        self._wait_for_command(command_id, timeout_s=60.0)
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
 
     def move_joint_tcp(
         self,
@@ -297,6 +309,7 @@ class DobotNova5Controller:
         if (user_index is None) != (tool_index is None):
             raise ValueError("user_index and tool_index must be provided together")
         with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
             response = self.dashboard.MovJ(
                 pose_m_deg.x * MM_PER_METER,
                 pose_m_deg.y * MM_PER_METER,
@@ -312,7 +325,7 @@ class DobotNova5Controller:
                 cp=-1 if cp is None else int(cp),
             )
         command_id = self._require_command_id(response, "MovJ")
-        self._wait_for_command(command_id, timeout_s=60.0)
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
 
     def move_linear_tcp(
         self,
@@ -326,6 +339,7 @@ class DobotNova5Controller:
         if (user_index is None) != (tool_index is None):
             raise ValueError("user_index and tool_index must be provided together")
         with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
             response = self.dashboard.MovL(
                 pose_m_deg.x * MM_PER_METER,
                 pose_m_deg.y * MM_PER_METER,
@@ -340,7 +354,7 @@ class DobotNova5Controller:
                 v=int(speed),
             )
         command_id = self._require_command_id(response, "MovL")
-        self._wait_for_command(command_id, timeout_s=60.0)
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
 
     def inverse_kinematics(
         self,
@@ -388,6 +402,7 @@ class DobotNova5Controller:
         if (user_index is None) != (tool_index is None):
             raise ValueError("user_index and tool_index must be provided together")
         with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
             response = self.dashboard.RelMovJTool(
                 offset_pose_m_deg.x * MM_PER_METER,
                 offset_pose_m_deg.y * MM_PER_METER,
@@ -402,7 +417,7 @@ class DobotNova5Controller:
                 cp=-1 if cp is None else int(cp),
             )
         command_id = self._require_command_id(response, "RelMovJTool")
-        self._wait_for_command(command_id, timeout_s=60.0)
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
 
     def rel_move_user_joint(
         self,
@@ -417,6 +432,7 @@ class DobotNova5Controller:
         if (user_index is None) != (tool_index is None):
             raise ValueError("user_index and tool_index must be provided together")
         with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
             response = self.dashboard.RelMovJUser(
                 offset_pose_m_deg.x * MM_PER_METER,
                 offset_pose_m_deg.y * MM_PER_METER,
@@ -431,7 +447,7 @@ class DobotNova5Controller:
                 cp=-1 if cp is None else int(cp),
             )
         command_id = self._require_command_id(response, "RelMovJUser")
-        self._wait_for_command(command_id, timeout_s=60.0)
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
 
     def relative_point_user(
         self,
@@ -490,14 +506,26 @@ class DobotNova5Controller:
     def _wait_for_feedback(self, timeout_s: float = 3.0) -> None:
         self._wait_until(lambda: self.feedback_data is not None, timeout_s=timeout_s, detail="first feedback packet")
 
-    def _wait_for_command(self, command_id: int, timeout_s: float) -> None:
+    def _wait_for_command(self, command_id: int, timeout_s: float, command_epoch: int) -> None:
         def done() -> bool:
+            if command_epoch != self._motion_cancel_epoch:
+                raise RuntimeError(
+                    f"Motion command {command_id} cancelled by Stop; releasing command wait"
+                )
             if self.feedback_data is None:
                 return False
             current_command_id = int(self.feedback_data["CurrentCommandId"][0])
             mode = self.robot_mode
             if mode == 9:
-                raise RuntimeError("Robot entered error mode while waiting for motion completion")
+                error_detail = "GetErrorID unavailable"
+                try:
+                    with self._command_lock:
+                        error_detail = str(self.dashboard.GetErrorID()).strip()
+                except Exception as exc:
+                    error_detail = f"GetErrorID failed: {exc}"
+                raise RuntimeError(
+                    f"Robot entered error mode while waiting for motion completion; {error_detail}"
+                )
             if mode == 10:
                 raise RuntimeError("Motion paused before command completion")
             return mode == 5 and current_command_id == command_id

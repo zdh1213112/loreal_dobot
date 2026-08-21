@@ -1,0 +1,3 @@
+# Give the active desktop user persistent access to this HID barcode scanner.
+# The rule runs before systemd's 73-seat-late.rules so TAG+="uaccess" is applied.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", ENV{ID_VENDOR_ID}=="0525", ENV{ID_MODEL_ID}=="a4ac", ENV{ID_SERIAL}=="Linux_3.0.8_with_fh_otg_BTW_Hid_Device", MODE="0660", TAG+="uaccess"

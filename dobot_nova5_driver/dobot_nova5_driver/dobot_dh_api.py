@@ -33,7 +33,10 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 
-from TCP_IP_Python_V4.dobot_api import DobotApiDashboard  # noqa: E402
+try:
+    from .TCP_IP_Python_V4.dobot_api import DobotApiDashboard  # noqa: E402
+except ImportError:  # Support direct execution of this helper as a script.
+    from TCP_IP_Python_V4.dobot_api import DobotApiDashboard  # noqa: E402
 
 REG_INITIALIZE = 0x0100
 REG_FORCE = 0x0101
@@ -180,9 +183,14 @@ class DHGripper:
     ) -> None:
         if not 0.0 <= position <= 1.0:
             raise ValueError(f"position must be in [0, 1], got {position}.")
+        initial_position = self.read_position() if wait else None
         self.write_register(REG_POSITION, int(round(position * DH_POS_OPEN)))
         if wait:
-            self.wait_until_stopped(timeout_s=timeout_s)
+            self.wait_until_stopped(
+                timeout_s=timeout_s,
+                target_position=position,
+                initial_position=initial_position,
+            )
 
     def open(self, wait: bool = False) -> None:
         self.set_position(1.0, wait=wait)
@@ -190,12 +198,37 @@ class DHGripper:
     def close(self, wait: bool = False) -> None:
         self.set_position(0.0, wait=wait)
 
-    def wait_until_stopped(self, timeout_s: float = 10.0) -> int:
+    def wait_until_stopped(
+        self,
+        timeout_s: float = 10.0,
+        target_position: float | None = None,
+        initial_position: float | None = None,
+    ) -> int:
+        start = time.monotonic()
         deadline = time.monotonic() + timeout_s
+        motion_seen = False
         while time.monotonic() < deadline:
             state = self.read_grip_state()
-            if state in (GRIP_REACHED, GRIP_GRIPPED, GRIP_DROPPED):
-                return state
+            if state == GRIP_IN_MOTION:
+                motion_seen = True
+            elif state in (GRIP_REACHED, GRIP_GRIPPED, GRIP_DROPPED):
+                # Immediately after a new command the AG-95 can briefly return
+                # the terminal state of the previous command. Do not treat that
+                # stale value as completion, otherwise the robot may lift while
+                # the fingers have only just started closing.
+                current_position = self.read_position()
+                target_reached = (
+                    target_position is not None
+                    and abs(current_position - target_position) <= 0.01
+                )
+                position_changed = (
+                    initial_position is not None
+                    and abs(current_position - initial_position) >= 0.01
+                )
+                elapsed = time.monotonic() - start
+                object_terminal = state in (GRIP_GRIPPED, GRIP_DROPPED)
+                if motion_seen or target_reached or (elapsed >= 0.20 and position_changed and object_terminal):
+                    return state
             time.sleep(0.05)
         raise TimeoutError(f"DH gripper did not stop within {timeout_s:.1f}s.")
 
