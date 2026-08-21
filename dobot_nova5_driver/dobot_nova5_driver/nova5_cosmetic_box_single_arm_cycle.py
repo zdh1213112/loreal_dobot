@@ -116,6 +116,15 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("linear_speed", 30)
         self.declare_parameter("linear_acc", 30)
         self.declare_parameter("jog_speed_factor", 20.0)
+        # 扫码器靠近速度：盒子到达 transfer_joint 后，沿 User 0 X+ 自适应
+        # 靠近扫码器时使用。它只影响这段 X+ 位移，不影响抓取、抬升或放置。
+        self.declare_parameter("scanner_approach_speed_factor", 35)
+        # J6 多面找码速度：只影响找码期间 J6 的连续点动，以及扫码成功后
+        # 吸附到最近 90° 标准面的对齐动作。速度越高，停止超调通常越大。
+        self.declare_parameter("barcode_j6_speed_factor", 55)
+        # 扫码后末端翻转速度：只影响保持 TCP XYZ 不动、绕用户/基底坐标系
+        # Ry（以后若扩展为 Rx/Rz 也应复用此参数）的纯姿态点动。
+        self.declare_parameter("face_up_rotation_speed_factor", 35)
         self.declare_parameter("jog_tolerance_m", 0.002)
         self.declare_parameter("jog_axis_timeout_s", 20.0)
         self.declare_parameter("grasp_lift_m", 0.060)
@@ -162,7 +171,7 @@ class CosmeticBoxSingleArmNode(Node):
         # unlike frame-by-frame vision detections it need not be seen 3 times.
         self.declare_parameter("barcode_stable_hits", 1)
         self.declare_parameter("barcode_hit_gap_s", 0.7)
-        self.declare_parameter("barcode_face_wait_s", 1.5)
+        self.declare_parameter("barcode_face_wait_s", 0.5) #当前面等待0.5秒
         self.declare_parameter("barcode_max_face_rotations", 4)
         # Each next-face search may rotate wrist J6 by as much as -90 degrees,
         # with a joint-limit guard. Live monitoring below stops it earlier when
@@ -199,9 +208,9 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("dh_slave_id", 1)
         self.declare_parameter("dh_tool_identify", 1)
         self.declare_parameter("dh_timeout_s", 10.0)
-        self.declare_parameter("grasp_close_settle_s", 0.8)
-        self.declare_parameter("grasp_confirm_samples", 3)
-        self.declare_parameter("grasp_confirm_interval_s", 0.15)
+        self.declare_parameter("grasp_close_settle_s", 0.4)
+        self.declare_parameter("grasp_confirm_samples", 2)
+        self.declare_parameter("grasp_confirm_interval_s", 0.05)
         self.declare_parameter("grasp_feedback_wait_s", 1.5)
         self.declare_parameter("single_cycle_grasp_retry_limit", 3)
         self.declare_parameter("grasp_success_min_opening_m", 0.003)
@@ -881,11 +890,27 @@ class CosmeticBoxSingleArmNode(Node):
             tool_index=int(self.get_parameter("command_tool_index").value),
         )
 
-    def _relative_user_move(self, x=0.0, y=0.0, z=0.0, rx=0.0, ry=0.0, rz=0.0, label="relative user move") -> None:
+    def _relative_user_move(
+        self,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+        rx=0.0,
+        ry=0.0,
+        rz=0.0,
+        label="relative user move",
+        speed_factor: int | None = None,
+    ) -> None:
+        # 未指定专用速度时仍使用普通关节速度；扫码器靠近等独立阶段可显式传入。
+        motion_speed = (
+            int(self.get_parameter("joint_speed").value)
+            if speed_factor is None
+            else max(1, min(100, int(speed_factor)))
+        )
         self._publish_status(label)
         self.controller.rel_move_user_joint(
             TcpPose(float(x), float(y), float(z), float(rx), float(ry), float(rz)),
-            speed=int(self.get_parameter("joint_speed").value),
+            speed=motion_speed,
             accel=int(self.get_parameter("joint_acc").value),
             user_index=int(self.get_parameter("user_index").value),
             tool_index=int(self.get_parameter("command_tool_index").value),
@@ -932,7 +957,12 @@ class CosmeticBoxSingleArmNode(Node):
             self._publish_status(formula + "; already at requested clearance")
             return
         tcp_before = self._current_command_pose()
-        self._relative_user_move(x=approach_m, label=formula)
+        scanner_speed = int(self.get_parameter("scanner_approach_speed_factor").value)
+        self._relative_user_move(
+            x=approach_m,
+            label=f"{formula}; speed={scanner_speed}%",
+            speed_factor=scanner_speed,
+        )
         self._require_cycle_active("after adaptive scanner approach")
         tcp_after = self._current_command_pose()
         actual_x_m = tcp_after.x - tcp_before.x
@@ -1018,9 +1048,14 @@ class CosmeticBoxSingleArmNode(Node):
             abs(float(self.get_parameter("barcode_flip_jog_tolerance_deg").value)),
         )
         timeout_s = max(1.0, float(self.get_parameter("barcode_flip_jog_timeout_s").value))
+        barcode_speed = max(
+            1,
+            min(100, int(self.get_parameter("barcode_j6_speed_factor").value)),
+        )
         self._publish_status(
             f"barcode face {face_index}: monitored {axis_name} jog "
-            f"{start_joint_deg:.1f}->{target_joint_deg:.1f}deg; stop immediately on scan"
+            f"{start_joint_deg:.1f}->{target_joint_deg:.1f}deg at {barcode_speed}%; "
+            f"stop immediately on scan"
         )
 
         captured_barcode = ""
@@ -1028,7 +1063,7 @@ class CosmeticBoxSingleArmNode(Node):
         progress_deg = 0.0
         start_time = time.monotonic()
         try:
-            self.controller.set_speed_factor(int(self.get_parameter("joint_speed").value))
+            self.controller.set_speed_factor(barcode_speed)
             self.controller.move_jog(
                 axis_name,
                 coord_type=1,
@@ -1077,6 +1112,13 @@ class CosmeticBoxSingleArmNode(Node):
                     self.get_logger().warning(
                         f"Stopping barcode {axis_name} jog returned: {stop_exc}"
                     )
+            try:
+                # 避免 J6 专用速度残留并影响后续普通机械臂动作。
+                self.controller.set_speed_factor(int(self.get_parameter("joint_speed").value))
+            except Exception as speed_exc:
+                self.get_logger().warning(
+                    f"Restoring robot speed factor after barcode jog failed: {speed_exc}"
+                )
 
         self._require_cycle_active(f"after barcode {axis_name} jog")
         final_joints = self.controller.current_joint()
@@ -1116,7 +1158,7 @@ class CosmeticBoxSingleArmNode(Node):
             aligned_joints[watch_index] = snap_target_deg
             self.controller.move_joint(
                 aligned_joints,
-                speed=int(self.get_parameter("joint_speed").value),
+                speed=barcode_speed,
             )
             self._require_cycle_active(f"after barcode face alignment to {face_anchor} anchor")
             final_joints = self.controller.current_joint()
@@ -1245,7 +1287,7 @@ class CosmeticBoxSingleArmNode(Node):
                         aligned_joints[watch_index] = next_face_anchor_deg
                         self.controller.move_joint(
                             [float(joint) for joint in aligned_joints],
-                            speed=int(self.get_parameter("joint_speed").value),
+                            speed=int(self.get_parameter("barcode_j6_speed_factor").value),
                         )
                         self._require_cycle_active("after waiting-phase barcode face alignment")
                     return value
@@ -1327,11 +1369,15 @@ class CosmeticBoxSingleArmNode(Node):
             0.0005,
             float(self.get_parameter("face_up_fixed_xyz_tolerance_m").value),
         )
+        rotation_speed = max(
+            1,
+            min(100, int(self.get_parameter("face_up_rotation_speed_factor").value)),
+        )
 
         self._publish_status(
             f"user-frame {axis_name} MoveJog to {total_delta_deg:+.1f}deg with fixed TCP XYZ; "
             f"User={user_index}, Tool={tool_index}, speed_factor="
-            f"{int(self.get_parameter('joint_speed').value)}%, XYZ=({fixed_xyz[0]*1000:.1f},"
+            f"{rotation_speed}%, XYZ=({fixed_xyz[0]*1000:.1f},"
             f"{fixed_xyz[1]*1000:.1f},{fixed_xyz[2]*1000:.1f})mm"
         )
         jog_started = False
@@ -1339,11 +1385,9 @@ class CosmeticBoxSingleArmNode(Node):
         start_time = time.monotonic()
         last_log_progress = -10.0
         try:
-            # The previous working implementation inherited the joint-motion
-            # speed factor at this point.  Do not use jog_speed_factor here:
-            # that GUI value belongs to the slow XYZ PTP move and made a 90
-            # degree rotation exceed the old 25 second timeout.
-            self.controller.set_speed_factor(int(self.get_parameter("joint_speed").value))
+            # 纯姿态旋转使用独立速度，不与普通关节运动、J6 找码或扫码器
+            # 靠近速度联动；jog_speed_factor 仍只属于扫码后的 XYZ PTP。
+            self.controller.set_speed_factor(rotation_speed)
             self.controller.move_jog(axis_name, coord_type=1, user=user_index, tool=tool_index)
             jog_started = True
             while True:
@@ -1583,6 +1627,10 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.barcode_hits = QSpinBox(); self.barcode_hits.setRange(1, 20); self.barcode_hits.setValue(int(self.node.get_parameter("barcode_stable_hits").value))
         self.barcode_rotations = QSpinBox(); self.barcode_rotations.setRange(4, 4); self.barcode_rotations.setValue(4)
         self.barcode_wait = self._new_double(float(self.node.get_parameter("barcode_face_wait_s").value), 0.1, 10.0, 1, 0.1)
+        # 三段扫码相关运动分别调速，避免修改普通“关节速度”时全部一起变化。
+        self.scanner_approach_speed = QSpinBox(); self.scanner_approach_speed.setRange(1, 100); self.scanner_approach_speed.setValue(int(self.node.get_parameter("scanner_approach_speed_factor").value))
+        self.barcode_j6_speed = QSpinBox(); self.barcode_j6_speed.setRange(1, 100); self.barcode_j6_speed.setValue(int(self.node.get_parameter("barcode_j6_speed_factor").value))
+        self.face_up_rotation_speed = QSpinBox(); self.face_up_rotation_speed.setRange(1, 100); self.face_up_rotation_speed.setValue(int(self.node.get_parameter("face_up_rotation_speed_factor").value))
         self.barcode_rz = self._new_double(float(self.node.get_parameter("barcode_flip_step_deg").value), -180.0, 180.0, 1, 5.0)
         self.face_up_user_ry = self._new_double(float(self.node.get_parameter("face_up_user_ry_deg").value), -180.0, 180.0, 1, 5.0)
         self.face_up_jog_tolerance = self._new_double(float(self.node.get_parameter("face_up_jog_tolerance_deg").value), 0.2, 10.0, 1, 0.2)
@@ -1593,8 +1641,11 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("每面等待秒", self.barcode_wait)
         form.addRow("中转 TCP 到扫码器距离 mm", self.scanner_center_distance)
         form.addRow("盒侧面扫码间隙 mm", self.scanner_face_clearance)
+        form.addRow("靠近扫码器 User X+ 速度 %", self.scanner_approach_speed)
+        form.addRow("J6 多面找码/对齐速度 %", self.barcode_j6_speed)
         form.addRow("找码 J6 步进 deg（旧逻辑）", self.barcode_rz)
         form.addRow("扫码后用户 Ry 旋转 deg", self.face_up_user_ry)
+        form.addRow("扫码后末端 Ry 旋转速度 %", self.face_up_rotation_speed)
         form.addRow("Ry 点动停止容差 deg", self.face_up_jog_tolerance)
         layout.addWidget(box)
 
@@ -1665,8 +1716,11 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("barcode_face_wait_s", value=self.barcode_wait.value()),
             Parameter("scanner_center_distance_m", value=self.scanner_center_distance.value() / 1000.0),
             Parameter("scanner_face_clearance_m", value=self.scanner_face_clearance.value() / 1000.0),
+            Parameter("scanner_approach_speed_factor", value=self.scanner_approach_speed.value()),
+            Parameter("barcode_j6_speed_factor", value=self.barcode_j6_speed.value()),
             Parameter("barcode_flip_step_deg", value=self.barcode_rz.value()),
             Parameter("face_up_user_ry_deg", value=self.face_up_user_ry.value()),
+            Parameter("face_up_rotation_speed_factor", value=self.face_up_rotation_speed.value()),
             Parameter("face_up_jog_tolerance_deg", value=self.face_up_jog_tolerance.value()),
         ]
         results = self.node.set_parameters(parameters)
