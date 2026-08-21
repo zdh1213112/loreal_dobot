@@ -120,7 +120,11 @@ spin_thread = threading.Thread(target=spin_ros, daemon=True)
 spin_thread.start()
 
 pose_pub = ros_node.create_publisher(PoseStamped, "/target_pose_cam_fine", 10)
+# 点云包围盒短边加开爪余量，供 DH 夹爪预张开使用。
 width_pub = ros_node.create_publisher(Float32, "/gripper_target_width", 10)
+# 点云包围盒长边的真实尺寸（不加夹爪余量），供扫码靠近距离计算使用。
+length_pub = ros_node.create_publisher(Float32, "/cosmetic_box_length", 10)
+# 顶面与桌面之间的盒子高度，供 75% 下爪深度计算使用。
 height_pub = ros_node.create_publisher(Float32, "/cosmetic_box_height", 10)
 rgb_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local_rgb/image/compressed", 1)
 cloud_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local_cloud/image/compressed", 1)
@@ -1033,6 +1037,14 @@ try:
                                             width_msg = Float32()
                                             width_msg.data = float(min(MAX_GRIPPER_OPENING_M, smooth_extent[1] + GRIP_CLEARANCE_M))
                                             width_pub.publish(width_msg)
+                                            length_msg = Float32()
+                                            # x_axis follows the long side of the segmented
+                                            # top surface.  Publish its physical extent
+                                            # without gripper clearance so the robot can
+                                            # position the near box face relative to the
+                                            # barcode scanner.
+                                            length_msg.data = float(smooth_extent[0])
+                                            length_pub.publish(length_msg)
                                             height_msg = Float32()
                                             height_msg.data = last_height_m
                                             height_pub.publish(height_msg)
@@ -1042,7 +1054,8 @@ try:
                                                 locked_target_ready = True
                                                 locked_target_height_m = last_height_m
                                                 logging.info(
-                                                    f"[D405] Published stable target: height={last_height_m*1000:.1f}mm, "
+                                                    f"[D405] Published stable target: length={smooth_extent[0]*1000:.1f}mm, "
+                                                    f"height={last_height_m*1000:.1f}mm, "
                                                     f"depth={GRASP_DEPTH_RATIO*100:.0f}%, evidence={last_height_evidence_mode}; "
                                                     "SAM2 display tracking remains active."
                                                 )
@@ -1113,6 +1126,8 @@ try:
                 target_label += f" | camX:{locked_target_camera_x:+.3f}m"
             if locked_target_height_m is not None:
                 target_label += f" | H:{locked_target_height_m*1000:.1f}mm"
+            if smooth_extent is not None:
+                target_label += f" | L:{smooth_extent[0]*1000:.1f}mm"
             text_size, font_baseline_px = cv2.getTextSize(
                 target_label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2
             )
@@ -1154,7 +1169,8 @@ try:
         cv2.putText(display, f"{status} | FPS {fps:.1f} | {exposure_status} | {roi_status}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0) if sam_initialized else (0, 165, 255), 2)
         cv2.putText(display, "drag mouse=lock ROI | select=min camera X inside ROI | r=clear ROI/reset | a=AE | q=quit", (10, 47), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 220, 255), 1)
         if last_height_m is not None:
-            cv2.putText(display, f"height={last_height_m*1000:.1f}mm side_planes={last_side_planes} side_pts={last_side_points} depth=75%", (10, IMG_HEIGHT - 31), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1)
+            length_text = "" if smooth_extent is None else f" length={smooth_extent[0]*1000:.1f}mm"
+            cv2.putText(display, f"height={last_height_m*1000:.1f}mm{length_text} side_planes={last_side_planes} side_pts={last_side_points} depth=75%", (10, IMG_HEIGHT - 31), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1)
             cv2.putText(display, f"height evidence: {last_height_evidence_mode}", (10, IMG_HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 255, 255), 1)
 
         publish_jpeg(rgb_pub, display, "d405_local_rgb")
