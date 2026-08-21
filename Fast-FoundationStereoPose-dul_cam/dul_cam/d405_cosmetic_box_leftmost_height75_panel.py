@@ -60,8 +60,9 @@ IMG_HEIGHT = 480
 PCD_STRIDE = 2
 IR_PROJECTOR_ON = True
 # 触发后清除相机管线中可能滞留的旧帧。自动曝光在等待触发期间一直工作，
-# 因此 5 帧足以刷新画面，同时比原来的 15 帧减少约 0.33 秒等待（30 FPS）。
-CAPTURE_FLUSH_FRAMES = 5
+# 眼在手相机到达初始关节位后仍需丢弃少量运动尾帧；2 帧约为 67 ms，
+# 可以避免使用回程中的图像，同时比原来的 15 帧减少约 0.43 秒等待（30 FPS）。
+CAPTURE_FLUSH_FRAMES = 2
 
 # Cosmetic-box geometry parameters
 MAX_PLANES = 3
@@ -698,52 +699,66 @@ try:
             current_mask = (mask_logits[0] > 0.0).permute(1, 2, 0).byte().cpu().numpy().squeeze() if len(object_ids) else None
             tracking_frames_without_height += 1
 
-        ir_left = np.asanyarray(frames.get_infrared_frame(1).get_data())
-        ir_right = np.asanyarray(frames.get_infrared_frame(2).get_data())
-        left_rgb, right_rgb = np.stack([ir_left] * 3, axis=-1), np.stack([ir_right] * 3, axis=-1)
-        image0 = torch.as_tensor(left_rgb).cuda().float()[None].permute(0, 3, 1, 2)
-        image1 = torch.as_tensor(right_rgb).cuda().float()[None].permute(0, 3, 1, 2)
-        padder = InputPadder(image0.shape, divis_by=32, force_square=False)
-        image0_p, image1_p = padder.pad(image0, image1)
-        with torch.amp.autocast("cuda", enabled=True, dtype=AMP_DTYPE):
-            disparity = ffs_model.forward(image0_p, image1_p, iters=VALID_ITERS, test_mode=True, optimize_build_volume="pytorch1")
-        disparity = padder.unpad(disparity.float()).data.cpu().numpy().reshape(IMG_HEIGHT, IMG_WIDTH).clip(0, None)
-        disparity_finite = disparity[np.isfinite(disparity)]
-        depth = fx_ir * stereo_baseline_m / (disparity + 1e-6)
-        depth[(depth < ZNEAR) | (depth > ZFAR) | ~np.isfinite(depth)] = 0
-        bad_edge = (np.abs(cv2.Sobel(depth, cv2.CV_64F, 1, 0, ksize=3)) > 0.5) | (np.abs(cv2.Sobel(depth, cv2.CV_64F, 0, 1, ksize=3)) > 0.5)
-        depth[bad_edge] = 0
-
-        z_flat = depth[::PCD_STRIDE, ::PCD_STRIDE].reshape(-1)
-        valid_depth = z_flat > 0
-        z, u, v = z_flat[valid_depth], u_flat[valid_depth], v_flat[valid_depth]
-        points_3d = np.stack(((u - cx_ir) * z / fx_ir, (v - cy_ir) * z / fy_ir, z), axis=-1)
-        points_color = (R_ir_to_color @ points_3d.T).T + T_ir_to_color
-        u_rgb = (K_color[0, 0] * points_color[:, 0] / points_color[:, 2] + K_color[0, 2]).astype(np.int32)
-        v_rgb = (K_color[1, 1] * points_color[:, 1] / points_color[:, 2] + K_color[1, 2]).astype(np.int32)
-        in_bounds = (u_rgb >= 0) & (u_rgb < IMG_WIDTH) & (v_rgb >= 0) & (v_rgb < IMG_HEIGHT)
-        colors = np.zeros((len(points_3d), 3), dtype=np.float64)
-        colors[in_bounds] = color_bgr[v_rgb[in_bounds], u_rgb[in_bounds], ::-1].astype(np.float64) / 255.0
-        using_locked_cloud = False
-
-        # The scene and camera remain stationary between target selection and
-        # pose publication. If FFS temporarily returns no points after SAM2 is
-        # initialized, reuse the valid cloud captured for this exact YOLO
-        # selection instead of presenting a black cloud or fabricating depth.
-        if len(points_3d) < 40 and locked_cloud_points is not None:
+        # YOLO 的相机 X 排序必须使用本次触发刚计算出的 FFS 点云。选中目标后，
+        # 相机和场景在机械臂开始抓取前保持静止，因此 SAM2 的后续稳定帧直接复用
+        # 这份锁定点云，避免为同一个静止场景重复运行昂贵的 FFS 推理。
+        reuse_selection_cloud = (
+            locked_cloud_points is not None
+            and pending_yolo_obbs is None
+            and not locked_target_ready
+        )
+        if reuse_selection_cloud:
             points_3d = locked_cloud_points
             u_rgb = locked_cloud_u_rgb
             v_rgb = locked_cloud_v_rgb
             in_bounds = locked_cloud_in_bounds
             colors = locked_cloud_colors.copy()
             using_locked_cloud = True
-            now = time.time()
-            if now - last_cloud_fallback_time >= 1.0:
-                logging.warning(
-                    f"[depth] Live FFS cloud has fewer than 40 points; using locked selection "
-                    f"snapshot with {len(points_3d)} points."
-                )
-                last_cloud_fallback_time = now
+        else:
+            ir_left = np.asanyarray(frames.get_infrared_frame(1).get_data())
+            ir_right = np.asanyarray(frames.get_infrared_frame(2).get_data())
+            left_rgb, right_rgb = np.stack([ir_left] * 3, axis=-1), np.stack([ir_right] * 3, axis=-1)
+            image0 = torch.as_tensor(left_rgb).cuda().float()[None].permute(0, 3, 1, 2)
+            image1 = torch.as_tensor(right_rgb).cuda().float()[None].permute(0, 3, 1, 2)
+            padder = InputPadder(image0.shape, divis_by=32, force_square=False)
+            image0_p, image1_p = padder.pad(image0, image1)
+            with torch.amp.autocast("cuda", enabled=True, dtype=AMP_DTYPE):
+                disparity = ffs_model.forward(image0_p, image1_p, iters=VALID_ITERS, test_mode=True, optimize_build_volume="pytorch1")
+            disparity = padder.unpad(disparity.float()).data.cpu().numpy().reshape(IMG_HEIGHT, IMG_WIDTH).clip(0, None)
+            disparity_finite = disparity[np.isfinite(disparity)]
+            depth = fx_ir * stereo_baseline_m / (disparity + 1e-6)
+            depth[(depth < ZNEAR) | (depth > ZFAR) | ~np.isfinite(depth)] = 0
+            bad_edge = (np.abs(cv2.Sobel(depth, cv2.CV_64F, 1, 0, ksize=3)) > 0.5) | (np.abs(cv2.Sobel(depth, cv2.CV_64F, 0, 1, ksize=3)) > 0.5)
+            depth[bad_edge] = 0
+
+            z_flat = depth[::PCD_STRIDE, ::PCD_STRIDE].reshape(-1)
+            valid_depth = z_flat > 0
+            z, u, v = z_flat[valid_depth], u_flat[valid_depth], v_flat[valid_depth]
+            points_3d = np.stack(((u - cx_ir) * z / fx_ir, (v - cy_ir) * z / fy_ir, z), axis=-1)
+            points_color = (R_ir_to_color @ points_3d.T).T + T_ir_to_color
+            u_rgb = (K_color[0, 0] * points_color[:, 0] / points_color[:, 2] + K_color[0, 2]).astype(np.int32)
+            v_rgb = (K_color[1, 1] * points_color[:, 1] / points_color[:, 2] + K_color[1, 2]).astype(np.int32)
+            in_bounds = (u_rgb >= 0) & (u_rgb < IMG_WIDTH) & (v_rgb >= 0) & (v_rgb < IMG_HEIGHT)
+            colors = np.zeros((len(points_3d), 3), dtype=np.float64)
+            colors[in_bounds] = color_bgr[v_rgb[in_bounds], u_rgb[in_bounds], ::-1].astype(np.float64) / 255.0
+            using_locked_cloud = False
+
+            # 锁定完成后恢复 LIVE FFS 以维持点云跟随；若某一帧立体网络临时
+            # 丢失深度，仍回退到本次目标的锁定快照，避免点云窗口突然变黑。
+            if len(points_3d) < 40 and locked_cloud_points is not None:
+                points_3d = locked_cloud_points
+                u_rgb = locked_cloud_u_rgb
+                v_rgb = locked_cloud_v_rgb
+                in_bounds = locked_cloud_in_bounds
+                colors = locked_cloud_colors.copy()
+                using_locked_cloud = True
+                now = time.time()
+                if now - last_cloud_fallback_time >= 1.0:
+                    logging.warning(
+                        f"[depth] Live FFS cloud has fewer than 40 points; using locked "
+                        f"selection snapshot with {len(points_3d)} points."
+                    )
+                    last_cloud_fallback_time = now
 
         # Rank every YOLO box by measured camera-optical X. No ROI, coarse prior,
         # image-center fallback, or image-left heuristic is used.

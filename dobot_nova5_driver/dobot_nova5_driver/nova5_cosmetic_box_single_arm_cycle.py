@@ -744,11 +744,15 @@ class CosmeticBoxSingleArmNode(Node):
             f"Z_correction={z_offset_m*1000:+.1f}mm, command_Z={target.z*1000:.1f}mm, "
             f"box_height={height_m*1000:.1f}mm"
         )
-        self._publish_status("opening gripper to measured box width")
+        self._publish_status("commanding measured gripper width; pre-shaping during move-above")
         max_opening = float(self.get_parameter("dh_max_opening_m").value)
         width_m = max(0.0, min(max_opening, width_m))
-        self.gripper.set_position(width_m / max_opening, wait=True)
-        self._require_cycle_active("after pre-opening gripper")
+        pre_shape_position = width_m / max_opening
+        pre_shape_initial = self.gripper.read_position()
+        # 夹爪预张开和机械臂前往目标上方互不冲突。先下发非阻塞命令，
+        # 到达目标上方后再确认夹爪已经停止，从串行流程中隐藏约 0.6 秒。
+        self.gripper.set_position(pre_shape_position, wait=False)
+        self._require_cycle_active("after commanding gripper pre-shape")
 
         self.controller.inverse_kinematics(
             target,
@@ -767,6 +771,12 @@ class CosmeticBoxSingleArmNode(Node):
             tool_index=int(self.get_parameter("command_tool_index").value),
         )
         self._require_cycle_active("after move-above")
+        self.gripper.wait_until_stopped(
+            timeout_s=float(self.get_parameter("dh_timeout_s").value),
+            target_position=pre_shape_position,
+            initial_position=pre_shape_initial,
+        )
+        self._require_cycle_active("after confirming gripper pre-shape")
         self._publish_status("descending TCP tip to 75% box height")
         self.controller.move_linear_tcp(
             target,

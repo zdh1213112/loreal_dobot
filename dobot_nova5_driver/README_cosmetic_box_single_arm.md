@@ -63,7 +63,7 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `scanner_retreat_speed_factor=60`：扫码成功后沿 User X− 安全退让的速度。
 - `scanner_retreat_extra_m=0.030`：退回实际靠近距离后继续远离扫码器的额外安全余量。
 - `barcode_j6_speed_factor=70`：只控制 J6 多面找码，以及扫码成功后的标准面对齐速度；设置过高会增大急停超调。
-- `vision_samples=2`：机器人使用两帧结果进行跨帧稳定性检查；视觉触发旧帧刷新由 15 帧缩短为 5 帧。
+- `vision_samples=2`：机器人仍使用两帧结果检查 SAM2 目标稳定性；眼在手相机到达初始位后只刷新 2 帧，并复用本次目标选择时的锁定 FFS 点云，避免静止场景重复计算立体深度。
 - `vision_result_topic=/d405_vision_result`：视觉端会明确返回本次请求成功或失败；ROI 内无目标、YOLO 无目标、立体点不足时，机械臂不再固定等满 `vision_timeout_s=8.0`。
 - `vision_retry_delay_s=0.3`：连续模式一次检测明确失败后，到发起下一次检测之间的等待时间。
 - `barcode_face_wait_s=0.1`：每个 J6 标准面等待扫码的最长时间。
@@ -72,7 +72,7 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `grasp_z_offset_m=0.010`：根据当前实机日志默认将视觉抓取 Z 上移 10 mm，用于补偿手眼高度偏差；界面中正值表示抓得更浅。
 - `minimum_safe_tcp_z_m=0.010`：抓取命令不会低于 10 mm；低于该值时自动钳位并打印警告。
 
-界面中可以修改初始关节、中转关节、扫码后用户 XYZ、组合 User Ry/Rz 增量、最终放置位姿、普通运动速度、扫码器靠近速度、J6 找码速度、夹爪力、抓取 Z 修正、TCP 最低安全 Z、抬升高度及扫码稳定参数。下降到位后，程序会在原位等待夹爪完成闭合并检查 `state=2`，确认夹持后才允许抬升；抬升后会再次检查是否掉落。建议先“只采样视觉”，确认结果后再执行完整一轮。
+界面中可以修改初始关节、中转关节、扫码后用户 XYZ、组合 User Ry/Rz 增量、最终放置位姿、普通运动速度、扫码器靠近速度、J6 找码速度、夹爪力、抓取 Z 修正、TCP 最低安全 Z、抬升高度及扫码稳定参数。接受视觉目标后，夹爪预张开会与机械臂移动到目标上方并行，到达上方后仍会确认夹爪已停止才允许下降。下降到位后，程序会在原位等待夹爪完成闭合并检查 `state=2`，确认夹持后才允许抬升；抬升后会再次检查是否掉落。建议先“只采样视觉”，确认结果后再执行完整一轮。
 
 观察状态：
 
