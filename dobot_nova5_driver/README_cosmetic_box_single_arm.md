@@ -25,6 +25,15 @@ source install/setup.bash
 ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle.launch.py
 ```
 
+启动文件当前默认使用统一比例 `200`，这是在原有效速度基线 `100` 上提高一倍；
+后半段的抬升、中转、扫码后组合 PTP、放置和回初始位另有独立兼容基准参数。
+需要临时恢复原基线或继续试调时，可以从启动命令覆盖，例如：
+
+```bash
+ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle.launch.py \
+  motion_speed_scale_percent:=100
+```
+
 启动文件默认使用 `/home/zdh/miniconda3/envs/ffs_ros/bin/python` 运行视觉节点；该环境已包含当前机器上的 CUDA、FFS、SAM2、RealSense、Open3D、Ultralytics 和 ROS 2 依赖。若环境位置变化，可传入 `vision_python:=...`。
 
 D405 默认启用自动曝光。RGB 视觉窗口或远程面板获得键盘焦点后，按 `a` 可以实时切换自动/手动曝光；左上角显示 `AE` 或 `M Exp:... G:...`。切换到手动模式时使用曝光 `11000`、增益 `8`，并可通过 `[`、`]` 调整曝光、`-`、`+` 调整增益。
@@ -54,15 +63,19 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `barcode_stable_hits=1`：HID 扫码器每次完整解码只输出一条数据，默认一条即成功。
 - `scanner_center_distance_m=0.120`：`transfer_joint` 处 TCP 夹持中心到扫码器的 User-X 距离。
 - `scanner_face_clearance_m=0.030`：自适应靠近后盒子侧面与扫码器之间保留的间隙。
-- `joint_speed=65`、`joint_acc=55`：普通关节运动的速度和加速度；短行程提速重点看加速度。
-- `linear_speed=60`、`linear_acc=50`：抓取下降直线运动的速度和加速度。
+- `scanner_approach_negative_tolerance_m=0.005`：盒长/距离测量造成的轻微负靠近量容差。默认允许不超过 5 mm 的负值直接将 X+ 靠近量钳制为 0；更大的负值仍然安全拒绝，避免长盒子继续靠近扫码器。
+- `motion_speed_scale_percent=200`：统一提速比例。`100` 表示修改前多层速度比例相乘后的理论有效速度基线；当前默认使用 200%，GUI 可调到 400%。
+- `joint_speed=65`、`joint_acc=55`：保留原界面的兼容基准值。程序会在软件中把旧版 `SpeedFactor × VelJ/AccJ × 指令 v/a` 合成为单条指令百分比，控制器的全局回放比例固定为 100，避免重复相乘。
+- `linear_speed=60`、`linear_acc=50`：抓取下降的兼容基准值，同样只合成为一组单条 `MovL v/a`。
+- 在统一比例 200 下，后半段阶段默认兼容基准约为：抓取后抬升 63%、中转位 68%、扫码后组合 PTP 68%、放置 68%、回初始位 68%、扫码靠近/退让 68%、J6 MoveJog 100%（已达到控制器 Jog 比例上限）。
+- `grasp_lift_speed_factor`、`transfer_speed_factor`、`place_speed_factor`、`return_startup_speed_factor` 分别控制抓取后抬升、中转、放置和回初始位；`jog_speed_factor` 控制扫码后的 XYZ+Ry/Rz 组合 PTP；对应的 `*_acc_factor` 控制阶段加速度。
 - `scan_exit_user_xyz=[0.557,0.200,0.320]`：扫码后组合 PTP 的 User XYZ 目标，单位为米。
 - `face_up_user_ry_deg=-90`、`post_scan_user_rz_deg=50`：组合目标相对扫码姿态的固定 User 轴旋转；先 Ry，后 Rz。
-- `jog_speed_factor=50`：扫码后 XYZ+Ry+Rz 单条组合 PTP 的速度。
-- `scanner_approach_speed_factor=50`：只控制中转点后沿 User X+ 靠近扫码器的速度。
-- `scanner_retreat_speed_factor=60`：扫码成功后沿 User X− 安全退让的速度。
+- `jog_speed_factor=80`：扫码后 XYZ+Ry+Rz 单条组合 PTP 的兼容基准；统一比例为 200 时默认有效指令约为 68%。
+- `scanner_approach_speed_factor=80`：中转点后沿 User X+ 靠近扫码器的兼容基准；统一比例为 200 时默认有效指令约为 68%。
+- `scanner_retreat_speed_factor=80`：扫码成功后沿 User X− 安全退让的兼容基准；统一比例为 200 时默认有效指令约为 68%。
 - `scanner_retreat_extra_m=0.030`：退回实际靠近距离后继续远离扫码器的额外安全余量。
-- `barcode_j6_speed_factor=70`：只控制 J6 多面找码，以及扫码成功后的标准面对齐速度；设置过高会增大急停超调。
+- `barcode_j6_speed_factor=100`：J6 连续点动和标准面对齐的比例上限。当前使用 `MoveJog`，统一比例 200 时已经钳位到控制器允许的 100%；若实机仍慢，应提高 Dobot 控制器的 Jog 基准速度或改用可监控的 MovJ 找码方式。
 - `vision_samples=2`：机器人仍使用两帧结果检查 SAM2 目标稳定性；眼在手相机到达初始位后只刷新 2 帧，并复用本次目标选择时的锁定 FFS 点云，避免静止场景重复计算立体深度。
 - `vision_result_topic=/d405_vision_result`：视觉端会明确返回本次请求成功或失败；ROI 内无目标、YOLO 无目标、立体点不足时，机械臂不再固定等满 `vision_timeout_s=8.0`。
 - `vision_retry_delay_s=0.3`：连续模式一次检测明确失败后，到发起下一次检测之间的等待时间。
@@ -72,14 +85,20 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `grasp_z_offset_m=0.010`：根据当前实机日志默认将视觉抓取 Z 上移 10 mm，用于补偿手眼高度偏差；界面中正值表示抓得更浅。
 - `minimum_safe_tcp_z_m=0.010`：抓取命令不会低于 10 mm；低于该值时自动钳位并打印警告。
 
-界面中可以修改初始关节、中转关节、扫码后用户 XYZ、组合 User Ry/Rz 增量、最终放置位姿、普通运动速度、扫码器靠近速度、J6 找码速度、夹爪力、抓取 Z 修正、TCP 最低安全 Z、抬升高度及扫码稳定参数。接受视觉目标后，夹爪预张开会与机械臂移动到目标上方并行，到达上方后仍会确认夹爪已停止才允许下降。下降到位后，程序会在原位等待夹爪完成闭合并检查 `state=2`，确认夹持后才允许抬升；抬升后会再次检查是否掉落。建议先“只采样视觉”，确认结果后再执行完整一轮。
+界面中可以修改统一提速比例、抓取后抬升/中转/扫码后组合/放置/回初始位的阶段速度和加速度、初始关节、中转关节、扫码后用户 XYZ、组合 User Ry/Rz 增量、最终放置位姿、抓取下降速度、扫码器靠近速度、J6 找码速度、夹爪力、抓取 Z 修正、TCP 最低安全 Z、抬升高度及扫码稳定参数。接受视觉目标后，夹爪预张开会与机械臂移动到目标上方并行，到达上方后仍会确认夹爪已停止才允许下降。下降到位后，程序会在原位等待夹爪完成闭合并检查 `state=2`，确认夹持后才允许抬升；抬升后会再次检查是否掉落。建议先“只采样视觉”，确认结果后再执行完整一轮。
 
 观察状态：
 
 ```bash
 ros2 topic echo /cosmetic_pick_cycle_status
+ros2 topic echo /cosmetic_pick_cycle_timing
 ros2 topic echo /cosmetic_box_height
 ros2 topic echo /detected_barcodes
 ```
+
+`/cosmetic_pick_cycle_timing` 使用 JSON 字符串发布两类数据：每个阶段完成时发布
+`event=stage`，每轮结束时发布 `event=cycle_summary`。成功轮次从触发视觉开始计时，
+到放置后回到初始关节位结束；视觉无目标、空抓重试和故障轮次也会分别以
+`no_target`、`grasp_retry`、`fault` 结算，便于直接统计平均值和 P95。
 
 首次实机验证建议将机械臂速度参数降低，并确认：手眼矩阵、Tool 1、User 0、75% 深度方向以及最终放置点均与现场一致。
