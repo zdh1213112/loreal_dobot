@@ -59,6 +59,9 @@ IMG_WIDTH = 640
 IMG_HEIGHT = 480
 PCD_STRIDE = 2
 IR_PROJECTOR_ON = True
+# 触发后清除相机管线中可能滞留的旧帧。自动曝光在等待触发期间一直工作，
+# 因此 5 帧足以刷新画面，同时比原来的 15 帧减少约 0.33 秒等待（30 FPS）。
+CAPTURE_FLUSH_FRAMES = 5
 
 # Cosmetic-box geometry parameters
 MAX_PLANES = 3
@@ -79,7 +82,9 @@ GRASP_DEPTH_RATIO = 0.75
 GRIP_CLEARANCE_M = 0.020
 MAX_GRIPPER_OPENING_M = 0.095
 OBB_SMOOTH = 0.65
-PUBLISH_FRAMES_BEFORE_RESET = 3
+# 连续两帧有效几何结果用于机器人端稳定性检查；相比原来的三帧少一次
+# FFS/SAM2/平面拟合，但不退化成不做跨帧验证的单帧抓取。
+PUBLISH_FRAMES_BEFORE_RESET = 2
 MAX_TRACKING_FRAMES_WITHOUT_HEIGHT = 18
 YOLO_BOX_DISPLAY_TTL_S = 0.8
 
@@ -126,6 +131,9 @@ width_pub = ros_node.create_publisher(Float32, "/gripper_target_width", 10)
 length_pub = ros_node.create_publisher(Float32, "/cosmetic_box_length", 10)
 # 顶面与桌面之间的盒子高度，供 75% 下爪深度计算使用。
 height_pub = ros_node.create_publisher(Float32, "/cosmetic_box_height", 10)
+# 每次触发的明确成功/失败结果。机械臂据此在 YOLO/ROI 已明确失败时
+# 立即结束等待，而不是固定等满 vision_timeout_s。
+vision_result_pub = ros_node.create_publisher(String, "/d405_vision_result", 10)
 rgb_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local_rgb/image/compressed", 1)
 cloud_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local_cloud/image/compressed", 1)
 
@@ -138,6 +146,18 @@ roi_drawing = False
 roi_start = (-1, -1)
 roi_end = (-1, -1)
 roi_lock = threading.Lock()
+vision_request_active = False
+
+
+def publish_vision_result(success: bool, reason: str) -> None:
+    """每个触发请求最多发布一次最终结果。"""
+    global vision_request_active
+    if not vision_request_active:
+        return
+    message = String()
+    message.data = f"{'success' if success else 'failure'}:{reason}"
+    vision_result_pub.publish(message)
+    vision_request_active = False
 
 
 def trigger_callback(msg: Bool) -> None:
@@ -570,6 +590,7 @@ try:
         loop_start = time.time()
 
         if trigger_requested:
+            vision_request_active = True
             # A new request supersedes the previous pick indication. The newly
             # selected target will remain visible until the following request.
             # Reset the previous SAM2 session, then hand the new YOLO box to a
@@ -585,8 +606,10 @@ try:
             locked_cloud_v_rgb = None
             locked_cloud_in_bounds = None
             locked_cloud_colors = None
-            logging.info("[D405] Flushing 15 frames before YOLO capture...")
-            for _ in range(15):
+            logging.info(
+                f"[D405] Flushing {CAPTURE_FLUSH_FRAMES} frames before YOLO capture..."
+            )
+            for _ in range(CAPTURE_FLUSH_FRAMES):
                 pipeline.wait_for_frames()
             detection_frames = pipeline.wait_for_frames()
             detection_color = np.asanyarray(detection_frames.get_color_frame().get_data())
@@ -626,10 +649,12 @@ try:
                         "[ROI] YOLO found objects, but none is inside the locked ROI; "
                         "this request is rejected without fallback outside the ROI."
                     )
+                    publish_vision_result(False, "no_yolo_candidate_inside_roi")
             else:
                 pending_yolo_obbs = None
                 last_yolo_obbs = None
                 logging.warning("[YOLO] No cosmetic box detected.")
+                publish_vision_result(False, "no_cosmetic_box")
             trigger_requested = False
 
         frames = pipeline.wait_for_frames()
@@ -771,6 +796,7 @@ try:
                 logging.info(f"[3-D select] Selected ID={best_index}, the minimum valid camera-X target.")
             else:
                 logging.warning("[3-D select] No YOLO candidate had enough valid stereo points; detection rejected.")
+                publish_vision_result(False, "no_candidate_with_valid_stereo_points")
             pending_yolo_obbs = None
 
         display = color_bgr.copy()
@@ -1053,6 +1079,7 @@ try:
                                             if published_frames >= PUBLISH_FRAMES_BEFORE_RESET:
                                                 locked_target_ready = True
                                                 locked_target_height_m = last_height_m
+                                                publish_vision_result(True, "stable_target_published")
                                                 logging.info(
                                                     f"[D405] Published stable target: length={smooth_extent[0]*1000:.1f}mm, "
                                                     f"height={last_height_m*1000:.1f}mm, "
@@ -1084,6 +1111,7 @@ try:
                 f"[height] No valid height after {tracking_frames_without_height} tracked frames; "
                 "resetting SAM2 so the next request starts cleanly."
             )
+            publish_vision_result(False, "no_valid_height")
             locked_target_corners = None
             locked_target_id = -1
             locked_target_camera_x = None
