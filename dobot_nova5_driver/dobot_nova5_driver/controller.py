@@ -54,6 +54,13 @@ class DobotNova5Controller:
         self._feedback_thread: threading.Thread | None = None
         self._stop_feedback = threading.Event()
         self._command_lock = threading.Lock()
+        # Legacy callers expect ``move_joint(speed=...)`` to set both the
+        # global SpeedFactor and the MovJ-local ``v`` ratio.  The cosmetic-box
+        # cycle opts into single-command scaling instead: global/profile
+        # ratios stay at 100 and every motion receives one already-composed
+        # speed/acceleration percentage.  Keeping this opt-in avoids changing
+        # the behaviour of the other Nova5 nodes that share this controller.
+        self._single_command_motion_scaling = False
         # Incremented by Stop(). Every blocking motion wait captures the epoch
         # used when its command was submitted, allowing Stop to wake the old
         # waiter immediately instead of leaving it blocked for 60 seconds on a
@@ -223,6 +230,21 @@ class DobotNova5Controller:
                     supported = False
         return supported
 
+    def enable_single_command_motion_scaling(self) -> None:
+        """Use only per-command ``v/a`` ratios for replay motions.
+
+        Dobot replay motion normally multiplies the global SpeedFactor, the
+        VelJ/VelL or AccJ/AccL profile, and the optional ratio on each motion
+        command.  This mode fixes the first two layers at 100 so callers can
+        compose the desired effective ratio once and pass it to the command.
+        MoveJog remains the intentional exception because it has no per-command
+        speed argument and must temporarily use SpeedFactor.
+        """
+        self.set_speed_factor(100)
+        self.set_joint_profile(speed=100, accel=100)
+        self.set_linear_profile(speed=100, accel=100)
+        self._single_command_motion_scaling = True
+
     def set_user_index(self, index: int) -> None:
         self._ensure_dashboard()
         with self._command_lock:
@@ -278,11 +300,17 @@ class DobotNova5Controller:
             self.stop_motion()
         self.move_joint(self.startup_joint, speed=self.startup_speed)
 
-    def move_joint(self, joints_deg: list[float], speed: int = 20) -> None:
+    def move_joint(
+        self,
+        joints_deg: list[float],
+        speed: int = 20,
+        accel: Optional[int] = None,
+    ) -> None:
         self._ensure_dashboard()
         with self._command_lock:
             command_epoch = self._motion_cancel_epoch
-            self._raise_if_error(self.dashboard.SpeedFactor(int(speed)), "SpeedFactor")
+            if not self._single_command_motion_scaling:
+                self._raise_if_error(self.dashboard.SpeedFactor(int(speed)), "SpeedFactor")
             response = self.dashboard.MovJ(
                 float(joints_deg[0]),
                 float(joints_deg[1]),
@@ -291,6 +319,7 @@ class DobotNova5Controller:
                 float(joints_deg[4]),
                 float(joints_deg[5]),
                 1,
+                a=-1 if accel is None else int(accel),
                 v=int(speed),
             )
         command_id = self._require_command_id(response, "MovJ")
@@ -580,7 +609,10 @@ class DobotNova5Controller:
                 return
             if time.time() - start > timeout_s:
                 raise TimeoutError(f"Timed out while waiting for {detail}")
-            time.sleep(0.05)
+            # Motion completion is polled from the feedback stream; 50 ms
+            # added a visible pause between retreat and the next PTP. Keep
+            # command transitions responsive without busy-spinning.
+            time.sleep(0.01)
 
     def _ensure_dashboard(self) -> None:
         if self.dashboard is None:

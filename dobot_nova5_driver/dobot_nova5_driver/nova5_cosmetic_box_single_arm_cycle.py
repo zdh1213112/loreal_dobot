@@ -15,10 +15,13 @@ height bias, and an absolute TCP-Z floor prevents contact with the tabletop.
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -86,6 +89,15 @@ def circular_mean(values: list[float]) -> float:
     return float(np.rad2deg(np.arctan2(np.sin(radians).mean(), np.cos(radians).mean())))
 
 
+def compose_motion_percent(ratios: tuple[float, ...], scale_percent: float) -> int:
+    """Return one Dobot command ratio equivalent to multiplied legacy ratios."""
+    effective = 100.0
+    for ratio in ratios:
+        effective *= max(0.0, float(ratio)) / 100.0
+    effective *= max(1.0, float(scale_percent)) / 100.0
+    return max(1, min(100, int(math.floor(effective + 0.5))))
+
+
 class RecoverableGraspError(RuntimeError):
     """A confirmed empty/lost grasp for which returning to startup is safe."""
 
@@ -93,6 +105,37 @@ class RecoverableGraspError(RuntimeError):
         super().__init__(message)
         self.stage = stage
         self.needs_vertical_retreat = needs_vertical_retreat
+
+
+@dataclass
+class CycleTiming:
+    """One vision-to-startup cycle with machine-readable stage durations."""
+
+    cycle_id: str
+    started_at: float = field(default_factory=time.monotonic)
+    stages: list[dict[str, object]] = field(default_factory=list)
+
+    def add_stage(self, name: str, duration_s: float, outcome: str) -> None:
+        self.stages.append(
+            {
+                "stage": str(name),
+                "duration_s": round(float(duration_s), 4),
+                "outcome": str(outcome),
+            }
+        )
+
+    def summary(self, outcome: str) -> dict[str, object]:
+        total_s = time.monotonic() - self.started_at
+        accounted_s = sum(float(stage["duration_s"]) for stage in self.stages)
+        return {
+            "event": "cycle_summary",
+            "cycle_id": self.cycle_id,
+            "outcome": str(outcome),
+            "total_s": round(total_s, 4),
+            "accounted_s": round(accounted_s, 4),
+            "overhead_s": round(max(0.0, total_s - accounted_s), 4),
+            "stages": list(self.stages),
+        }
 
 
 class CosmeticBoxSingleArmNode(Node):
@@ -112,27 +155,56 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("user_index", 0)
         self.declare_parameter("flange_tool_index", 0)
         self.declare_parameter("command_tool_index", 1)
+        # 以下运动参数保留原 GUI 的调节语义。控制器端不再把它们同时写入
+        # SpeedFactor、VelJ/VelL 和单条指令，而是先在软件中合成为一个等效
+        # 指令百分比。100 表示修改前的理论有效速度基线；当前现场测试使用
+        # 200，并通过下方的阶段参数只提高抓取后的流程。
+        self.declare_parameter("motion_speed_scale_percent", 300)
         # 普通关节动作：初始位、抓取上方、中转位、放置位及回初始位。
         # 加速度独立可调，短行程往往由加速度而不是最高速度决定耗时。
         self.declare_parameter("joint_speed", 65)
         self.declare_parameter("joint_acc", 55)
+        # 抓取完成后的抬升、去中转位、扫码后翻转、放置和回初始位分别调速，
+        # 避免为了加快后半段而把抓取上方/下降前的动作一起推得过快。
+        # 后半段参数是“单条指令有效百分比”，不再与 joint_speed 重复相乘。
+        self.declare_parameter("grasp_lift_speed_factor", 90)
+        self.declare_parameter("grasp_lift_acc_factor", 85)
+        self.declare_parameter("transfer_speed_factor", 100)
+        self.declare_parameter("transfer_acc_factor", 100)
+        self.declare_parameter("place_speed_factor", 100)
+        self.declare_parameter("place_acc_factor", 100)
+        self.declare_parameter("post_scan_acc_factor", 100)
+        self.declare_parameter("return_startup_speed_factor", 100)
+        self.declare_parameter("return_startup_acc_factor", 100)
         # 抓取下降使用的直线运动速度和加速度。
         self.declare_parameter("linear_speed", 60)
         self.declare_parameter("linear_acc", 50)
         # 扫码成功后，XYZ 与 User Ry/Rz 姿态一起变化的组合 PTP 速度。
-        self.declare_parameter("jog_speed_factor", 50.0)
+        self.declare_parameter("jog_speed_factor", 100.0)
         # 扫码器靠近速度：盒子到达 transfer_joint 后，沿 User 0 X+ 自适应
         # 靠近扫码器时使用。它只影响这段 X+ 位移，不影响抓取、抬升或放置。
-        self.declare_parameter("scanner_approach_speed_factor", 50)
+        self.declare_parameter("scanner_approach_speed_factor", 100)
         # 扫码完成后的安全退让速度：保持扫码完成姿态，沿 User 0 X- 原路
         # 退回实际靠近距离，远离扫码器后才允许执行大范围组合 PTP。
-        self.declare_parameter("scanner_retreat_speed_factor", 60)
+        self.declare_parameter("scanner_retreat_speed_factor", 100)
+        self.declare_parameter("scanner_retreat_acc_factor", 100)
         # 回到原中转距离后继续沿 User X- 增加的安全余量，默认 30 mm。
         # 用于覆盖长盒子执行 Ry/Rz 时角点产生的额外旋转包络。
         self.declare_parameter("scanner_retreat_extra_m", 0.030)
         # J6 多面找码速度：只影响找码期间 J6 的连续点动，以及扫码成功后
         # 吸附到最近 90° 标准面的对齐动作。速度越高，停止超调通常越大。
-        self.declare_parameter("barcode_j6_speed_factor", 70)
+        # MoveJog 没有单条 v 参数；200% 下该值会被合成为并钳位到 100%，
+        # 因此继续提高统一比例不会再提高 J6 的硬件 Jog 速度。
+        self.declare_parameter("barcode_j6_speed_factor", 100)
+        self.declare_parameter("barcode_alignment_acc_factor", 100)
+        # X+ 扫码靠近使用有界 RelMovJUser；收到条码时主动停止当前指令，
+        # 没有条码时精确到达目标距离，避免高速 MoveJog 的刹停过冲。
+        self.declare_parameter("scanner_approach_monitor_timeout_s", 20.0)
+        self.declare_parameter("scanner_approach_monitor_period_s", 0.005)
+        self.declare_parameter("scanner_approach_acc_factor", 100)
+        # 条码已经在目标点前几毫米内出现时，让有界 RelMovJUser 自然完成，
+        # 避免为极短剩余距离额外触发约 0.5s 的控制器 Stop 停机确认。
+        self.declare_parameter("scanner_approach_natural_finish_margin_m", 0.005)
         # 旧版“固定 XYZ、单独 Ry 点动”的备用速度。当前生产流程已经改为
         # XYZ+Ry+Rz 单条组合 PTP，不再读取该参数。
         self.declare_parameter("face_up_rotation_speed_factor", 50)
@@ -186,7 +258,7 @@ class CosmeticBoxSingleArmNode(Node):
         # unlike frame-by-frame vision detections it need not be seen 3 times.
         self.declare_parameter("barcode_stable_hits", 1)
         self.declare_parameter("barcode_hit_gap_s", 0.7)
-        self.declare_parameter("barcode_face_wait_s", 0.1)  # 每个标准面最多等待 0.1 秒
+        self.declare_parameter("barcode_face_wait_s", 0.05)  # 每个标准面最多等待 0.05 秒
         self.declare_parameter("barcode_max_face_rotations", 4)
         # Each next-face search may rotate wrist J6 by as much as -90 degrees,
         # with a joint-limit guard. Live monitoring below stops it earlier when
@@ -209,6 +281,10 @@ class CosmeticBoxSingleArmNode(Node):
         # scanner_face_clearance_m：靠近完成后，盒子朝向扫码器的侧面与扫码器
         # 识读面之间保留的安全/识读间隙，默认 0.030 m（30 mm）。
         self.declare_parameter("scanner_face_clearance_m", 0.030)
+        # 点云盒长和现场距离都有毫米级误差。若计算出的靠近量仅略微为负，
+        # 说明 transfer_joint 已经足够接近，不再沿 X+ 前进即可；超过该容差
+        # 仍然拒绝运动，避免长盒子撞向扫码器。
+        self.declare_parameter("scanner_approach_negative_tolerance_m", 0.005)
         # 自动靠近量（沿 User 0 X+）：
         #   X移动量 = TCP中心到扫码器距离 - 盒长/2 - 盒侧面保留间隙
         # 示例：盒长 100 mm 时，120 - 100/2 - 30 = 40 mm。
@@ -220,7 +296,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("face_up_jog_timeout_s", 60.0)
         self.declare_parameter("face_up_fixed_xyz_tolerance_m", 0.003)
         # 旧版单独 Ry 点动的备用稳定等待；当前组合 PTP 不使用。
-        self.declare_parameter("face_up_settle_s", 0.15)
+        self.declare_parameter("face_up_settle_s", 0.0)
 
         self.declare_parameter("dh_max_opening_m", 0.095)
         self.declare_parameter("dh_force", 30)
@@ -238,6 +314,8 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("single_cycle_grasp_retry_limit", 3)
         self.declare_parameter("grasp_success_min_opening_m", 0.003)
         self.declare_parameter("grasp_feedback_required", True)
+        self.declare_parameter("timing_enabled", True)
+        self.declare_parameter("timing_topic", "/cosmetic_pick_cycle_timing")
 
         handeye_values = [float(value) for value in self.get_parameter("handeye_flange_to_cam").value]
         if len(handeye_values) != 16:
@@ -252,14 +330,7 @@ class CosmeticBoxSingleArmNode(Node):
             startup_speed=int(self.get_parameter("joint_speed").value),
         )
         self.controller.connect(go_to_start=False, auto_enable=bool(self.get_parameter("auto_enable").value))
-        self.controller.set_joint_profile(
-            speed=int(self.get_parameter("joint_speed").value),
-            accel=int(self.get_parameter("joint_acc").value),
-        )
-        self.controller.set_linear_profile(
-            speed=int(self.get_parameter("linear_speed").value),
-            accel=int(self.get_parameter("linear_acc").value),
-        )
+        self.controller.enable_single_command_motion_scaling()
         self.gripper = self._initialize_gripper()
 
         self.data_lock = threading.Lock()
@@ -282,7 +353,9 @@ class CosmeticBoxSingleArmNode(Node):
 
         self.running = True
         self.cycle_enabled = False
+        self.shutting_down = False
         self.worker: Optional[threading.Thread] = None
+        self.active_timing: Optional[CycleTiming] = None
         # Serialize complete robot sequences. Emergency Stop intentionally does
         # not take this lock, so it can interrupt a blocking sequence; recovery
         # to startup waits for that interrupted sequence to unwind before it
@@ -303,6 +376,11 @@ class CosmeticBoxSingleArmNode(Node):
         self.create_subscription(Bool, "/cosmetic_pick_cycle_enable", self._cycle_enable_callback, 10)
         self.trigger_publisher = self.create_publisher(Bool, str(self.get_parameter("vision_trigger_topic").value), 10)
         self.status_publisher = self.create_publisher(String, "/cosmetic_pick_cycle_status", 10)
+        self.timing_publisher = self.create_publisher(
+            String,
+            str(self.get_parameter("timing_topic").value),
+            20,
+        )
 
         self.start_timer = self.create_timer(1.0, self._start_automatically_once)
         self.get_logger().warning(
@@ -310,12 +388,151 @@ class CosmeticBoxSingleArmNode(Node):
             "verify this calibration on the real cell before enabling motion."
         )
         self.get_logger().info("Single-arm cosmetic-box controller connected; no 192.168.111.102 connection is created.")
+        self._log_effective_motion_profile()
 
     def _six_values(self, name: str) -> list[float]:
         values = [float(value) for value in self.get_parameter(name).value]
         if len(values) != 6:
             raise ValueError(f"{name} must contain 6 values")
         return values
+
+    def _composed_motion_percent(self, *ratios: float) -> int:
+        """Collapse legacy Dobot ratio multiplication into one command value."""
+        scale = max(1.0, float(self.get_parameter("motion_speed_scale_percent").value))
+        return compose_motion_percent(tuple(ratios), scale)
+
+    @staticmethod
+    def _direct_motion_percent(value: float) -> int:
+        """Clamp a stage-specific effective command percentage."""
+        return max(1, min(100, int(math.floor(float(value) + 0.5))))
+
+    def _motion_profile(self) -> dict[str, int]:
+        joint_speed = float(self.get_parameter("joint_speed").value)
+        joint_acc = float(self.get_parameter("joint_acc").value)
+        linear_speed = float(self.get_parameter("linear_speed").value)
+        linear_acc = float(self.get_parameter("linear_acc").value)
+        grasp_lift_speed = float(self.get_parameter("grasp_lift_speed_factor").value)
+        grasp_lift_acc = float(self.get_parameter("grasp_lift_acc_factor").value)
+        transfer_speed = float(self.get_parameter("transfer_speed_factor").value)
+        transfer_acc = float(self.get_parameter("transfer_acc_factor").value)
+        place_speed = float(self.get_parameter("place_speed_factor").value)
+        place_acc = float(self.get_parameter("place_acc_factor").value)
+        post_scan_acc = float(self.get_parameter("post_scan_acc_factor").value)
+        return_speed = float(self.get_parameter("return_startup_speed_factor").value)
+        return_acc = float(self.get_parameter("return_startup_acc_factor").value)
+        combined_speed = float(self.get_parameter("jog_speed_factor").value)
+        approach_speed = float(self.get_parameter("scanner_approach_speed_factor").value)
+        approach_acc = float(self.get_parameter("scanner_approach_acc_factor").value)
+        retreat_speed = float(self.get_parameter("scanner_retreat_speed_factor").value)
+        retreat_acc = float(self.get_parameter("scanner_retreat_acc_factor").value)
+        barcode_speed = float(self.get_parameter("barcode_j6_speed_factor").value)
+        face_up_speed = float(self.get_parameter("face_up_rotation_speed_factor").value)
+        return {
+            # Old replay speed: SpeedFactor(joint) * VelJ(joint) * command-v.
+            "joint_speed": self._composed_motion_percent(
+                joint_speed, joint_speed, joint_speed
+            ),
+            # Joint-coordinate MovJ previously omitted local ``a``.
+            "joint_waypoint_acc": self._composed_motion_percent(
+                joint_speed, joint_acc
+            ),
+            # Cartesian/relative MovJ used joint_acc both globally and locally.
+            "joint_pose_acc": self._composed_motion_percent(
+                joint_speed, joint_acc, joint_acc
+            ),
+            # These post-grasp values are already effective single-command
+            # percentages; do not multiply them by joint_speed again.
+            "grasp_lift_speed": self._direct_motion_percent(grasp_lift_speed),
+            "grasp_lift_acc": self._direct_motion_percent(grasp_lift_acc),
+            "transfer_speed": self._direct_motion_percent(transfer_speed),
+            "transfer_acc": self._direct_motion_percent(transfer_acc),
+            "place_speed": self._direct_motion_percent(place_speed),
+            "place_acc": self._direct_motion_percent(place_acc),
+            "post_scan_acc": self._direct_motion_percent(post_scan_acc),
+            "return_startup_speed": self._direct_motion_percent(return_speed),
+            "return_startup_acc": self._direct_motion_percent(return_acc),
+            "linear_speed": self._composed_motion_percent(
+                joint_speed, linear_speed, linear_speed
+            ),
+            "linear_acc": self._composed_motion_percent(
+                joint_speed, linear_acc, linear_acc
+            ),
+            "post_scan_speed": self._direct_motion_percent(combined_speed),
+            "scanner_approach_speed": self._direct_motion_percent(approach_speed),
+            "scanner_approach_acc": self._direct_motion_percent(approach_acc),
+            "scanner_retreat_speed": self._direct_motion_percent(retreat_speed),
+            "scanner_retreat_acc": self._direct_motion_percent(retreat_acc),
+            # MoveJog has no local v/a ratios; these are direct SpeedFactor
+            # values and are capped by the controller at 100.
+            "barcode_jog_speed": self._direct_motion_percent(barcode_speed),
+            "barcode_alignment_speed": self._direct_motion_percent(barcode_speed),
+            "barcode_alignment_acc": self._direct_motion_percent(
+                float(self.get_parameter("barcode_alignment_acc_factor").value)
+            ),
+            "face_up_jog_speed": self._direct_motion_percent(face_up_speed),
+        }
+
+    def _log_effective_motion_profile(self) -> None:
+        profile = self._motion_profile()
+        scale = int(self.get_parameter("motion_speed_scale_percent").value)
+        details = ", ".join(f"{name}={value}%" for name, value in profile.items())
+        self.get_logger().info(
+            f"Normalized motion scaling active: scale={scale}% (100%=legacy effective baseline); "
+            f"SpeedFactor/VelJ/VelL/AccJ/AccL replay layers fixed at 100; {details}"
+        )
+
+    def _emit_timing(self, payload: dict[str, object]) -> None:
+        if self.shutting_down or not rclpy.ok() or not bool(self.get_parameter("timing_enabled").value):
+            return
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        message = String()
+        message.data = encoded
+        try:
+            self.timing_publisher.publish(message)
+        except Exception:
+            # Ctrl-C can invalidate the ROS context while the cycle worker is
+            # unwinding a blocking vision/motion stage. Timing must not keep
+            # the process alive or mask the original shutdown.
+            return
+        self.get_logger().info(f"[timing] {encoded}")
+
+    def _begin_cycle_timing(self, cycle_id: str) -> None:
+        self.active_timing = CycleTiming(str(cycle_id))
+        self._emit_timing({"event": "cycle_start", "cycle_id": str(cycle_id)})
+
+    @contextmanager
+    def _timed_stage(self, stage: str):
+        timing = self.active_timing
+        if timing is None or not bool(self.get_parameter("timing_enabled").value):
+            yield
+            return
+        started_at = time.monotonic()
+        outcome = "ok"
+        try:
+            yield
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            duration_s = time.monotonic() - started_at
+            timing.add_stage(stage, duration_s, outcome)
+            self._emit_timing(
+                {
+                    "event": "stage",
+                    "cycle_id": timing.cycle_id,
+                    "stage": str(stage),
+                    "outcome": outcome,
+                    "duration_s": round(duration_s, 4),
+                    "elapsed_s": round(time.monotonic() - timing.started_at, 4),
+                }
+            )
+
+    def _finish_cycle_timing(self, outcome: str) -> None:
+        timing = self.active_timing
+        if timing is None:
+            return
+        self._emit_timing(timing.summary(outcome))
+        self.active_timing = None
 
     def _initialize_gripper(self) -> DHGripper:
         if self.controller.dashboard is None:
@@ -432,9 +649,14 @@ class CosmeticBoxSingleArmNode(Node):
 
     def _publish_status(self, text: str) -> None:
         self.last_status = text
+        if self.shutting_down or not rclpy.ok():
+            return
         msg = String()
         msg.data = text
-        self.status_publisher.publish(msg)
+        try:
+            self.status_publisher.publish(msg)
+        except Exception:
+            return
         self.get_logger().info(f"[cycle] {text}")
 
     def _cycle_worker(self) -> None:
@@ -444,31 +666,40 @@ class CosmeticBoxSingleArmNode(Node):
                 cycle_index = 0
                 while self.running and self.cycle_enabled:
                     cycle_index += 1
+                    self._begin_cycle_timing(f"continuous-{cycle_index}")
                     self._publish_status(f"cycle {cycle_index}: detecting minimum-camera-X box")
-                    target_bundle = self._request_vision_target()
+                    with self._timed_stage("vision_detection"):
+                        target_bundle = self._request_vision_target()
                     if target_bundle is None:
                         delay = max(0.1, float(self.get_parameter("vision_retry_delay_s").value))
                         self._publish_status(f"cycle {cycle_index}: no valid box; retrying in {delay:.1f}s")
-                        time.sleep(delay)
+                        with self._timed_stage("vision_retry_delay"):
+                            time.sleep(delay)
+                        self._finish_cycle_timing("no_target")
                         continue
                     target_pose, width_m, height_m, length_m = target_bundle
                     try:
                         self._execute_one_cycle(target_pose, width_m, height_m, length_m)
                     except RecoverableGraspError as exc:
-                        self._recover_failed_grasp_for_retry(exc)
+                        with self._timed_stage("grasp_failure_recovery"):
+                            self._recover_failed_grasp_for_retry(exc)
                         self._publish_status(
                             f"cycle {cycle_index}: grasp retry recovery completed; "
                             "requesting a fresh D405 target"
                         )
+                        self._finish_cycle_timing("grasp_retry")
                         continue
                     # 放置点已经执行 open(wait=True)，回初始位后不再重复下发
                     # 一次相同的开爪命令和 Modbus 完成等待。
-                    self._move_startup_and_open(
-                        require_cycle_active=True,
-                        open_gripper=False,
-                    )
+                    with self._timed_stage("return_startup"):
+                        self._move_startup_and_open(
+                            require_cycle_active=True,
+                            open_gripper=False,
+                        )
+                    self._finish_cycle_timing("success")
             self._publish_status("cycle stopped")
         except Exception as exc:
+            self._finish_cycle_timing("fault")
             self.cycle_enabled = False
             self._publish_status(f"FAULT: {exc}")
             self.get_logger().fatal(f"Automatic cycle stopped safely: {exc}")
@@ -479,7 +710,12 @@ class CosmeticBoxSingleArmNode(Node):
         open_gripper: bool = True,
     ) -> None:
         self._publish_status("moving to startup joint")
-        self.controller.move_joint(self._six_values("startup_joint"), speed=int(self.get_parameter("joint_speed").value))
+        motion = self._motion_profile()
+        self.controller.move_joint(
+            self._six_values("startup_joint"),
+            speed=motion["return_startup_speed"],
+            accel=motion["return_startup_acc"],
+        )
         if require_cycle_active:
             self._require_cycle_active("at startup joint")
         if open_gripper:
@@ -600,16 +836,23 @@ class CosmeticBoxSingleArmNode(Node):
                     0, int(self.get_parameter("single_cycle_grasp_retry_limit").value)
                 )
                 grasp_failures = 0
+                attempt_index = 0
                 while True:
-                    result = self._request_vision_target()
+                    attempt_index += 1
+                    self._begin_cycle_timing(f"single-{attempt_index}")
+                    with self._timed_stage("vision_detection"):
+                        result = self._request_vision_target()
                     if result is None:
+                        self._finish_cycle_timing("no_target")
                         raise RuntimeError("no stable D405 target received")
                     try:
                         self._execute_one_cycle(*result)
                         break
                     except RecoverableGraspError as exc:
                         grasp_failures += 1
-                        self._recover_failed_grasp_for_retry(exc)
+                        with self._timed_stage("grasp_failure_recovery"):
+                            self._recover_failed_grasp_for_retry(exc)
+                        self._finish_cycle_timing("grasp_retry")
                         if grasp_failures > retry_limit:
                             raise RuntimeError(
                                 f"Grasp failed after {grasp_failures} attempts; "
@@ -621,11 +864,16 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                 # 放置点已经执行 open(wait=True)，回初始位后不再重复下发
                 # 一次相同的开爪命令和 Modbus 完成等待。
-                self._move_startup_and_open(
-                    require_cycle_active=True,
-                    open_gripper=False,
-                )
+                with self._timed_stage("return_startup"):
+                    self._move_startup_and_open(
+                        require_cycle_active=True,
+                        open_gripper=False,
+                    )
+                self._finish_cycle_timing("success")
                 self._publish_status("single cycle completed")
+        except Exception:
+            self._finish_cycle_timing("fault")
+            raise
         finally:
             self.cycle_enabled = False
 
@@ -724,6 +972,7 @@ class CosmeticBoxSingleArmNode(Node):
         return averaged, width_m, height_m, length_m
 
     def _execute_one_cycle(self, target: TcpPose, width_m: float, height_m: float, length_m: float) -> None:
+        motion = self._motion_profile()
         z_offset_m = float(self.get_parameter("grasp_z_offset_m").value)
         z_offset_limit_m = abs(float(self.get_parameter("grasp_z_offset_limit_m").value))
         if abs(z_offset_m) > z_offset_limit_m:
@@ -744,63 +993,81 @@ class CosmeticBoxSingleArmNode(Node):
             f"Z_correction={z_offset_m*1000:+.1f}mm, command_Z={target.z*1000:.1f}mm, "
             f"box_height={height_m*1000:.1f}mm"
         )
-        self._publish_status("commanding measured gripper width; pre-shaping during move-above")
-        max_opening = float(self.get_parameter("dh_max_opening_m").value)
-        width_m = max(0.0, min(max_opening, width_m))
-        pre_shape_position = width_m / max_opening
-        pre_shape_initial = self.gripper.read_position()
-        # 夹爪预张开和机械臂前往目标上方互不冲突。先下发非阻塞命令，
-        # 到达目标上方后再确认夹爪已经停止，从串行流程中隐藏约 0.6 秒。
-        self.gripper.set_position(pre_shape_position, wait=False)
-        self._require_cycle_active("after commanding gripper pre-shape")
+        with self._timed_stage("grasp_prepare"):
+            self._publish_status("commanding measured gripper width; pre-shaping during move-above")
+            max_opening = float(self.get_parameter("dh_max_opening_m").value)
+            width_m = max(0.0, min(max_opening, width_m))
+            pre_shape_position = width_m / max_opening
+            pre_shape_initial = self.gripper.read_position()
+            # 夹爪预张开和机械臂前往目标上方互不冲突。先下发非阻塞命令，
+            # 到达目标上方后再确认夹爪已经停止，从串行流程中隐藏约 0.6 秒。
+            self.gripper.set_position(pre_shape_position, wait=False)
+            self._require_cycle_active("after commanding gripper pre-shape")
 
-        self.controller.inverse_kinematics(
-            target,
-            user_index=int(self.get_parameter("user_index").value),
-            tool_index=int(self.get_parameter("command_tool_index").value),
-            joint_near=self.controller.current_joint(),
-        )
-        current = self._current_command_pose()
-        planar = TcpPose(target.x, target.y, current.z, target.rx, target.ry, target.rz)
+            self.controller.inverse_kinematics(
+                target,
+                user_index=int(self.get_parameter("user_index").value),
+                tool_index=int(self.get_parameter("command_tool_index").value),
+                joint_near=self.controller.current_joint(),
+            )
+            current = self._current_command_pose()
+            planar = TcpPose(target.x, target.y, current.z, target.rx, target.ry, target.rz)
         self._publish_status("moving above selected box")
-        self.controller.move_joint_tcp(
-            planar,
-            speed=int(self.get_parameter("joint_speed").value),
-            accel=int(self.get_parameter("joint_acc").value),
-            user_index=int(self.get_parameter("user_index").value),
-            tool_index=int(self.get_parameter("command_tool_index").value),
-        )
+        with self._timed_stage("move_above"):
+            self.controller.move_joint_tcp(
+                planar,
+                speed=motion["joint_speed"],
+                accel=motion["joint_pose_acc"],
+                user_index=int(self.get_parameter("user_index").value),
+                tool_index=int(self.get_parameter("command_tool_index").value),
+            )
         self._require_cycle_active("after move-above")
-        self.gripper.wait_until_stopped(
-            timeout_s=float(self.get_parameter("dh_timeout_s").value),
-            target_position=pre_shape_position,
-            initial_position=pre_shape_initial,
-        )
+        with self._timed_stage("gripper_preshape_wait"):
+            self.gripper.wait_until_stopped(
+                timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                target_position=pre_shape_position,
+                initial_position=pre_shape_initial,
+            )
         self._require_cycle_active("after confirming gripper pre-shape")
         self._publish_status("descending TCP tip to 75% box height")
-        self.controller.move_linear_tcp(
-            target,
-            speed=int(self.get_parameter("linear_speed").value),
-            accel=int(self.get_parameter("linear_acc").value),
-            user_index=int(self.get_parameter("user_index").value),
-            tool_index=int(self.get_parameter("command_tool_index").value),
-        )
+        with self._timed_stage("grasp_descend"):
+            self.controller.move_linear_tcp(
+                target,
+                speed=motion["linear_speed"],
+                accel=motion["linear_acc"],
+                user_index=int(self.get_parameter("user_index").value),
+                tool_index=int(self.get_parameter("command_tool_index").value),
+            )
         self._require_cycle_active("at grasp depth")
         self._publish_status("at grasp depth; closing gripper now")
-        self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
-        self.gripper.close(wait=True)
+        with self._timed_stage("gripper_close"):
+            self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
+            self.gripper.close(wait=True)
         self._require_cycle_active("after gripper close")
-        self._confirm_grasp_before_lift(max_opening)
+        with self._timed_stage("grasp_confirm"):
+            self._confirm_grasp_before_lift(max_opening)
 
-        self._relative_user_move(z=float(self.get_parameter("grasp_lift_m").value), label="lifting grasp")
+        with self._timed_stage("grasp_lift"):
+            self._relative_user_move(
+                z=float(self.get_parameter("grasp_lift_m").value),
+                label="lifting grasp",
+                speed_factor=motion["grasp_lift_speed"],
+                accel_factor=motion["grasp_lift_acc"],
+            )
         self._require_cycle_active("after grasp lift")
-        self._validate_grasp_feedback("after lift", max_opening)
+        with self._timed_stage("post_lift_grasp_check"):
+            self._validate_grasp_feedback("after lift", max_opening)
 
         # 扫码器可能在机械臂前往 transfer_joint 的途中就读到条码。必须在
         # 运动前开启窗口，否则这条比“到达中转点”早几十毫秒的消息会被回调丢弃。
         self._reset_barcode_window()
         self._publish_status("moving to barcode transfer joint; barcode window armed")
-        self.controller.move_joint(self._six_values("transfer_joint"), speed=int(self.get_parameter("joint_speed").value))
+        with self._timed_stage("move_transfer"):
+            self.controller.move_joint(
+                self._six_values("transfer_joint"),
+                speed=motion["transfer_speed"],
+                accel=motion["transfer_acc"],
+            )
         self._require_cycle_active("at barcode transfer joint")
 
         # 到达中转点后先检查“运动途中”捕获的码。已经扫到时无需再靠近
@@ -815,41 +1082,48 @@ class CosmeticBoxSingleArmNode(Node):
             )
         else:
             self._publish_status("no barcode at transfer joint; approaching scanner adaptively")
-            scanner_approach_m = self._move_box_to_scanner(length_m)
+            with self._timed_stage("scanner_approach"):
+                scanner_approach_m = self._move_box_to_scanner(length_m)
             self._require_cycle_active("at adaptive barcode distance")
             self._publish_status("adaptive barcode distance reached; checking captured barcode")
-        barcode = self._rotate_until_stable_barcode()
+        with self._timed_stage("barcode_acquisition"):
+            barcode = self._rotate_until_stable_barcode()
         self._publish_status(f"stable barcode acquired: {barcode}")
 
         # 此时盒子侧面仍贴近扫码器，不能直接执行带 Ry/Rz 的关节 PTP，
         # 否则中间关节轨迹的旋转包络可能扫到扫码器。先沿 User X- 原路
         # 退出实际靠近距离，确认退让完成后才进入扫码后组合运动。
-        self._retreat_box_from_scanner(scanner_approach_m)
+        with self._timed_stage("scanner_retreat"):
+            self._retreat_box_from_scanner(scanner_approach_m)
         self._require_cycle_active("after scanner safety retreat")
 
-        self._move_to_user_xyz_with_rotation(
-            [float(value) for value in self.get_parameter("scan_exit_user_xyz").value],
-            ry_delta_deg=float(self.get_parameter("face_up_user_ry_deg").value),
-            rz_delta_deg=float(self.get_parameter("post_scan_user_rz_deg").value),
-        )
+        with self._timed_stage("post_scan_combined_ptp"):
+            self._move_to_user_xyz_with_rotation(
+                [float(value) for value in self.get_parameter("scan_exit_user_xyz").value],
+                ry_delta_deg=float(self.get_parameter("face_up_user_ry_deg").value),
+                rz_delta_deg=float(self.get_parameter("post_scan_user_rz_deg").value),
+            )
         self._require_cycle_active("after combined post-scan XYZ/Ry/Rz PTP")
-        self._validate_grasp_feedback(
-            "after combined post-scan pose motion",
-            float(self.get_parameter("dh_max_opening_m").value),
-        )
+        with self._timed_stage("post_scan_grasp_check"):
+            self._validate_grasp_feedback(
+                "after combined post-scan pose motion",
+                float(self.get_parameter("dh_max_opening_m").value),
+            )
 
         place = self._six_values("place_pose")
         place_pose = TcpPose(*place)
         self._publish_status("moving to final place pose")
-        self.controller.move_joint_tcp(
-            place_pose,
-            speed=int(self.get_parameter("joint_speed").value),
-            accel=int(self.get_parameter("joint_acc").value),
-            user_index=int(self.get_parameter("user_index").value),
-            tool_index=int(self.get_parameter("command_tool_index").value),
-        )
+        with self._timed_stage("move_place"):
+            self.controller.move_joint_tcp(
+                place_pose,
+                speed=motion["place_speed"],
+                accel=motion["place_acc"],
+                user_index=int(self.get_parameter("user_index").value),
+                tool_index=int(self.get_parameter("command_tool_index").value),
+            )
         self._require_cycle_active("at final place pose")
-        self.gripper.open(wait=True)
+        with self._timed_stage("gripper_open_place"):
+            self.gripper.open(wait=True)
         self._publish_status("placed box; returning to startup")
 
     def _require_cycle_active(self, stage: str) -> None:
@@ -986,18 +1260,26 @@ class CosmeticBoxSingleArmNode(Node):
         rz=0.0,
         label="relative user move",
         speed_factor: int | None = None,
+        accel_factor: int | None = None,
     ) -> None:
-        # 未指定专用速度时仍使用普通关节速度；扫码器靠近等独立阶段可显式传入。
+        # speed_factor 已经是合成后的单条指令速度，不会再与全局速度或
+        # VelJ 重复相乘。扫码器靠近等独立阶段可显式传入自己的有效速度。
+        motion = self._motion_profile()
         motion_speed = (
-            int(self.get_parameter("joint_speed").value)
+            motion["joint_speed"]
             if speed_factor is None
             else max(1, min(100, int(speed_factor)))
+        )
+        motion_accel = (
+            motion["joint_pose_acc"]
+            if accel_factor is None
+            else max(1, min(100, int(accel_factor)))
         )
         self._publish_status(label)
         self.controller.rel_move_user_joint(
             TcpPose(float(x), float(y), float(z), float(rx), float(ry), float(rz)),
             speed=motion_speed,
-            accel=int(self.get_parameter("joint_acc").value),
+            accel=motion_accel,
             user_index=int(self.get_parameter("user_index").value),
             tool_index=int(self.get_parameter("command_tool_index").value),
         )
@@ -1028,12 +1310,23 @@ class CosmeticBoxSingleArmNode(Node):
         # 剩余值就是机械臂需要沿 User 0 X+ 前进的距离。
         approach_m = center_distance_m - 0.5 * length_m - clearance_m
         if approach_m < 0.0:
-            raise RuntimeError(
-                f"Unsafe scanner approach: center_distance={center_distance_m*1000:.1f}mm - "
-                f"length/2={0.5*length_m*1000:.1f}mm - clearance={clearance_m*1000:.1f}mm "
-                f"= {approach_m*1000:.1f}mm; X+ motion refused"
+            negative_tolerance_m = max(
+                0.0,
+                float(self.get_parameter("scanner_approach_negative_tolerance_m").value),
             )
-
+            if approach_m >= -negative_tolerance_m:
+                self.get_logger().warning(
+                    f"Scanner approach is {approach_m*1000:.1f}mm below the nominal clearance "
+                    f"due to box-length/distance tolerance; clamping X+ approach to 0.0mm "
+                    f"(allowed negative tolerance={negative_tolerance_m*1000:.1f}mm)"
+                )
+                approach_m = 0.0
+            else:
+                raise RuntimeError(
+                    f"Unsafe scanner approach: center_distance={center_distance_m*1000:.1f}mm - "
+                    f"length/2={0.5*length_m*1000:.1f}mm - clearance={clearance_m*1000:.1f}mm "
+                    f"= {approach_m*1000:.1f}mm; X+ motion refused"
+                )
         self._require_cycle_active("before adaptive scanner approach")
         formula = (
             f"scanner approach User X+: {center_distance_m*1000:.1f} - "
@@ -1043,18 +1336,18 @@ class CosmeticBoxSingleArmNode(Node):
         if approach_m <= 0.0005:
             self._publish_status(formula + "; already at requested clearance")
             return 0.0
-        tcp_before = self._current_command_pose()
-        scanner_speed = int(self.get_parameter("scanner_approach_speed_factor").value)
-        self._relative_user_move(
-            x=approach_m,
-            label=f"{formula}; speed={scanner_speed}%",
-            speed_factor=scanner_speed,
+        scanner_speed = self._motion_profile()["scanner_approach_speed"]
+        actual_x_m, barcode_seen = self._monitored_scanner_approach(
+            approach_m,
+            scanner_speed,
+            self._motion_profile()["scanner_approach_acc"],
         )
         self._require_cycle_active("after adaptive scanner approach")
-        tcp_after = self._current_command_pose()
-        actual_x_m = tcp_after.x - tcp_before.x
         tolerance_m = max(0.001, float(self.get_parameter("jog_tolerance_m").value) * 1.5)
-        if abs(actual_x_m - approach_m) > tolerance_m:
+        # A barcode can intentionally stop the approach before the requested
+        # endpoint, so displacement mismatch is only an error when no barcode
+        # was captured during the monitored move.
+        if not barcode_seen and abs(actual_x_m - approach_m) > tolerance_m:
             raise RuntimeError(
                 f"Scanner approach X displacement mismatch: requested={approach_m*1000:.1f}mm, "
                 f"actual={actual_x_m*1000:.1f}mm"
@@ -1062,8 +1355,113 @@ class CosmeticBoxSingleArmNode(Node):
         self._publish_status(
             f"scanner approach reached: User X moved {actual_x_m*1000:.1f}mm; "
             f"box-to-scanner clearance={clearance_m*1000:.1f}mm"
+            + ("; barcode captured and approach stopped" if barcode_seen else "")
         )
         return float(actual_x_m)
+
+    def _monitored_scanner_approach(
+        self,
+        target_distance_m: float,
+        speed_percent: int,
+        accel_percent: int,
+    ) -> tuple[float, bool]:
+        """Move a bounded User-X distance, interrupting it when a code arrives."""
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        timeout_s = max(
+            1.0,
+            float(self.get_parameter("scanner_approach_monitor_timeout_s").value),
+        )
+        period_s = max(
+            0.005,
+            min(0.05, float(self.get_parameter("scanner_approach_monitor_period_s").value)),
+        )
+        start_pose = self._current_command_pose()
+        start_x = float(start_pose.x)
+        barcode_seen = False
+        motion_stopped = False
+        natural_finish = False
+        move_errors: list[BaseException] = []
+
+        def run_bounded_move() -> None:
+            try:
+                self.controller.rel_move_user_joint(
+                    TcpPose(target_distance_m, 0.0, 0.0, 0.0, 0.0, 0.0),
+                    speed=int(speed_percent),
+                    accel=int(accel_percent),
+                    user_index=user_index,
+                    tool_index=tool_index,
+                )
+            except BaseException as exc:
+                move_errors.append(exc)
+
+        move_thread = threading.Thread(
+            target=run_bounded_move,
+            name="scanner-approach-motion",
+            daemon=True,
+        )
+        started_at = time.monotonic()
+        self._publish_status(
+            f"bounded scanner approach User X+: {target_distance_m*1000:.1f}mm; "
+            f"speed={speed_percent}%, accel={accel_percent}%; "
+            "stop immediately on barcode"
+        )
+        move_thread.start()
+        try:
+            while move_thread.is_alive():
+                self._require_cycle_active("during monitored scanner approach")
+                with self.barcode_lock:
+                    if self.barcode_hits >= max(1, int(self.get_parameter("barcode_stable_hits").value)):
+                        barcode_seen = True
+                        try:
+                            current_pose = self._current_command_pose()
+                            progress_m = float(current_pose.x) - start_x
+                            remaining_m = target_distance_m - progress_m
+                        except Exception:
+                            remaining_m = float("inf")
+                        finish_margin_m = max(
+                            0.0,
+                            float(self.get_parameter("scanner_approach_natural_finish_margin_m").value),
+                        )
+                        if 0.0 <= remaining_m <= finish_margin_m:
+                            natural_finish = True
+                            self._publish_status(
+                                f"barcode acquired during scanner approach: {self.barcode_value}; "
+                                f"remaining={remaining_m*1000:.1f}mm, allowing bounded User X+ to finish"
+                            )
+                        else:
+                            self._publish_status(
+                                f"barcode acquired during scanner approach: {self.barcode_value}; "
+                                "stopping bounded User X+ immediately"
+                            )
+                            self.controller.stop_motion()
+                            motion_stopped = True
+                        break
+                if time.monotonic() - started_at > timeout_s:
+                    raise RuntimeError(
+                        f"Monitored scanner approach timed out: "
+                        f"target={target_distance_m*1000:.1f}mm"
+                    )
+                time.sleep(period_s)
+        finally:
+            if move_thread.is_alive() and not motion_stopped and not natural_finish:
+                try:
+                    self.controller.stop_motion()
+                    motion_stopped = True
+                except Exception as stop_exc:
+                    self.get_logger().warning(
+                        f"Stopping bounded scanner approach returned: {stop_exc}"
+                    )
+            move_thread.join(timeout=2.0)
+
+        if move_thread.is_alive():
+            raise RuntimeError("Scanner approach motion thread did not stop after cancellation")
+        if move_errors and not barcode_seen:
+            raise move_errors[0]
+
+        final_pose = self._current_command_pose()
+        actual_x_m = max(0.0, float(final_pose.x) - start_x)
+        return actual_x_m, barcode_seen
 
     def _retreat_box_from_scanner(self, actual_approach_m: float) -> None:
         """扫码后保持姿态沿 User X- 退回，给后续旋转留出安全空间。"""
@@ -1078,10 +1476,7 @@ class CosmeticBoxSingleArmNode(Node):
             self._publish_status("scanner safety retreat not required; no X+ approach was made")
             return
 
-        retreat_speed = max(
-            1,
-            min(100, int(self.get_parameter("scanner_retreat_speed_factor").value)),
-        )
+        retreat_speed = self._motion_profile()["scanner_retreat_speed"]
         self._require_cycle_active("before scanner safety retreat")
         tcp_before = self._current_command_pose()
         self._relative_user_move(
@@ -1093,6 +1488,7 @@ class CosmeticBoxSingleArmNode(Node):
                 f"at {retreat_speed}% before XYZ/Ry/Rz PTP"
             ),
             speed_factor=retreat_speed,
+            accel_factor=self._motion_profile()["scanner_retreat_acc"],
         )
         self._require_cycle_active("during scanner safety retreat")
         tcp_after = self._current_command_pose()
@@ -1192,10 +1588,8 @@ class CosmeticBoxSingleArmNode(Node):
             abs(float(self.get_parameter("barcode_flip_jog_tolerance_deg").value)),
         )
         timeout_s = max(1.0, float(self.get_parameter("barcode_flip_jog_timeout_s").value))
-        barcode_speed = max(
-            1,
-            min(100, int(self.get_parameter("barcode_j6_speed_factor").value)),
-        )
+        motion = self._motion_profile()
+        barcode_speed = motion["barcode_jog_speed"]
         self._publish_status(
             f"barcode face {face_index}: monitored {axis_name} jog "
             f"{start_joint_deg:.1f}->{target_joint_deg:.1f}deg at {barcode_speed}%; "
@@ -1217,7 +1611,8 @@ class CosmeticBoxSingleArmNode(Node):
             jog_started = True
             while True:
                 self._require_cycle_active(f"during barcode {axis_name} jog")
-                # 条码回调运行在 ROS executor 线程中；这里每 20 ms 检查一次。
+                # 条码回调运行在 ROS executor 线程中；这里每 5 ms 检查一次，
+                # 让扫码成功后的 J6 停止和后续阶段衔接更紧。
                 # 一旦达到稳定次数，立即退出循环，并在 finally 中停止 J6。
                 with self.barcode_lock:
                     if self.barcode_hits >= required_hits:
@@ -1244,7 +1639,7 @@ class CosmeticBoxSingleArmNode(Node):
                     )
                 if progress_deg >= target_progress_deg - tolerance_deg:
                     break
-                time.sleep(0.02)
+                time.sleep(0.005)
         finally:
             if jog_started:
                 try:
@@ -1258,7 +1653,7 @@ class CosmeticBoxSingleArmNode(Node):
                     )
             try:
                 # 避免 J6 专用速度残留并影响后续普通机械臂动作。
-                self.controller.set_speed_factor(int(self.get_parameter("joint_speed").value))
+                self.controller.set_speed_factor(100)
             except Exception as speed_exc:
                 self.get_logger().warning(
                     f"Restoring robot speed factor after barcode jog failed: {speed_exc}"
@@ -1302,7 +1697,8 @@ class CosmeticBoxSingleArmNode(Node):
             aligned_joints[watch_index] = snap_target_deg
             self.controller.move_joint(
                 aligned_joints,
-                speed=barcode_speed,
+                speed=motion["barcode_alignment_speed"],
+                accel=motion["barcode_alignment_acc"],
             )
             self._require_cycle_active(f"after barcode face alignment to {face_anchor} anchor")
             final_joints = self.controller.current_joint()
@@ -1341,7 +1737,7 @@ class CosmeticBoxSingleArmNode(Node):
             with self.barcode_lock:
                 if self.barcode_hits >= required_hits:
                     return self.barcode_value
-            time.sleep(0.02)
+            time.sleep(0.005)
         return ""
 
     def _rotate_until_stable_barcode(self) -> str:
@@ -1351,7 +1747,7 @@ class CosmeticBoxSingleArmNode(Node):
         # a barcode is decoded. Keeping this fixed at four faces also prevents
         # an accidental mouse-wheel change in the GUI from shortening search.
         max_faces = 4
-        wait_s = max(0.1, float(self.get_parameter("barcode_face_wait_s").value))
+        wait_s = max(0.02, float(self.get_parameter("barcode_face_wait_s").value))
         preferred_delta = float(self.get_parameter("barcode_flip_step_deg").value)
         try:
             with self.barcode_lock:
@@ -1363,7 +1759,7 @@ class CosmeticBoxSingleArmNode(Node):
             # into the transfer joint, exactly as the previous search loop did.
             value = self._wait_for_current_barcode(required_hits, wait_s, "checking barcode at transfer joint")
             if value:
-                self._publish_status(f"barcode already acquired at transfer joint: {value}")
+                self._publish_status(f"barcode already acquired before J6 search: {value}")
                 return value
 
             watch_index = max(
@@ -1431,7 +1827,8 @@ class CosmeticBoxSingleArmNode(Node):
                         aligned_joints[watch_index] = next_face_anchor_deg
                         self.controller.move_joint(
                             [float(joint) for joint in aligned_joints],
-                            speed=int(self.get_parameter("barcode_j6_speed_factor").value),
+                            speed=self._motion_profile()["barcode_alignment_speed"],
+                            accel=self._motion_profile()["barcode_alignment_acc"],
                         )
                         self._require_cycle_active("after waiting-phase barcode face alignment")
                     return value
@@ -1479,10 +1876,8 @@ class CosmeticBoxSingleArmNode(Node):
             float(target_ry),
             float(target_rz),
         )
-        combined_speed = max(
-            1,
-            min(100, int(self.get_parameter("jog_speed_factor").value)),
-        )
+        motion = self._motion_profile()
+        combined_speed = motion["post_scan_speed"]
         self._publish_status(
             f"combined User PTP: XYZ=({target.x*1000:.0f},{target.y*1000:.0f},"
             f"{target.z*1000:.0f})mm, Ry={ry_delta_deg:+.1f}deg then "
@@ -1501,7 +1896,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.controller.move_joint_tcp(
             target,
             speed=combined_speed,
-            accel=int(self.get_parameter("joint_acc").value),
+            accel=motion["post_scan_acc"],
             user_index=user_index,
             tool_index=tool_index,
         )
@@ -1563,10 +1958,7 @@ class CosmeticBoxSingleArmNode(Node):
             0.0005,
             float(self.get_parameter("face_up_fixed_xyz_tolerance_m").value),
         )
-        rotation_speed = max(
-            1,
-            min(100, int(self.get_parameter("face_up_rotation_speed_factor").value)),
-        )
+        rotation_speed = self._motion_profile()["face_up_jog_speed"]
 
         self._publish_status(
             f"user-frame {axis_name} MoveJog to {total_delta_deg:+.1f}deg with fixed TCP XYZ; "
@@ -1617,7 +2009,7 @@ class CosmeticBoxSingleArmNode(Node):
                 except Exception as stop_exc:
                     self.get_logger().warning(f"Stopping user-frame Ry MoveJog returned: {stop_exc}")
             try:
-                self.controller.set_speed_factor(int(self.get_parameter("joint_speed").value))
+                self.controller.set_speed_factor(100)
             except Exception as speed_exc:
                 self.get_logger().warning(f"Restoring robot speed factor failed: {speed_exc}")
 
@@ -1657,6 +2049,7 @@ class CosmeticBoxSingleArmNode(Node):
         )
 
     def destroy_node(self):
+        self.shutting_down = True
         self.running = False
         self.cycle_enabled = False
         try:
@@ -1794,8 +2187,18 @@ class CosmeticBoxControlWindow(QMainWindow):
     def _build_motion_parameters(self, layout: QVBoxLayout) -> None:
         box = QGroupBox("抓取与运动参数")
         form = QFormLayout(box)
+        self.motion_speed_scale = QSpinBox(); self.motion_speed_scale.setRange(50, 400); self.motion_speed_scale.setSingleStep(5); self.motion_speed_scale.setValue(int(self.node.get_parameter("motion_speed_scale_percent").value))
         self.joint_speed = QSpinBox(); self.joint_speed.setRange(1, 100); self.joint_speed.setValue(int(self.node.get_parameter("joint_speed").value))
         self.joint_acc = QSpinBox(); self.joint_acc.setRange(1, 100); self.joint_acc.setValue(int(self.node.get_parameter("joint_acc").value))
+        self.grasp_lift_speed = QSpinBox(); self.grasp_lift_speed.setRange(1, 100); self.grasp_lift_speed.setValue(int(self.node.get_parameter("grasp_lift_speed_factor").value))
+        self.grasp_lift_acc = QSpinBox(); self.grasp_lift_acc.setRange(1, 100); self.grasp_lift_acc.setValue(int(self.node.get_parameter("grasp_lift_acc_factor").value))
+        self.transfer_speed = QSpinBox(); self.transfer_speed.setRange(1, 100); self.transfer_speed.setValue(int(self.node.get_parameter("transfer_speed_factor").value))
+        self.transfer_acc = QSpinBox(); self.transfer_acc.setRange(1, 100); self.transfer_acc.setValue(int(self.node.get_parameter("transfer_acc_factor").value))
+        self.post_scan_acc = QSpinBox(); self.post_scan_acc.setRange(1, 100); self.post_scan_acc.setValue(int(self.node.get_parameter("post_scan_acc_factor").value))
+        self.place_speed = QSpinBox(); self.place_speed.setRange(1, 100); self.place_speed.setValue(int(self.node.get_parameter("place_speed_factor").value))
+        self.place_acc = QSpinBox(); self.place_acc.setRange(1, 100); self.place_acc.setValue(int(self.node.get_parameter("place_acc_factor").value))
+        self.return_startup_speed = QSpinBox(); self.return_startup_speed.setRange(1, 100); self.return_startup_speed.setValue(int(self.node.get_parameter("return_startup_speed_factor").value))
+        self.return_startup_acc = QSpinBox(); self.return_startup_acc.setRange(1, 100); self.return_startup_acc.setValue(int(self.node.get_parameter("return_startup_acc_factor").value))
         self.linear_speed = QSpinBox(); self.linear_speed.setRange(1, 100); self.linear_speed.setValue(int(self.node.get_parameter("linear_speed").value))
         self.linear_acc = QSpinBox(); self.linear_acc.setRange(1, 100); self.linear_acc.setValue(int(self.node.get_parameter("linear_acc").value))
         self.jog_speed = QSpinBox(); self.jog_speed.setRange(1, 100); self.jog_speed.setValue(int(self.node.get_parameter("jog_speed_factor").value))
@@ -1808,11 +2211,25 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.grasp_retry_limit = QSpinBox(); self.grasp_retry_limit.setRange(0, 20); self.grasp_retry_limit.setValue(int(self.node.get_parameter("single_cycle_grasp_retry_limit").value))
         self.feedback_required = QCheckBox("启用空抓检测与自动重试")
         self.feedback_required.setChecked(bool(self.node.get_parameter("grasp_feedback_required").value))
-        form.addRow("关节速度 %", self.joint_speed)
-        form.addRow("关节加速度 %（短行程提速）", self.joint_acc)
-        form.addRow("直线速度 %", self.linear_speed)
-        form.addRow("直线加速度 %（抓取下降）", self.linear_acc)
-        form.addRow("扫码后 XYZ+Ry/Rz PTP 速度 %", self.jog_speed)
+        self.effective_motion_label = QLabel()
+        self.effective_motion_label.setWordWrap(True)
+        self._refresh_effective_motion_label()
+        form.addRow("统一提速比例 %（100=原有效速度）", self.motion_speed_scale)
+        form.addRow("当前单指令有效值", self.effective_motion_label)
+        form.addRow("关节速度兼容基准 %", self.joint_speed)
+        form.addRow("关节加速度兼容基准 %", self.joint_acc)
+        form.addRow("抓取后抬升速度兼容基准 %", self.grasp_lift_speed)
+        form.addRow("抓取后抬升加速度兼容基准 %", self.grasp_lift_acc)
+        form.addRow("抓取后中转位速度兼容基准 %", self.transfer_speed)
+        form.addRow("抓取后中转位加速度兼容基准 %", self.transfer_acc)
+        form.addRow("直线速度兼容基准 %", self.linear_speed)
+        form.addRow("直线加速度兼容基准 %", self.linear_acc)
+        form.addRow("扫码后组合 PTP 兼容基准 %", self.jog_speed)
+        form.addRow("扫码后组合 PTP 加速度兼容基准 %", self.post_scan_acc)
+        form.addRow("最终放置速度兼容基准 %", self.place_speed)
+        form.addRow("最终放置加速度兼容基准 %", self.place_acc)
+        form.addRow("回初始位速度兼容基准 %", self.return_startup_speed)
+        form.addRow("回初始位加速度兼容基准 %", self.return_startup_acc)
         form.addRow("夹爪抓取力", self.gripper_force)
         form.addRow("抓取 Z 修正 mm（正值更浅）", self.grasp_z_offset)
         form.addRow("TCP 最低安全 Z mm", self.minimum_safe_tcp_z)
@@ -1826,32 +2243,51 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow(self.apply_button)
         layout.addWidget(box)
 
+    def _refresh_effective_motion_label(self) -> None:
+        if not hasattr(self, "effective_motion_label"):
+            return
+        profile = self.node._motion_profile()
+        self.effective_motion_label.setText(
+            "抓取上方关节 {joint_speed}% / 抬升 {grasp_lift_speed}% / "
+            "中转 {transfer_speed}% / 组合 PTP {post_scan_speed}% / "
+            "放置 {place_speed}% / 回初始 {return_startup_speed}% / "
+            "直线 {linear_speed}%·{linear_acc}% / "
+            "扫码靠近 {scanner_approach_speed}% / 退让 {scanner_retreat_speed}% / "
+            "J6 点动 {barcode_jog_speed}%".format(**profile)
+        )
+
     def _build_barcode_parameters(self, layout: QVBoxLayout) -> None:
         box = QGroupBox("扫码与组合姿态参数")
         form = QFormLayout(box)
         self.barcode_hits = QSpinBox(); self.barcode_hits.setRange(1, 20); self.barcode_hits.setValue(int(self.node.get_parameter("barcode_stable_hits").value))
         self.barcode_rotations = QSpinBox(); self.barcode_rotations.setRange(4, 4); self.barcode_rotations.setValue(4)
-        self.barcode_wait = self._new_double(float(self.node.get_parameter("barcode_face_wait_s").value), 0.1, 10.0, 1, 0.1)
+        self.barcode_wait = self._new_double(float(self.node.get_parameter("barcode_face_wait_s").value), 0.02, 10.0, 2, 0.01)
         # 三段扫码相关运动分别调速，避免修改普通“关节速度”时全部一起变化。
         self.scanner_approach_speed = QSpinBox(); self.scanner_approach_speed.setRange(1, 100); self.scanner_approach_speed.setValue(int(self.node.get_parameter("scanner_approach_speed_factor").value))
         self.scanner_retreat_speed = QSpinBox(); self.scanner_retreat_speed.setRange(1, 100); self.scanner_retreat_speed.setValue(int(self.node.get_parameter("scanner_retreat_speed_factor").value))
+        self.scanner_retreat_acc = QSpinBox(); self.scanner_retreat_acc.setRange(1, 100); self.scanner_retreat_acc.setValue(int(self.node.get_parameter("scanner_retreat_acc_factor").value))
         self.barcode_j6_speed = QSpinBox(); self.barcode_j6_speed.setRange(1, 100); self.barcode_j6_speed.setValue(int(self.node.get_parameter("barcode_j6_speed_factor").value))
+        self.barcode_alignment_acc = QSpinBox(); self.barcode_alignment_acc.setRange(1, 100); self.barcode_alignment_acc.setValue(int(self.node.get_parameter("barcode_alignment_acc_factor").value))
         self.barcode_rz = self._new_double(float(self.node.get_parameter("barcode_flip_step_deg").value), -180.0, 180.0, 1, 5.0)
         self.face_up_user_ry = self._new_double(float(self.node.get_parameter("face_up_user_ry_deg").value), -180.0, 180.0, 1, 5.0)
         self.post_scan_user_rz = self._new_double(float(self.node.get_parameter("post_scan_user_rz_deg").value), -180.0, 180.0, 1, 5.0)
         self.face_up_jog_tolerance = self._new_double(float(self.node.get_parameter("face_up_jog_tolerance_deg").value), 0.2, 10.0, 1, 0.2)
         self.scanner_center_distance = self._new_double(float(self.node.get_parameter("scanner_center_distance_m").value) * 1000.0, 1.0, 500.0, 1, 1.0)
         self.scanner_face_clearance = self._new_double(float(self.node.get_parameter("scanner_face_clearance_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
+        self.scanner_negative_tolerance = self._new_double(float(self.node.get_parameter("scanner_approach_negative_tolerance_m").value) * 1000.0, 0.0, 20.0, 1, 1.0)
         self.scanner_retreat_extra = self._new_double(float(self.node.get_parameter("scanner_retreat_extra_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
         form.addRow("同码稳定次数", self.barcode_hits)
         form.addRow("检查面数（旧逻辑固定）", self.barcode_rotations)
         form.addRow("每面等待秒", self.barcode_wait)
         form.addRow("中转 TCP 到扫码器距离 mm", self.scanner_center_distance)
         form.addRow("盒侧面扫码间隙 mm", self.scanner_face_clearance)
+        form.addRow("负靠近量容差 mm", self.scanner_negative_tolerance)
         form.addRow("靠近扫码器 User X+ 速度 %", self.scanner_approach_speed)
         form.addRow("扫码后安全退让 User X- 速度 %", self.scanner_retreat_speed)
+        form.addRow("扫码后安全退让 User X- 加速度 %", self.scanner_retreat_acc)
         form.addRow("回中转距离后额外退让 mm", self.scanner_retreat_extra)
         form.addRow("J6 多面找码/对齐速度 %", self.barcode_j6_speed)
+        form.addRow("J6 标准面对齐加速度 %", self.barcode_alignment_acc)
         form.addRow("找码 J6 步进 deg（旧逻辑）", self.barcode_rz)
         form.addRow("组合目标 User Ry 增量 deg", self.face_up_user_ry)
         form.addRow("组合目标 User Rz 增量 deg", self.post_scan_user_rz)
@@ -1909,11 +2345,21 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("transfer_joint", value=transfer),
             Parameter("scan_exit_user_xyz", value=scan_xyz),
             Parameter("place_pose", value=place),
+            Parameter("motion_speed_scale_percent", value=self.motion_speed_scale.value()),
             Parameter("joint_speed", value=self.joint_speed.value()),
             Parameter("joint_acc", value=self.joint_acc.value()),
+            Parameter("grasp_lift_speed_factor", value=self.grasp_lift_speed.value()),
+            Parameter("grasp_lift_acc_factor", value=self.grasp_lift_acc.value()),
+            Parameter("transfer_speed_factor", value=self.transfer_speed.value()),
+            Parameter("transfer_acc_factor", value=self.transfer_acc.value()),
             Parameter("linear_speed", value=self.linear_speed.value()),
             Parameter("linear_acc", value=self.linear_acc.value()),
-            Parameter("jog_speed_factor", value=self.jog_speed.value()),
+            Parameter("jog_speed_factor", value=float(self.jog_speed.value())),
+            Parameter("post_scan_acc_factor", value=self.post_scan_acc.value()),
+            Parameter("place_speed_factor", value=self.place_speed.value()),
+            Parameter("place_acc_factor", value=self.place_acc.value()),
+            Parameter("return_startup_speed_factor", value=self.return_startup_speed.value()),
+            Parameter("return_startup_acc_factor", value=self.return_startup_acc.value()),
             Parameter("dh_grasp_force", value=self.gripper_force.value()),
             Parameter("grasp_z_offset_m", value=self.grasp_z_offset.value() / 1000.0),
             Parameter("minimum_safe_tcp_z_m", value=self.minimum_safe_tcp_z.value() / 1000.0),
@@ -1927,10 +2373,13 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("barcode_face_wait_s", value=self.barcode_wait.value()),
             Parameter("scanner_center_distance_m", value=self.scanner_center_distance.value() / 1000.0),
             Parameter("scanner_face_clearance_m", value=self.scanner_face_clearance.value() / 1000.0),
+            Parameter("scanner_approach_negative_tolerance_m", value=self.scanner_negative_tolerance.value() / 1000.0),
             Parameter("scanner_approach_speed_factor", value=self.scanner_approach_speed.value()),
             Parameter("scanner_retreat_speed_factor", value=self.scanner_retreat_speed.value()),
+            Parameter("scanner_retreat_acc_factor", value=self.scanner_retreat_acc.value()),
             Parameter("scanner_retreat_extra_m", value=self.scanner_retreat_extra.value() / 1000.0),
             Parameter("barcode_j6_speed_factor", value=self.barcode_j6_speed.value()),
+            Parameter("barcode_alignment_acc_factor", value=self.barcode_alignment_acc.value()),
             Parameter("barcode_flip_step_deg", value=self.barcode_rz.value()),
             Parameter("face_up_user_ry_deg", value=self.face_up_user_ry.value()),
             Parameter("post_scan_user_rz_deg", value=self.post_scan_user_rz.value()),
@@ -1941,8 +2390,9 @@ class CosmeticBoxControlWindow(QMainWindow):
         if failures:
             self.cycle_status_label.setText("参数应用失败: " + "; ".join(failures))
             return
-        self.node.controller.set_joint_profile(speed=self.joint_speed.value(), accel=self.joint_acc.value())
-        self.node.controller.set_linear_profile(speed=self.linear_speed.value(), accel=self.linear_acc.value())
+        self.node.controller.enable_single_command_motion_scaling()
+        self.node._log_effective_motion_profile()
+        self._refresh_effective_motion_label()
         self.node._publish_status("GUI parameters applied")
 
     def apply_and_run(self, function) -> None:
