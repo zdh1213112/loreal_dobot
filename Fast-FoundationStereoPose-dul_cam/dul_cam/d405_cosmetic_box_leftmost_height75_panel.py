@@ -34,6 +34,10 @@ from scipy.spatial.transform import Rotation as SciPyRot
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, Float32, String
 
+from dobot_nova5_driver.handoff_clearance import (
+    evaluate_camera_right_handoff_clearance,
+)
+
 SAM2_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "SAM2_streaming")
 sys.path.insert(0, SAM2_DIR)
 from sam2.build_sam import build_sam2_camera_predictor
@@ -89,6 +93,19 @@ PUBLISH_FRAMES_BEFORE_RESET = 2
 MAX_TRACKING_FRAMES_WITHOUT_HEIGHT = 18
 YOLO_BOX_DISPLAY_TTL_S = 0.8
 
+# 102 从 D405 图像右侧把盒子放到交接区并沿右侧退出。101 在发布抓取
+# 目标前，使用完整 FFS 场景点云检查目标正上方和右边缘外的小型通道。
+# 第一份锁定点云可用于快速初检，但必须再有一份 LIVE FFS 点云确认；
+# 障碍消失后同样连续两份独立点云 CLEAR 才放行。
+HANDOFF_CLEARANCE_ENABLED = True
+HANDOFF_CLEARANCE_CLEAR_FRAMES = 2
+HANDOFF_CLEARANCE_RIGHT_EXTENSION_M = 0.080
+HANDOFF_CLEARANCE_SIDE_MARGIN_M = 0.030
+HANDOFF_CLEARANCE_VERTICAL_GAP_M = 0.020
+HANDOFF_CLEARANCE_CHECK_HEIGHT_M = 0.180
+HANDOFF_CLEARANCE_VOXEL_SIZE_M = 0.015
+HANDOFF_CLEARANCE_MIN_CLUSTER_POINTS = 30
+
 # Camera/panel parameters
 AUTO_EXPOSURE = True
 MANUAL_EXPOSURE = 11000.0
@@ -101,6 +118,8 @@ PANEL_JPEG_QUALITY = 80
 CLOUD_VIEW_W = 720
 CLOUD_VIEW_H = 540
 ENABLE_LOCAL_WINDOWS = True
+LOCAL_WINDOW_NAME = "D405 Cosmetic Box RGB + Point Cloud"
+LOCAL_DIVIDER_WIDTH_PX = 4
 MIN_ROI_SIZE_PX = 20
 
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
@@ -135,6 +154,8 @@ height_pub = ros_node.create_publisher(Float32, "/cosmetic_box_height", 10)
 # 每次触发的明确成功/失败结果。机械臂据此在 YOLO/ROI 已明确失败时
 # 立即结束等待，而不是固定等满 vision_timeout_s。
 vision_result_pub = ros_node.create_publisher(String, "/d405_vision_result", 10)
+handoff_clear_pub = ros_node.create_publisher(Bool, "/d405_handoff_zone_clear", 10)
+handoff_state_pub = ros_node.create_publisher(String, "/d405_handoff_zone_state", 10)
 rgb_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local_rgb/image/compressed", 1)
 cloud_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local_cloud/image/compressed", 1)
 
@@ -159,6 +180,36 @@ def publish_vision_result(success: bool, reason: str) -> None:
     message.data = f"{'success' if success else 'failure'}:{reason}"
     vision_result_pub.publish(message)
     vision_request_active = False
+
+
+def publish_handoff_clearance(
+    state: str,
+    *,
+    clear: bool,
+    candidate_points: int = 0,
+    largest_cluster_points: int = 0,
+    clear_streak: int = 0,
+) -> None:
+    """Publish a fail-closed handoff-zone state for monitoring and logging."""
+
+    clear_message = Bool()
+    clear_message.data = bool(clear)
+    handoff_clear_pub.publish(clear_message)
+    state_message = String()
+    state_message.data = json.dumps(
+        {
+            "state": str(state),
+            "clear": bool(clear),
+            "candidate_points": int(candidate_points),
+            "largest_cluster_points": int(largest_cluster_points),
+            "clear_streak": int(clear_streak),
+            "required_clear_frames": int(HANDOFF_CLEARANCE_CLEAR_FRAMES),
+            "stamp_ns": int(ros_node.get_clock().now().nanoseconds),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    handoff_state_pub.publish(state_message)
 
 
 def trigger_callback(msg: Bool) -> None:
@@ -231,6 +282,40 @@ def mouse_callback(event, x, y, flags, param) -> None:
                 f"[ROI] Drag is too small; minimum size is greater than "
                 f"{MIN_ROI_SIZE_PX}x{MIN_ROI_SIZE_PX}px. Previous ROI is unchanged."
             )
+
+
+def combined_window_mouse_callback(event, x, y, flags, param) -> None:
+    """Route ROI gestures from only the RGB half of the combined window."""
+
+    if 0 <= x < IMG_WIDTH and 0 <= y < IMG_HEIGHT:
+        mouse_callback(event, x, y, flags, param)
+    elif event == cv2.EVENT_LBUTTONUP:
+        # A drag that starts on RGB and ends over the cloud should still close
+        # cleanly at the RGB boundary instead of leaving ROI drawing active.
+        mouse_callback(
+            event,
+            max(0, min(IMG_WIDTH - 1, x)),
+            max(0, min(IMG_HEIGHT - 1, y)),
+            flags,
+            param,
+        )
+
+
+def compose_local_window(rgb_image: np.ndarray, cloud_image: np.ndarray) -> np.ndarray:
+    """Place RGB and point-cloud views side by side in one local window."""
+
+    cloud_width = max(1, int(round(cloud_image.shape[1] * IMG_HEIGHT / cloud_image.shape[0])))
+    cloud_scaled = cv2.resize(
+        cloud_image,
+        (cloud_width, IMG_HEIGHT),
+        interpolation=cv2.INTER_AREA,
+    )
+    divider = np.full(
+        (IMG_HEIGHT, LOCAL_DIVIDER_WIDTH_PX, 3),
+        48,
+        dtype=np.uint8,
+    )
+    return np.hstack((rgb_image, divider, cloud_scaled))
 
 
 def draw_manual_roi(image: np.ndarray) -> None:
@@ -578,13 +663,20 @@ last_height_evidence_mode = "none"
 tracking_frames_without_height = 0
 last_height_warning_time = 0.0
 last_cloud_fallback_time = 0.0
+handoff_clear_streak = 0
+handoff_clearance_passed = not HANDOFF_CLEARANCE_ENABLED
+handoff_force_live_cloud = False
+last_handoff_state = "IDLE"
+last_handoff_candidate_points = 0
+last_handoff_cluster_points = 0
 
 if ENABLE_LOCAL_WINDOWS:
-    cv2.namedWindow("D405 Cosmetic Box RGB", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("D405 Cosmetic Box RGB", IMG_WIDTH, IMG_HEIGHT)
-    cv2.setMouseCallback("D405 Cosmetic Box RGB", mouse_callback)
-    cv2.namedWindow("D405 Cosmetic Box Point Cloud", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("D405 Cosmetic Box Point Cloud", CLOUD_VIEW_W, CLOUD_VIEW_H)
+    local_window_width = IMG_WIDTH + LOCAL_DIVIDER_WIDTH_PX + int(
+        round(CLOUD_VIEW_W * IMG_HEIGHT / CLOUD_VIEW_H)
+    )
+    cv2.namedWindow(LOCAL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(LOCAL_WINDOW_NAME, local_window_width, IMG_HEIGHT)
+    cv2.setMouseCallback(LOCAL_WINDOW_NAME, combined_window_mouse_callback)
 
 try:
     while not quit_requested:
@@ -607,6 +699,13 @@ try:
             locked_cloud_v_rgb = None
             locked_cloud_in_bounds = None
             locked_cloud_colors = None
+            handoff_clear_streak = 0
+            handoff_clearance_passed = not HANDOFF_CLEARANCE_ENABLED
+            handoff_force_live_cloud = False
+            last_handoff_state = "WAIT_TARGET"
+            last_handoff_candidate_points = 0
+            last_handoff_cluster_points = 0
+            publish_handoff_clearance("WAIT_TARGET", clear=False)
             logging.info(
                 f"[D405] Flushing {CAPTURE_FLUSH_FRAMES} frames before YOLO capture..."
             )
@@ -706,6 +805,7 @@ try:
             locked_cloud_points is not None
             and pending_yolo_obbs is None
             and not locked_target_ready
+            and not handoff_force_live_cloud
         )
         if reuse_selection_cloud:
             points_3d = locked_cloud_points
@@ -804,6 +904,13 @@ try:
                 locked_cloud_v_rgb = v_rgb.copy()
                 locked_cloud_in_bounds = in_bounds.copy()
                 locked_cloud_colors = colors.copy()
+                handoff_clear_streak = 0
+                handoff_clearance_passed = not HANDOFF_CLEARANCE_ENABLED
+                handoff_force_live_cloud = False
+                last_handoff_state = "CHECKING"
+                last_handoff_candidate_points = 0
+                last_handoff_cluster_points = 0
+                publish_handoff_clearance("CHECKING", clear=False)
                 x1, y1 = np.min(corners, axis=0)
                 x2, y2 = np.max(corners, axis=0)
                 pending_bbox = (int(x1), int(y1), int(x2), int(y2))
@@ -816,6 +923,7 @@ try:
 
         display = color_bgr.copy()
         tracked_target_points = None
+        handoff_candidate_mask = None
         if current_mask is not None and np.any(current_mask):
             overlay = display.copy()
             overlay[current_mask > 0] = MASK_COLOR_BGR
@@ -1062,11 +1170,88 @@ try:
                                             smooth_rotation = orthonormalize(OBB_SMOOTH * axes + (1 - OBB_SMOOTH) * smooth_rotation)
 
                                         last_height_m = float(smooth_extent[2])
-                                        # Publish only the initial stable samples.
-                                        # Afterwards SAM2 remains alive solely for the
-                                        # RGB/point-cloud tracking display until the
-                                        # next trigger starts a fresh target session.
-                                        if not locked_target_ready:
+                                        # A geometrically valid box must not be mistaken
+                                        # for a missing-height frame merely because the
+                                        # 102 arm is still occupying the space above it.
+                                        tracking_frames_without_height = 0
+
+                                        if not handoff_clearance_passed:
+                                            clearance = evaluate_camera_right_handoff_clearance(
+                                                points_3d,
+                                                smooth_box_center,
+                                                smooth_extent,
+                                                smooth_rotation,
+                                                right_extension_m=HANDOFF_CLEARANCE_RIGHT_EXTENSION_M,
+                                                side_margin_m=HANDOFF_CLEARANCE_SIDE_MARGIN_M,
+                                                vertical_gap_m=HANDOFF_CLEARANCE_VERTICAL_GAP_M,
+                                                check_height_m=HANDOFF_CLEARANCE_CHECK_HEIGHT_M,
+                                                voxel_size_m=HANDOFF_CLEARANCE_VOXEL_SIZE_M,
+                                                min_obstacle_points=HANDOFF_CLEARANCE_MIN_CLUSTER_POINTS,
+                                            )
+                                            handoff_candidate_mask = clearance.candidate_mask
+                                            last_handoff_candidate_points = clearance.candidate_point_count
+                                            last_handoff_cluster_points = clearance.largest_cluster_point_count
+                                            # After the first snapshot (or any BLOCKED
+                                            # result), a CLEAR result only counts when it
+                                            # comes from a newly inferred LIVE FFS cloud.
+                                            independent_clear_sample = not (
+                                                handoff_force_live_cloud and using_locked_cloud
+                                            )
+                                            if not clearance.clear:
+                                                handoff_clear_streak = 0
+                                                handoff_force_live_cloud = True
+                                                handoff_state = "BLOCKED"
+                                            elif not independent_clear_sample:
+                                                handoff_force_live_cloud = True
+                                                handoff_state = "WAIT_LIVE_CLOUD"
+                                            else:
+                                                handoff_clear_streak += 1
+                                                if handoff_clear_streak >= HANDOFF_CLEARANCE_CLEAR_FRAMES:
+                                                    handoff_clearance_passed = True
+                                                    handoff_force_live_cloud = False
+                                                    handoff_state = "CLEAR"
+                                                    # Reuse this verified-clear cloud for
+                                                    # the second robot-side pose sample;
+                                                    # this avoids a third FFS inference.
+                                                    if not using_locked_cloud:
+                                                        locked_cloud_points = points_3d.copy()
+                                                        locked_cloud_u_rgb = u_rgb.copy()
+                                                        locked_cloud_v_rgb = v_rgb.copy()
+                                                        locked_cloud_in_bounds = in_bounds.copy()
+                                                        locked_cloud_colors = colors.copy()
+                                                else:
+                                                    handoff_force_live_cloud = True
+                                                    handoff_state = "VERIFYING_CLEAR"
+
+                                            if clearance.candidate_point_count:
+                                                obstacle_color = (
+                                                    np.array([1.0, 0.0, 1.0])
+                                                    if not clearance.clear
+                                                    else np.array([1.0, 0.65, 0.0])
+                                                )
+                                                colors[clearance.candidate_mask] = obstacle_color
+                                            if handoff_state != last_handoff_state:
+                                                logging.info(
+                                                    f"[handoff-clearance] {handoff_state}: "
+                                                    f"candidate_points={clearance.candidate_point_count}, "
+                                                    f"largest_cluster={clearance.largest_cluster_point_count}, "
+                                                    f"clear_streak={handoff_clear_streak}/"
+                                                    f"{HANDOFF_CLEARANCE_CLEAR_FRAMES}, "
+                                                    f"cloud={'LOCKED' if using_locked_cloud else 'LIVE'}"
+                                                )
+                                            last_handoff_state = handoff_state
+                                            publish_handoff_clearance(
+                                                handoff_state,
+                                                clear=handoff_clearance_passed,
+                                                candidate_points=clearance.candidate_point_count,
+                                                largest_cluster_points=clearance.largest_cluster_point_count,
+                                                clear_streak=handoff_clear_streak,
+                                            )
+
+                                        # Publish only after the target core and right-side handoff
+                                        # corridor have been independently clear twice. Afterwards SAM2
+                                        # remains alive only for the operator display.
+                                        if handoff_clearance_passed and not locked_target_ready:
                                             pose_msg = PoseStamped()
                                             pose_msg.header.stamp = ros_node.get_clock().now().to_msg()
                                             pose_msg.header.frame_id = "camera_d405_link"
@@ -1090,7 +1275,6 @@ try:
                                             height_msg.data = last_height_m
                                             height_pub.publish(height_msg)
                                             published_frames += 1
-                                            tracking_frames_without_height = 0
                                             if published_frames >= PUBLISH_FRAMES_BEFORE_RESET:
                                                 locked_target_ready = True
                                                 locked_target_height_m = last_height_m
@@ -1194,9 +1378,36 @@ try:
                 cv2.LINE_AA,
             )
 
+        if (
+            handoff_candidate_mask is not None
+            and len(handoff_candidate_mask) == len(points_3d)
+            and np.any(handoff_candidate_mask & in_bounds)
+        ):
+            projected_indices = np.flatnonzero(handoff_candidate_mask & in_bounds)
+            # Keep the panel responsive even when a large robot-link surface
+            # contributes thousands of points to the forbidden prism.
+            draw_step = max(1, len(projected_indices) // 250)
+            point_color = (255, 0, 255) if last_handoff_state == "BLOCKED" else (0, 165, 255)
+            for point_index in projected_indices[::draw_step]:
+                cv2.circle(
+                    display,
+                    (int(u_rgb[point_index]), int(v_rgb[point_index])),
+                    2,
+                    point_color,
+                    -1,
+                    cv2.LINE_AA,
+                )
+
         draw_manual_roi(display)
         fps = 1.0 / max(1e-6, time.time() - loop_start)
-        if locked_target_ready and sam_initialized:
+        if last_handoff_state == "BLOCKED":
+            status = "HANDOFF BLOCKED - WAITING FOR 102 RETREAT"
+        elif last_handoff_state in ("VERIFYING_CLEAR", "WAIT_LIVE_CLOUD"):
+            status = (
+                f"HANDOFF VERIFYING CLEAR {handoff_clear_streak}/"
+                f"{HANDOFF_CLEARANCE_CLEAR_FRAMES}"
+            )
+        elif locked_target_ready and sam_initialized:
             status = "NEXT GRASP TARGET TRACKING"
         elif sam_initialized:
             status = "TRACKING SELECTED TARGET"
@@ -1211,6 +1422,19 @@ try:
         roi_status = "ROI:FULL" if active_roi is None else f"ROI:{active_roi[0]},{active_roi[1]}-{active_roi[2]},{active_roi[3]}"
         cv2.putText(display, f"{status} | FPS {fps:.1f} | {exposure_status} | {roi_status}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0) if sam_initialized else (0, 165, 255), 2)
         cv2.putText(display, "drag mouse=lock ROI | select=min camera X inside ROI | r=clear ROI/reset | a=AE | q=quit", (10, 47), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 220, 255), 1)
+        if last_handoff_state not in ("IDLE", "WAIT_TARGET"):
+            clearance_color = (0, 255, 0) if handoff_clearance_passed else (0, 0, 255)
+            cv2.putText(
+                display,
+                f"handoff={last_handoff_state} points={last_handoff_candidate_points} "
+                f"cluster={last_handoff_cluster_points} clear="
+                f"{handoff_clear_streak}/{HANDOFF_CLEARANCE_CLEAR_FRAMES}",
+                (10, 68),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.43,
+                clearance_color,
+                2,
+            )
         if last_height_m is not None:
             length_text = "" if smooth_extent is None else f" length={smooth_extent[0]*1000:.1f}mm"
             cv2.putText(display, f"height={last_height_m*1000:.1f}mm{length_text} side_planes={last_side_planes} side_pts={last_side_points} depth=75%", (10, IMG_HEIGHT - 31), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1)
@@ -1228,8 +1452,8 @@ try:
         )
         publish_jpeg(cloud_pub, cloud_image, "d405_local_cloud")
         if ENABLE_LOCAL_WINDOWS:
-            cv2.imshow("D405 Cosmetic Box RGB", display)
-            cv2.imshow("D405 Cosmetic Box Point Cloud", cloud_image)
+            combined_local_view = compose_local_window(display, cloud_image)
+            cv2.imshow(LOCAL_WINDOW_NAME, combined_local_view)
             local_key = cv2.waitKey(1) & 0xFF
             if local_key != 0xFF:
                 handle_key(local_key)

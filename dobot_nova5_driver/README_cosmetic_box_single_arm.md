@@ -9,6 +9,7 @@
 3. YOLO 同时检测到多个盒子时，使用每个检测框内的双目三维点比较相机光学坐标 X，抓取 X 最小的有效目标。
    视觉窗口中的候选框短暂显示，最终选中的目标会持续显示红色粗框、中心十字和 `NEXT GRASP`，直到下一次检测请求或人工按 `r` 清除，便于操作员确认机械臂即将抓取哪个盒子。
 4. SAM2 分割后先用净化点云拟合顶面，同时保留未做聚类裁剪的原始分割点作为高度证据。针对相机基本俯视、物体平放桌面的现场，优先使用目标周围桌面平面与顶面间距估高；桌面平面不可用时依次尝试近似垂直的 RANSAC 侧平面和 SAM 轮廓边缘下方点。发布的 TCP 尖端目标在顶面向下 75% 高度处。
+   发布抓取目标前还会用完整 FFS 场景点云检查盒子自身轮廓正上方及右侧三维交接通道：右侧方向固定为 D405 图像右侧，从目标右边缘向外 80 mm、前后额外 30 mm，两个区域的垂直检查范围均为盒顶上方约 20～200 mm。中央区域保留对盒子正上方障碍物的检测，右侧通道用于检测从右侧进入和退出的 102；约 230 mm 高的 101 TCP 位于高度范围外。检测到连续点云簇时保持等待，连续两份独立点云清空后才向 101 发布姿态；正常清空流程只额外计算一份 LIVE FFS 点云。
 5. 视觉同时发布点云包围盒长边。抓取并抬起后移动到中转关节角 `(14, -29, -99, 39, 88, 10)`，再沿 User 0 的 X+ 自动靠近扫码器。位移使用 `中转中心距离 - 盒长/2 - 扫码间隙`；默认即 `120 mm - 盒长/2 - 30 mm`。例如盒长 100 mm 时向 X+ 移动 40 mm，使盒子近侧面距扫码器约 30 mm。
 6. 抬升确认成功后、开始前往中转关节之前就打开扫码窗口，因此前往 `transfer_joint` 途中读到的条码不会丢失。到达中转点后立即检查：已经扫到稳定条码时跳过 User X+ 靠近和全部 J6 找码，直接进入安全退让；尚未扫到时才自适应靠近扫码器并沿 J6 负方向点动找码。J6 旋转途中约每 20 ms 检查一次条码，成功后立即停止并对齐到最近的标准 90° 面位。
 7. 扫码成功并完成 J6 标准面对齐后，盒子仍处于靠近扫码器的位置。程序先保持当前姿态沿 User X− 退回本轮实际 X+ 靠近距离，再额外退让 30 mm；只有核对实际退让量正确后才允许大范围姿态运动。
@@ -36,7 +37,7 @@ ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle.launch.py \
 
 启动文件默认使用 `/home/zdh/miniconda3/envs/ffs_ros/bin/python` 运行视觉节点；该环境已包含当前机器上的 CUDA、FFS、SAM2、RealSense、Open3D、Ultralytics 和 ROS 2 依赖。若环境位置变化，可传入 `vision_python:=...`。
 
-D405 默认启用自动曝光。RGB 视觉窗口或远程面板获得键盘焦点后，按 `a` 可以实时切换自动/手动曝光；左上角显示 `AE` 或 `M Exp:... G:...`。切换到手动模式时使用曝光 `11000`、增益 `8`，并可通过 `[`、`]` 调整曝光、`-`、`+` 调整增益。
+D405 本地显示使用一个组合窗口，左侧为 RGB、右侧为点云；鼠标 ROI 框选只作用于左侧 RGB。远程面板的 RGB 和点云 ROS 图像话题仍保持独立。D405 默认启用自动曝光；本地组合窗口或远程面板获得键盘焦点后，按 `a` 可以实时切换自动/手动曝光，左上角显示 `AE` 或 `M Exp:... G:...`。切换到手动模式时使用曝光 `11000`、增益 `8`，并可通过 `[`、`]` 调整曝光、`-`、`+` 调整增益。
 
 扫码器需要读取 `/dev/input/event*`。临时授权脚本已包含在本项目中。构建并 `source install/setup.bash` 后执行：
 
@@ -80,7 +81,9 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `scanner_approach_monitor_period_s=0.005`：有界 X+ 扫码靠近的条码检查周期；收到条码后立即停止当前 RelMovJUser。
 - `barcode_alignment_acc_factor=100`：J6 扫到码后吸附到最近 90°标准面的加速度。
 - `vision_samples=2`：机器人仍使用两帧结果检查 SAM2 目标稳定性；眼在手相机到达初始位后只刷新 2 帧，并复用本次目标选择时的锁定 FFS 点云，避免静止场景重复计算立体深度。
-- `vision_result_topic=/d405_vision_result`：视觉端会明确返回本次请求成功或失败；ROI 内无目标、YOLO 无目标、立体点不足时，机械臂不再固定等满 `vision_timeout_s=8.0`。
+- `vision_result_topic=/d405_vision_result`：视觉端会明确返回本次请求成功或失败；ROI 内无目标、YOLO 无目标、立体点不足时会立即返回。目标正上方或右侧交接通道有障碍时在同一次请求内等待其退出，控制端上限为 `vision_timeout_s=20.0`，正常 CLEAR 流程不会固定等待该时长。
+- `/d405_handoff_zone_clear`：只有目标正上方和右侧交接通道连续两份独立完整点云均清空时才发布 `true`。
+- `/d405_handoff_zone_state`：JSON 状态，包含 `BLOCKED/VERIFYING_CLEAR/CLEAR`、禁入区候选点数、最大连通簇点数和清空连续帧数。
 - `vision_retry_delay_s=0.1`：连续模式一次检测明确失败后，到发起下一次检测之间的等待时间。
 - `place_release_clearance_m=0.015`：放置点位保持不变；夹爪到达放置点后，从实际夹持宽度额外张开 15 mm 并确认到位，不再等待完全张到 95 mm。
 - `barcode_face_wait_s=0.05`：每个 J6 标准面等待扫码的最长时间。
@@ -98,6 +101,7 @@ ros2 topic echo /cosmetic_pick_cycle_status
 ros2 topic echo /cosmetic_pick_cycle_timing
 ros2 topic echo /cosmetic_box_height
 ros2 topic echo /detected_barcodes
+ros2 topic echo /d405_handoff_zone_state
 ```
 
 `/cosmetic_pick_cycle_timing` 使用 JSON 字符串发布两类数据：每个阶段完成时发布

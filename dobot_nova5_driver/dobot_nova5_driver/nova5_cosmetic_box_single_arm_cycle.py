@@ -228,10 +228,13 @@ class CosmeticBoxSingleArmNode(Node):
         # 盒子高度：顶面与桌面之间的距离，单位为米。
         self.declare_parameter("vision_height_topic", "/cosmetic_box_height")
         self.declare_parameter("vision_trigger_topic", "/trigger_d405_vision")
+        self.declare_parameter("handoff_state_topic", "/d405_handoff_zone_state")
         # 视觉节点连续发布 2 帧稳定结果；机器人取 2 帧做位置/角度一致性检查。
         # 相比原来的 3 帧少等待一次 FFS/SAM2 推理，同时仍保留跨帧校验。
         self.declare_parameter("vision_samples", 2)
-        self.declare_parameter("vision_timeout_s", 8.0)
+        # 视觉请求内部会等待 102 从目标上方退出。延长的上限只影响真正
+        # 被遮挡的请求；正常 CLEAR 流程仍在第二份新鲜点云到达后立即继续。
+        self.declare_parameter("vision_timeout_s", 20.0)
         # 明确失败会由视觉结果话题立即返回；连续循环仅短暂停顿后重新检测。
         self.declare_parameter("vision_retry_delay_s", 0.1)
         self.declare_parameter("vision_result_topic", "/d405_vision_result")
@@ -347,6 +350,11 @@ class CosmeticBoxSingleArmNode(Node):
         self.latest_height_m: Optional[float] = None
         self.vision_result_count = 0
         self.latest_vision_result = ""
+        self.handoff_state_count = 0
+        self.latest_handoff_state = "IDLE"
+        self.latest_handoff_clear = False
+        self.latest_handoff_candidate_points = 0
+        self.latest_handoff_cluster_points = 0
 
         self.barcode_lock = threading.Lock()
         self.barcode_window_active = False
@@ -375,6 +383,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.create_subscription(Float32, str(self.get_parameter("vision_length_topic").value), self._vision_length_callback, 10)
         self.create_subscription(Float32, str(self.get_parameter("vision_height_topic").value), self._vision_height_callback, 10)
         self.create_subscription(String, str(self.get_parameter("vision_result_topic").value), self._vision_result_callback, 10)
+        self.create_subscription(String, str(self.get_parameter("handoff_state_topic").value), self._handoff_state_callback, 10)
         self.create_subscription(String, str(self.get_parameter("barcode_topic").value), self._barcode_callback, 20)
         self.create_subscription(Bool, "/cosmetic_pick_cycle_enable", self._cycle_enable_callback, 10)
         self.trigger_publisher = self.create_publisher(Bool, str(self.get_parameter("vision_trigger_topic").value), 10)
@@ -613,6 +622,28 @@ class CosmeticBoxSingleArmNode(Node):
         with self.data_lock:
             self.latest_vision_result = result
             self.vision_result_count += 1
+
+    def _handoff_state_callback(self, msg: String) -> None:
+        encoded = msg.data.strip()
+        if not encoded:
+            return
+        try:
+            payload = json.loads(encoded)
+            state = str(payload.get("state", "UNKNOWN")).strip().upper()
+            # Fail closed: only a literal JSON boolean true paired with the
+            # exact CLEAR state can authorize accepting vision poses.
+            clear = payload.get("clear") is True and state == "CLEAR"
+            candidate_points = int(payload.get("candidate_points", 0))
+            cluster_points = int(payload.get("largest_cluster_points", 0))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warning(f"Ignoring invalid D405 handoff state: {exc}")
+            return
+        with self.data_lock:
+            self.latest_handoff_state = state
+            self.latest_handoff_clear = clear
+            self.latest_handoff_candidate_points = candidate_points
+            self.latest_handoff_cluster_points = cluster_points
+            self.handoff_state_count += 1
 
     def _barcode_callback(self, msg: String) -> None:
         value = msg.data.strip()
@@ -887,16 +918,19 @@ class CosmeticBoxSingleArmNode(Node):
             previous_length = self.length_count
             previous_height = self.height_count
             previous_result = self.vision_result_count
+            previous_handoff = self.handoff_state_count
         trigger = Bool()
         trigger.data = True
         self.trigger_publisher.publish(trigger)
         required_samples = max(1, int(self.get_parameter("vision_samples").value))
         deadline = time.monotonic() + max(0.1, float(self.get_parameter("vision_timeout_s").value))
+        last_reported_handoff_state = ""
         while (
             self.running
             and (self.cycle_enabled or not require_cycle_enabled)
             and time.monotonic() < deadline
         ):
+            status_update = ""
             with self.data_lock:
                 if self.vision_result_count > previous_result:
                     result_text = self.latest_vision_result
@@ -906,11 +940,26 @@ class CosmeticBoxSingleArmNode(Node):
                             f"D405 request rejected immediately: {reason}"
                         )
                         return None
+                fresh_handoff_state = self.handoff_state_count > previous_handoff
+                if fresh_handoff_state and self.latest_handoff_state != last_reported_handoff_state:
+                    last_reported_handoff_state = self.latest_handoff_state
+                    if self.latest_handoff_state == "BLOCKED":
+                        status_update = (
+                            "D405 handoff zone BLOCKED; waiting for 102 to retreat "
+                            f"(points={self.latest_handoff_candidate_points}, "
+                            f"cluster={self.latest_handoff_cluster_points})"
+                        )
+                    elif self.latest_handoff_state in ("VERIFYING_CLEAR", "WAIT_LIVE_CLOUD"):
+                        status_update = "D405 handoff zone looks clear; confirming with a fresh FFS cloud"
+                    elif self.latest_handoff_clear:
+                        status_update = "D405 handoff zone CLEAR; accepting stable grasp samples"
                 ready = (
                     self.pose_count >= previous_pose + required_samples
                     and self.width_count > previous_width
                     and self.length_count > previous_length
                     and self.height_count > previous_height
+                    and fresh_handoff_state
+                    and self.latest_handoff_clear
                 )
                 if ready:
                     samples = [pose for count, pose in self.pose_samples if count > previous_pose][-required_samples:]
@@ -918,8 +967,13 @@ class CosmeticBoxSingleArmNode(Node):
                     length_m = self.latest_length_m
                     height_m = self.latest_height_m
                     break
+            if status_update:
+                self._publish_status(status_update)
             time.sleep(0.02)
         else:
+            self.get_logger().warning(
+                "Timed out waiting for a fresh D405 target with a CLEAR handoff zone"
+            )
             return None
         if len(samples) != required_samples or width_m is None or length_m is None or height_m is None:
             return None
