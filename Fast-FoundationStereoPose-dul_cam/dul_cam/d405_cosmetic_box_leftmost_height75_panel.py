@@ -614,7 +614,7 @@ try:
                 pipeline.wait_for_frames()
             detection_frames = pipeline.wait_for_frames()
             detection_color = np.asanyarray(detection_frames.get_color_frame().get_data())
-            results = yolo_model(detection_color, conf=0.1, verbose=False)
+            results = yolo_model(detection_color, conf=0.6, verbose=False)#置信度参数设置目前0.6
             if results and results[0].obb is not None and len(results[0].obb) > 0:
                 detected_obbs = results[0].obb.xyxyxyxy.cpu().numpy()
                 roi_for_request = get_manual_roi()

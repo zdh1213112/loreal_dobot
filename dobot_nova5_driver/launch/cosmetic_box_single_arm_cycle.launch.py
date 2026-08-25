@@ -21,8 +21,8 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "motion_speed_scale_percent",
-                default_value="300",
-                description="Unified motion scale; 100 is the legacy effective-speed baseline and 300 is the current faster default",
+                default_value="400",
+                description="Unified motion scale; 100 is the legacy effective-speed baseline and 400 is the current faster default",
             ),
             ExecuteProcess(
                 cmd=[LaunchConfiguration("vision_python"), VISION_SCRIPT],

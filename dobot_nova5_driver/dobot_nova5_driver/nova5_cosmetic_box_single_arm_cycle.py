@@ -157,9 +157,9 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("command_tool_index", 1)
         # 以下运动参数保留原 GUI 的调节语义。控制器端不再把它们同时写入
         # SpeedFactor、VelJ/VelL 和单条指令，而是先在软件中合成为一个等效
-        # 指令百分比。100 表示修改前的理论有效速度基线；当前现场测试使用
-        # 200，并通过下方的阶段参数只提高抓取后的流程。
-        self.declare_parameter("motion_speed_scale_percent", 300)
+        # 指令百分比。100 表示修改前的理论有效速度基线；当前抓取上方和
+        # 抓取下降使用 400，抓取后的各阶段则使用下方独立有效百分比。
+        self.declare_parameter("motion_speed_scale_percent", 400)
         # 普通关节动作：初始位、抓取上方、中转位、放置位及回初始位。
         # 加速度独立可调，短行程往往由加速度而不是最高速度决定耗时。
         self.declare_parameter("joint_speed", 65)
@@ -233,7 +233,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("vision_samples", 2)
         self.declare_parameter("vision_timeout_s", 8.0)
         # 明确失败会由视觉结果话题立即返回；连续循环仅短暂停顿后重新检测。
-        self.declare_parameter("vision_retry_delay_s", 0.3)
+        self.declare_parameter("vision_retry_delay_s", 0.1)
         self.declare_parameter("vision_result_topic", "/d405_vision_result")
         self.declare_parameter("vision_position_stability_m", 0.010)
         self.declare_parameter("vision_angle_stability_deg", 10.0)
@@ -304,6 +304,9 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("dh_slave_id", 1)
         self.declare_parameter("dh_tool_identify", 1)
         self.declare_parameter("dh_timeout_s", 10.0)
+        # 放置时不再等待夹爪完全张到 95 mm；从实际夹持宽度额外张开
+        # 15 mm 并确认到位即可释放盒子。所有机械臂点位保持不变。
+        self.declare_parameter("place_release_clearance_m", 0.015)
         # close(wait=True) 已确认夹爪进入终态；只保留 50 ms 电气反馈稳定时间，
         # 后面仍执行两次独立 state/opening 检查，不取消空抓保护。
         self.declare_parameter("grasp_close_settle_s", 0.05)
@@ -1123,7 +1126,27 @@ class CosmeticBoxSingleArmNode(Node):
             )
         self._require_cycle_active("at final place pose")
         with self._timed_stage("gripper_open_place"):
-            self.gripper.open(wait=True)
+            max_opening = float(self.get_parameter("dh_max_opening_m").value)
+            release_clearance = max(
+                0.0,
+                float(self.get_parameter("place_release_clearance_m").value),
+            )
+            current_position = self.gripper.read_position()
+            current_opening = current_position * max_opening
+            release_opening = min(max_opening, current_opening + release_clearance)
+            release_position = release_opening / max_opening
+            actual_clearance = release_opening - current_opening
+            self._publish_status(
+                f"releasing box at fixed place pose: opening "
+                f"{current_opening*1000:.1f}->{release_opening*1000:.1f}mm "
+                f"(clearance +{actual_clearance*1000:.1f}mm)"
+            )
+            self.gripper.set_position(release_position, wait=False)
+            self.gripper.wait_until_stopped(
+                timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                target_position=release_position,
+                initial_position=current_position,
+            )
         self._publish_status("placed box; returning to startup")
 
     def _require_cycle_active(self, stage: str) -> None:
@@ -2206,6 +2229,7 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.grasp_z_offset = self._new_double(float(self.node.get_parameter("grasp_z_offset_m").value) * 1000.0, -20.0, 20.0, 1, 0.5)
         self.minimum_safe_tcp_z = self._new_double(float(self.node.get_parameter("minimum_safe_tcp_z_m").value) * 1000.0, -50.0, 100.0, 1, 0.5)
         self.grasp_lift = self._new_double(float(self.node.get_parameter("grasp_lift_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
+        self.place_release_clearance = self._new_double(float(self.node.get_parameter("place_release_clearance_m").value) * 1000.0, 1.0, 50.0, 1, 1.0)
         self.grasp_close_settle = self._new_double(float(self.node.get_parameter("grasp_close_settle_s").value), 0.0, 5.0, 2, 0.1)
         self.grasp_feedback_wait = self._new_double(float(self.node.get_parameter("grasp_feedback_wait_s").value), 0.1, 5.0, 2, 0.1)
         self.grasp_retry_limit = QSpinBox(); self.grasp_retry_limit.setRange(0, 20); self.grasp_retry_limit.setValue(int(self.node.get_parameter("single_cycle_grasp_retry_limit").value))
@@ -2234,6 +2258,7 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("抓取 Z 修正 mm（正值更浅）", self.grasp_z_offset)
         form.addRow("TCP 最低安全 Z mm", self.minimum_safe_tcp_z)
         form.addRow("抓取后抬升 mm", self.grasp_lift)
+        form.addRow("放置释放额外开度 mm", self.place_release_clearance)
         form.addRow("闭合后原地确认秒", self.grasp_close_settle)
         form.addRow("运动状态反馈等待秒", self.grasp_feedback_wait)
         form.addRow("单轮空抓重试次数", self.grasp_retry_limit)
@@ -2364,6 +2389,7 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("grasp_z_offset_m", value=self.grasp_z_offset.value() / 1000.0),
             Parameter("minimum_safe_tcp_z_m", value=self.minimum_safe_tcp_z.value() / 1000.0),
             Parameter("grasp_lift_m", value=self.grasp_lift.value() / 1000.0),
+            Parameter("place_release_clearance_m", value=self.place_release_clearance.value() / 1000.0),
             Parameter("grasp_close_settle_s", value=self.grasp_close_settle.value()),
             Parameter("grasp_feedback_wait_s", value=self.grasp_feedback_wait.value()),
             Parameter("single_cycle_grasp_retry_limit", value=self.grasp_retry_limit.value()),

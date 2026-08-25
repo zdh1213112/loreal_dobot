@@ -48,6 +48,8 @@ def test_speed_scale_increases_the_composed_command_once():
     assert compose_motion_percent((65, 65, 65), 110) == 30
     assert compose_motion_percent((70,), 120) == 84
     assert compose_motion_percent((100,), 200) == 100
+    assert compose_motion_percent((65, 65, 65), 400) == 100
+    assert compose_motion_percent((65, 60, 60), 400) == 94
 
 
 def test_normalized_joint_move_does_not_reapply_global_speed_factor():
