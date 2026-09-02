@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -68,6 +69,10 @@ IR_PROJECTOR_ON = True
 # 眼在手相机到达初始关节位后仍需丢弃少量运动尾帧；2 帧约为 67 ms，
 # 可以避免使用回程中的图像，同时比原来的 15 帧减少约 0.43 秒等待（30 FPS）。
 CAPTURE_FLUSH_FRAMES = 2
+# 稳定目标发布后，继续用 SAM2/FFS 后台跟踪一小段时间，供机械臂到达
+# 抓取上方后读取最新目标位姿。该跟踪不增加单独等待步骤。
+PREGRASP_POSE_TOPIC = "/target_pose_cam_pregrasp"
+PREGRASP_TRACKING_WINDOW_S = 5.0
 
 # Cosmetic-box geometry parameters
 MAX_PLANES = 3
@@ -121,6 +126,25 @@ INITIAL_POSITION_FRAME_COUNT = 2
 STABLE_TARGET_FRAME_COUNT = 2
 D405_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "d405_output")
 D405_OUTPUT_IMAGE_SUFFIX = ".png"
+# 机械臂节点发布最终 FAULT 或可恢复抓取故障状态时，保存一份当前 D405
+# 组合可视化画面。
+# 每个故障保存一张 <序号>.png 和一份同编号 <序号>.json；JSON 中包含故障
+# 状态、失败阶段、周期计时、ROI、目标尺寸、点云及当前显示状态等分析信息。
+# 设置为 False 时不创建 faults 文件夹，也不保存故障快照。
+SAVE_FAULT_SNAPSHOTS = True
+# 故障快照目录与 d405_output 同级，避免混入正常采集帧。
+FAULT_SNAPSHOT_OUTPUT_DIR = os.path.join(
+    os.path.dirname(D405_OUTPUT_DIR), "d405_fault_snapshots"
+)
+FAULT_SNAPSHOT_STATUS_TOPIC = "/cosmetic_pick_cycle_status"
+FAULT_SNAPSHOT_TIMING_TOPIC = "/cosmetic_pick_cycle_timing"
+FAULT_SNAPSHOT_IMAGE_SUFFIX = ".png"
+# 等待同一故障的 timing summary 和故障 status 都到达后再写盘，保证
+# JSON 尽量包含完整的 cycle_summary；不影响机械臂动作线程。
+FAULT_SNAPSHOT_METADATA_WAIT_S = 0.10
+# 可恢复抓取错误的状态消息和 cycle_summary 之间可能包含一次回初始位运动；
+# 用较宽的窗口把它们合并成同一份故障快照。
+FAULT_SNAPSHOT_EVENT_MERGE_WINDOW_S = 10.0
 MASK_ALPHA = 0.5
 MASK_COLOR_BGR = np.array([75, 70, 203], dtype=np.uint8)
 MASK_COLOR_RGB = np.array([203, 70, 75], dtype=np.float64) / 255.0
@@ -168,6 +192,9 @@ handoff_clear_pub = ros_node.create_publisher(Bool, "/d405_handoff_zone_clear", 
 handoff_state_pub = ros_node.create_publisher(String, "/d405_handoff_zone_state", 10)
 rgb_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local_rgb/image/compressed", 1)
 cloud_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local_cloud/image/compressed", 1)
+# 稳定目标后的后台预抓取跟踪位姿；与初始稳定采样话题分开，避免污染
+# 机器人端下一次视觉请求的 2 帧稳定性计数。
+pregrasp_pose_pub = ros_node.create_publisher(PoseStamped, PREGRASP_POSE_TOPIC, 10)
 
 trigger_requested = False
 quit_requested = False
@@ -184,6 +211,19 @@ vision_request_active = False
 
 next_initial_position_frame_index = 1
 initial_position_frame_output_ready = False
+next_fault_snapshot_index = 1
+fault_snapshot_output_ready = False
+fault_snapshot_lock = threading.Lock()
+latest_cycle_status = ""
+latest_cycle_timing = None
+latest_cycle_timing_received_at = 0.0
+pending_fault_snapshots = deque(maxlen=32)
+saved_fault_cycle_ids = set()
+latest_barcode = ""
+latest_barcode_received_at = 0.0
+latest_panel_image = None
+latest_panel_info = None
+latest_panel_captured_at_epoch = 0.0
 
 
 def initialize_initial_position_frame_output() -> None:
@@ -263,6 +303,398 @@ def save_d405_output_frames(frames, stage: str, expected_count: int) -> None:
         save_d405_output_frame(frame, stage)
 
 
+def initialize_fault_snapshot_output() -> None:
+    """Create the fault directory and continue its independent numbering."""
+
+    global next_fault_snapshot_index, fault_snapshot_output_ready
+    if not SAVE_FAULT_SNAPSHOTS:
+        return
+
+    try:
+        os.makedirs(FAULT_SNAPSHOT_OUTPUT_DIR, exist_ok=True)
+        largest_index = 0
+        image_name_pattern = re.compile(r"^(\d+)\.png$", re.IGNORECASE)
+        for entry in os.scandir(FAULT_SNAPSHOT_OUTPUT_DIR):
+            if not entry.is_file():
+                continue
+            match = image_name_pattern.fullmatch(entry.name)
+            if match is not None:
+                largest_index = max(largest_index, int(match.group(1)))
+        next_fault_snapshot_index = largest_index + 1
+        fault_snapshot_output_ready = True
+        logging.info(
+            f"[D405] Fault snapshot recording enabled: "
+            f"directory={FAULT_SNAPSHOT_OUTPUT_DIR}, next={next_fault_snapshot_index:04d}"
+        )
+    except OSError as exc:
+        fault_snapshot_output_ready = False
+        logging.error(
+            f"[D405] Cannot initialize fault snapshot directory "
+            f"{FAULT_SNAPSHOT_OUTPUT_DIR}: {exc}"
+        )
+
+
+def json_safe(value):
+    """Convert NumPy/scalar values into JSON-safe diagnostic values."""
+
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return json_safe(value.item())
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def timing_cycle_id(timing_payload) -> str:
+    if not isinstance(timing_payload, dict):
+        return ""
+    value = timing_payload.get("cycle_id", "")
+    return "" if value is None else str(value)
+
+
+def is_fault_status(status: str) -> bool:
+    """Recognize fatal and recoverable grasp-failure status messages."""
+
+    normalized = str(status or "").strip().lower()
+    return (
+        normalized.startswith("fault:")
+        or "recoverable grasp failure" in normalized
+        or "grasp retry" in normalized
+    )
+
+
+def is_fault_timing(timing_payload) -> bool:
+    """Recognize final faults and recoverable grasp retries in cycle timing."""
+
+    if not isinstance(timing_payload, dict):
+        return False
+    return (
+        timing_payload.get("event") == "cycle_summary"
+        and timing_payload.get("outcome") in ("fault", "grasp_retry")
+    )
+
+
+def queue_fault_snapshot(*, status: str = "", timing_payload=None, source: str = "") -> None:
+    """Queue one robot grasp failure for saving by the camera/render thread."""
+
+    if not SAVE_FAULT_SNAPSHOTS:
+        return
+    now = time.time()
+    timing_copy = json_safe(timing_payload) if isinstance(timing_payload, dict) else None
+    cycle_id = timing_cycle_id(timing_copy)
+    status_text = str(status or "")
+    with fault_snapshot_lock:
+        snapshot_image = None if latest_panel_image is None else latest_panel_image.copy()
+        snapshot_info = None if latest_panel_info is None else json_safe(latest_panel_info)
+        snapshot_captured_at = float(latest_panel_captured_at_epoch or 0.0)
+        # The timing summary and the status message describe the same failure.
+        # Merge them instead of saving two identical screenshots.
+        for event in pending_fault_snapshots:
+            event_cycle_id = timing_cycle_id(event.get("timing"))
+            same_cycle = bool(cycle_id and event_cycle_id == cycle_id)
+            recent_unidentified = (
+                not event_cycle_id
+                and now - float(event.get("queued_at", now))
+                <= FAULT_SNAPSHOT_EVENT_MERGE_WINDOW_S
+            )
+            if not (same_cycle or recent_unidentified):
+                continue
+            if status_text:
+                event["status"] = status_text
+            if timing_copy is not None:
+                event["timing"] = timing_copy
+            if snapshot_image is not None:
+                event["panel_image"] = snapshot_image
+                event["panel_info"] = snapshot_info
+                event["panel_captured_at_epoch"] = snapshot_captured_at
+            if source:
+                event.setdefault("sources", []).append(str(source))
+            event["ready_at"] = now + FAULT_SNAPSHOT_METADATA_WAIT_S
+            return
+
+        if cycle_id and cycle_id in saved_fault_cycle_ids:
+            return
+        pending_fault_snapshots.append(
+            {
+                "queued_at": now,
+                "ready_at": now + FAULT_SNAPSHOT_METADATA_WAIT_S,
+                "status": status_text,
+                "timing": timing_copy,
+                "sources": [str(source)] if source else [],
+                "panel_image": snapshot_image,
+                "panel_info": snapshot_info,
+                "panel_captured_at_epoch": snapshot_captured_at,
+            }
+        )
+
+
+def cycle_status_callback(msg: String) -> None:
+    """Receive robot status and arm snapshots for all grasp failures."""
+
+    global latest_cycle_status
+    status = str(msg.data)
+    with fault_snapshot_lock:
+        latest_cycle_status = status
+        timing_payload = (
+            None
+            if not isinstance(latest_cycle_timing, dict)
+            or not is_fault_timing(latest_cycle_timing)
+            else dict(latest_cycle_timing)
+        )
+    if is_fault_status(status):
+        queue_fault_snapshot(status=status, timing_payload=timing_payload, source="status")
+
+
+def cycle_timing_callback(msg: String) -> None:
+    """Keep the latest machine-readable cycle timing and detect fault summaries."""
+
+    global latest_cycle_timing, latest_cycle_timing_received_at
+    try:
+        payload = json.loads(msg.data)
+    except (TypeError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    received_at = time.time()
+    with fault_snapshot_lock:
+        latest_cycle_timing = json_safe(payload)
+        latest_cycle_timing_received_at = received_at
+        status = latest_cycle_status if is_fault_status(latest_cycle_status) else ""
+    if is_fault_timing(payload):
+        queue_fault_snapshot(status=status, timing_payload=payload, source="timing")
+
+
+def barcode_callback(msg: String) -> None:
+    """Keep the latest scanner value for the fault JSON diagnostics."""
+
+    global latest_barcode, latest_barcode_received_at
+    latest_barcode = str(msg.data)
+    latest_barcode_received_at = time.time()
+
+
+def build_fault_panel_info(
+    *,
+    display_status: str,
+    fps: float,
+    exposure_status: str,
+    active_roi,
+    cloud_source: str,
+    frame_stamp,
+    point_count: int,
+    tracked_target_count: int,
+) -> dict:
+    """Collect every value represented by the RGB/point-cloud panel."""
+
+    with fault_snapshot_lock:
+        robot_status = latest_cycle_status
+        robot_timing = None if latest_cycle_timing is None else json_safe(latest_cycle_timing)
+        robot_timing_received_at = latest_cycle_timing_received_at
+
+    frame_stamp_ns = int(frame_stamp.sec) * 1_000_000_000 + int(frame_stamp.nanosec)
+    target_corners = None if locked_target_corners is None else json_safe(locked_target_corners)
+    yolo_boxes = None if last_yolo_obbs is None else json_safe(last_yolo_obbs)
+    roi_value = None if active_roi is None else list(active_roi)
+    barcode_value = latest_barcode
+    return json_safe(
+        {
+            "captured_at_epoch": time.time(),
+            "panel": {
+                "status": display_status,
+                "fps": float(fps),
+                "exposure": exposure_status,
+                "roi": roi_value,
+                "cloud_source": cloud_source,
+                "point_count": int(point_count),
+                "sam_initialized": bool(sam_initialized),
+                "sam_tracked_target_points": int(tracked_target_count),
+                "handoff_state": str(last_handoff_state),
+                "handoff_clearance_passed": bool(handoff_clearance_passed),
+                "handoff_candidate_points": int(last_handoff_candidate_points),
+                "handoff_cluster_points": int(last_handoff_cluster_points),
+                "handoff_clear_streak": int(handoff_clear_streak),
+                "handoff_required_clear_frames": int(HANDOFF_CLEARANCE_CLEAR_FRAMES),
+                "height_m": last_height_m,
+                "length_m": None if smooth_extent is None else smooth_extent[0],
+                "side_planes": int(last_side_planes),
+                "side_points": int(last_side_points),
+                "height_evidence": str(last_height_evidence_mode),
+                "target_ready": bool(locked_target_ready),
+                "target_id": int(locked_target_id),
+                "target_camera_x_m": locked_target_camera_x,
+                "target_height_m": locked_target_height_m,
+                "target_corners_px": target_corners,
+                "yolo_boxes": yolo_boxes,
+                "smooth_grasp_m": smooth_grasp,
+                "smooth_box_center_m": smooth_box_center,
+                "smooth_extent_m": smooth_extent,
+                "smooth_rotation": smooth_rotation,
+            },
+            "camera": {
+                "serial": CAMERA_SERIAL,
+                "resolution": [IMG_WIDTH, IMG_HEIGHT],
+                "pcd_stride": int(PCD_STRIDE),
+                "frame_stamp_ns": frame_stamp_ns,
+            },
+            "scanner": {
+                "latest_barcode": barcode_value,
+                "latest_barcode_received_at_epoch": latest_barcode_received_at or None,
+            },
+            "robot": {
+                "latest_status": robot_status,
+                "latest_timing": robot_timing,
+                "latest_timing_received_at_epoch": robot_timing_received_at or None,
+            },
+            "configuration": {
+                "save_fault_snapshots": bool(SAVE_FAULT_SNAPSHOTS),
+                "fault_snapshot_output_dir": FAULT_SNAPSHOT_OUTPUT_DIR,
+                "grasp_depth_ratio": float(GRASP_DEPTH_RATIO),
+                "pregrasp_tracking_window_s": float(PREGRASP_TRACKING_WINDOW_S),
+                "handoff_clearance_enabled": bool(HANDOFF_CLEARANCE_ENABLED),
+            },
+        }
+    )
+
+
+def add_fault_footer(panel_image: np.ndarray, image_index: int, event: dict, panel_info: dict) -> np.ndarray:
+    """Append a readable fault banner without hiding the original panel."""
+
+    footer_height = 94
+    output = np.full(
+        (panel_image.shape[0] + footer_height, panel_image.shape[1], 3),
+        18,
+        dtype=np.uint8,
+    )
+    output[: panel_image.shape[0]] = panel_image
+    cv2.rectangle(
+        output,
+        (0, panel_image.shape[0]),
+        (panel_image.shape[1] - 1, output.shape[0] - 1),
+        (0, 0, 150),
+        -1,
+    )
+    timing_payload = event.get("timing") if isinstance(event.get("timing"), dict) else {}
+    stages = timing_payload.get("stages") if isinstance(timing_payload.get("stages"), list) else []
+    last_stage = stages[-1].get("stage", "unknown") if stages and isinstance(stages[-1], dict) else "unknown"
+    status = str(event.get("status") or panel_info.get("robot", {}).get("latest_status") or "FAULT")
+    cycle_id = str(timing_payload.get("cycle_id", "unknown"))
+    outcome = str(timing_payload.get("outcome", "fault"))
+    lines = (
+        f"FAULT SNAPSHOT {image_index:04d} | {status}",
+        f"cycle={cycle_id} outcome={outcome} failed_stage={last_stage}",
+        f"saved={datetime.now().astimezone().isoformat(timespec='milliseconds')}",
+    )
+    for line_index, line in enumerate(lines):
+        max_chars = max(20, output.shape[1] // 10)
+        if len(line) > max_chars:
+            line = line[: max_chars - 3] + "..."
+        cv2.putText(
+            output,
+            line,
+            (14, panel_image.shape[0] + 25 + line_index * 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58 if line_index == 0 else 0.50,
+            (255, 255, 255),
+            2 if line_index == 0 else 1,
+            cv2.LINE_AA,
+        )
+    return output
+
+
+def save_pending_fault_snapshots(panel_image: np.ndarray, panel_info: dict) -> None:
+    """Write queued fault panels once the current render frame is complete."""
+
+    global next_fault_snapshot_index
+    if not SAVE_FAULT_SNAPSHOTS:
+        return
+    now = time.time()
+    with fault_snapshot_lock:
+        ready_events = []
+        remaining_events = deque(maxlen=pending_fault_snapshots.maxlen)
+        for event in pending_fault_snapshots:
+            if float(event.get("ready_at", 0.0)) <= now:
+                ready_events.append(dict(event))
+            else:
+                remaining_events.append(event)
+        pending_fault_snapshots.clear()
+        pending_fault_snapshots.extend(remaining_events)
+
+    if not ready_events:
+        return
+    if not fault_snapshot_output_ready:
+        initialize_fault_snapshot_output()
+    if not fault_snapshot_output_ready:
+        return
+
+    for event in ready_events:
+        timing_payload = event.get("timing")
+        cycle_id = timing_cycle_id(timing_payload)
+        if cycle_id:
+            with fault_snapshot_lock:
+                if cycle_id in saved_fault_cycle_ids:
+                    continue
+                saved_fault_cycle_ids.add(cycle_id)
+
+        image_index = next_fault_snapshot_index
+        while True:
+            image_name = f"{image_index:04d}{FAULT_SNAPSHOT_IMAGE_SUFFIX}"
+            json_name = f"{image_index:04d}.json"
+            image_path = os.path.join(FAULT_SNAPSHOT_OUTPUT_DIR, image_name)
+            json_path = os.path.join(FAULT_SNAPSHOT_OUTPUT_DIR, json_name)
+            if not os.path.exists(image_path) and not os.path.exists(json_path):
+                break
+            image_index += 1
+
+        event_panel_image = event.get("panel_image")
+        if not isinstance(event_panel_image, np.ndarray):
+            event_panel_image = panel_image
+        event_panel_info = event.get("panel_info")
+        if not isinstance(event_panel_info, dict):
+            event_panel_info = panel_info
+        fault_image = add_fault_footer(event_panel_image, image_index, event, event_panel_info)
+        event_metadata = {
+            key: value
+            for key, value in event.items()
+            if key not in ("panel_image", "panel_info")
+        }
+        try:
+            if not cv2.imwrite(image_path, np.ascontiguousarray(fault_image)):
+                logging.error(f"[D405] Failed to save fault snapshot image: {image_path}")
+                continue
+            record = {
+                "event": "fault_snapshot",
+                "snapshot_index": image_index,
+                "saved_at_local": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "saved_at_epoch": time.time(),
+                "image_file": image_name,
+                "fault": json_safe(event_metadata),
+                "panel_info": json_safe(event_panel_info),
+                "panel_frame_age_s": round(
+                    max(
+                        0.0,
+                        time.time() - float(event.get("panel_captured_at_epoch", 0.0)),
+                    ),
+                    4,
+                )
+                if float(event.get("panel_captured_at_epoch", 0.0)) > 0.0
+                else None,
+            }
+            with open(json_path, "w", encoding="utf-8") as info_file:
+                json.dump(record, info_file, ensure_ascii=False, indent=2, allow_nan=False)
+        except (OSError, cv2.error, TypeError, ValueError) as exc:
+            logging.error(f"[D405] Failed to save fault snapshot {image_index:04d}: {exc}")
+            continue
+
+        next_fault_snapshot_index = image_index + 1
+        logging.info(
+            f"[D405] Saved fault snapshot: image={image_path}, info={json_path}"
+        )
+
+
 def publish_vision_result(success: bool, reason: str) -> None:
     """每个触发请求最多发布一次最终结果。"""
     global vision_request_active
@@ -306,6 +738,28 @@ def publish_handoff_clearance(
         separators=(",", ":"),
     )
     handoff_state_pub.publish(state_message)
+
+
+def publish_pregrasp_pose(frame_stamp) -> None:
+    """Publish the current-frame grasp pose during the pre-grasp window."""
+
+    if current_frame_grasp is None or current_frame_rotation is None:
+        return
+    pose_msg = PoseStamped()
+    # The robot may receive this message after FFS/SAM2 processing and after
+    # it has already moved.  Preserve the stamp of the frame that produced
+    # current_frame_grasp so the driver can use the matching historical TCP pose.
+    pose_msg.header.stamp = frame_stamp
+    pose_msg.header.frame_id = "camera_d405_link"
+    pose_msg.pose.position.x, pose_msg.pose.position.y, pose_msg.pose.position.z = map(
+        float, current_frame_grasp
+    )
+    quat = SciPyRot.from_matrix(current_frame_rotation).as_quat()
+    pose_msg.pose.orientation.x = float(quat[0])
+    pose_msg.pose.orientation.y = float(quat[1])
+    pose_msg.pose.orientation.z = float(quat[2])
+    pose_msg.pose.orientation.w = float(quat[3])
+    pregrasp_pose_pub.publish(pose_msg)
 
 
 def trigger_callback(msg: Bool) -> None:
@@ -485,6 +939,9 @@ def panel_event_callback(msg: String) -> None:
 
 ros_node.create_subscription(Bool, "/trigger_d405_vision", trigger_callback, 10)
 ros_node.create_subscription(String, "/vision_panel/d405_local_rgb/event", panel_event_callback, 10)
+ros_node.create_subscription(String, FAULT_SNAPSHOT_STATUS_TOPIC, cycle_status_callback, 10)
+ros_node.create_subscription(String, FAULT_SNAPSHOT_TIMING_TOPIC, cycle_timing_callback, 20)
+ros_node.create_subscription(String, "/detected_barcodes", barcode_callback, 20)
 
 
 def publish_jpeg(pub, image: np.ndarray, frame_id: str) -> None:
@@ -708,6 +1165,7 @@ u_flat, v_flat = u_grid.reshape(-1).astype(np.float32), v_grid.reshape(-1).astyp
 
 warm_up_ffs_model(ffs_model)
 initialize_initial_position_frame_output()
+initialize_fault_snapshot_output()
 
 
 def estimate_candidate_camera_x(corners, points_3d, u_rgb, v_rgb, in_bounds):
@@ -751,6 +1209,10 @@ smooth_grasp = None
 smooth_box_center = None
 smooth_extent = None
 smooth_rotation = None
+# 当前相机帧的未滤波抓取点/姿态。后台预抓取跟踪必须使用它：相机随
+# 机械臂移动时，smooth_grasp 的滤波滞后会被误认为目标发生了位移。
+current_frame_grasp = None
+current_frame_rotation = None
 height_history = deque(maxlen=20)
 published_frames = 0
 last_height_m = None
@@ -766,6 +1228,7 @@ handoff_force_live_cloud = False
 last_handoff_state = "IDLE"
 last_handoff_candidate_points = 0
 last_handoff_cluster_points = 0
+pregrasp_tracking_deadline = 0.0
 
 if ENABLE_LOCAL_WINDOWS:
     local_window_width = IMG_WIDTH + LOCAL_DIVIDER_WIDTH_PX + int(
@@ -802,6 +1265,7 @@ try:
             last_handoff_state = "WAIT_TARGET"
             last_handoff_candidate_points = 0
             last_handoff_cluster_points = 0
+            pregrasp_tracking_deadline = 0.0
             stable_target_frames.clear()
             publish_handoff_clearance("WAIT_TARGET", clear=False)
             logging.info(
@@ -872,6 +1336,10 @@ try:
             trigger_requested = False
 
         frames = pipeline.wait_for_frames()
+        # Stamp immediately after frame acquisition.  D405 and the robot
+        # driver run on this host, so this is the common wall-clock domain used
+        # by the robot feedback history for eye-in-hand compensation.
+        frame_stamp = ros_node.get_clock().now().to_msg()
         color_bgr = np.asanyarray(frames.get_color_frame().get_data())
 
         if reset_requested:
@@ -882,6 +1350,7 @@ try:
             sam_initialized = False
             current_mask = None
             smooth_grasp = smooth_box_center = smooth_extent = smooth_rotation = None
+            current_frame_grasp = current_frame_rotation = None
             height_history.clear()
             published_frames = 0
             tracking_frames_without_height = 0
@@ -1272,6 +1741,12 @@ try:
                                         box_center += normal * (-0.5 * height_delta)
                                         grasp_point += normal * (-GRASP_DEPTH_RATIO * height_delta)
                                         raw_extent[2] = stable_height
+                                        # Keep the current-frame estimate separate
+                                        # from the display/stability filter.  The
+                                        # filtered estimate is intentionally smooth
+                                        # but lags during eye-in-hand motion.
+                                        current_frame_grasp = grasp_point.copy()
+                                        current_frame_rotation = axes.copy()
                                         if smooth_grasp is None:
                                             smooth_grasp = grasp_point.copy()
                                             smooth_box_center = box_center.copy()
@@ -1371,7 +1846,7 @@ try:
                                                 # 保存原始 RGB，不保存带标注的显示图。
                                                 stable_target_frames.append(color_bgr.copy())
                                             pose_msg = PoseStamped()
-                                            pose_msg.header.stamp = ros_node.get_clock().now().to_msg()
+                                            pose_msg.header.stamp = frame_stamp
                                             pose_msg.header.frame_id = "camera_d405_link"
                                             pose_msg.pose.position.x, pose_msg.pose.position.y, pose_msg.pose.position.z = map(float, smooth_grasp)
                                             quat = SciPyRot.from_matrix(smooth_rotation).as_quat()
@@ -1405,6 +1880,10 @@ try:
                                                 # 允许机械臂完成本轮抓取、回到初始位后，
                                                 # 下一次视觉触发重新保存初始位两张图。
                                                 initial_position_frames_saved_for_startup = False
+                                                pregrasp_tracking_deadline = (
+                                                    time.monotonic() + PREGRASP_TRACKING_WINDOW_S
+                                                )
+                                                publish_pregrasp_pose(frame_stamp)
                                                 publish_vision_result(True, "stable_target_published")
                                                 logging.info(
                                                     f"[D405] Published stable target: length={smooth_extent[0]*1000:.1f}mm, "
@@ -1412,6 +1891,14 @@ try:
                                                     f"depth={GRASP_DEPTH_RATIO*100:.0f}%, evidence={last_height_evidence_mode}; "
                                                     "SAM2 display tracking remains active."
                                                 )
+                                        elif (
+                                            handoff_clearance_passed
+                                            and locked_target_ready
+                                            and time.monotonic() < pregrasp_tracking_deadline
+                                        ):
+                                            # 稳定目标已经交给机器人后，继续发布后台跟踪结果；
+                                            # 机器人只在到达安全抓取上方时消费最新的一份。
+                                            publish_pregrasp_pose(frame_stamp)
                                 else:
                                     now = time.time()
                                     if now - last_height_warning_time >= 1.0:
@@ -1567,19 +2054,39 @@ try:
             cv2.putText(display, f"height={last_height_m*1000:.1f}mm{length_text} side_planes={last_side_planes} side_pts={last_side_points} depth=75%", (10, IMG_HEIGHT - 31), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1)
             cv2.putText(display, f"height evidence: {last_height_evidence_mode}", (10, IMG_HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 255, 255), 1)
 
-        publish_jpeg(rgb_pub, display, "d405_local_rgb")
+        cloud_source = "LOCKED SNAPSHOT" if using_locked_cloud else "LIVE FFS"
         cloud_image = render_cloud(
             points_3d,
             colors,
             smooth_box_center,
             smooth_extent,
             smooth_rotation,
-            source_label="LOCKED SNAPSHOT" if using_locked_cloud else "LIVE FFS",
+            source_label=cloud_source,
             tracked_target_points=tracked_target_points,
         )
+        combined_local_view = compose_local_window(display, cloud_image)
+        active_frame_info = build_fault_panel_info(
+            display_status=status,
+            fps=fps,
+            exposure_status=exposure_status,
+            active_roi=active_roi,
+            cloud_source=cloud_source,
+            frame_stamp=frame_stamp,
+            point_count=len(points_3d),
+            tracked_target_count=0 if tracked_target_points is None else len(tracked_target_points),
+        )
+        with fault_snapshot_lock:
+            latest_panel_image = combined_local_view.copy()
+            latest_panel_info = active_frame_info
+            latest_panel_captured_at_epoch = float(active_frame_info["captured_at_epoch"])
+        # The fault listener only queues an event.  Saving here keeps all image
+        # operations in the camera/render thread and uses the completed RGB +
+        # point-cloud frame rather than a partially rendered callback state.
+        save_pending_fault_snapshots(combined_local_view, active_frame_info)
+
+        publish_jpeg(rgb_pub, display, "d405_local_rgb")
         publish_jpeg(cloud_pub, cloud_image, "d405_local_cloud")
         if ENABLE_LOCAL_WINDOWS:
-            combined_local_view = compose_local_window(display, cloud_image)
             cv2.imshow(LOCAL_WINDOW_NAME, combined_local_view)
             local_key = cv2.waitKey(1) & 0xFF
             if local_key != 0xFF:

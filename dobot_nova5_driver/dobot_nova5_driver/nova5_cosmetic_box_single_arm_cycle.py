@@ -78,6 +78,12 @@ def message_to_transform(msg: PoseStamped) -> np.ndarray:
     return transform
 
 
+def message_stamp_seconds(msg: PoseStamped) -> float:
+    """Convert a ROS message timestamp to the host wall-clock seconds domain."""
+
+    return float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+
+
 def transform_to_pose(transform: np.ndarray) -> TcpPose:
     rx, ry, rz = SciPyRot.from_matrix(transform[:3, :3]).as_euler("xyz", degrees=True)
     x, y, z = transform[:3, 3]
@@ -221,6 +227,31 @@ class CosmeticBoxSingleArmNode(Node):
 
         self.declare_parameter("camera_frame_id", "camera_d405_link")
         self.declare_parameter("vision_pose_topic", "/target_pose_cam_fine")
+        # D405 稳定目标后发布的后台预抓取位姿话题。机器人到达抓取上方
+        # 后只消费这条话题的最新一帧，不增加单独视觉等待。
+        self.declare_parameter("pregrasp_pose_topic", "/target_pose_cam_pregrasp")
+        # 最新预抓取位姿允许的最大年龄，单位：秒。超过该时间视为视觉
+        # 跟踪失效，机械臂不下压，直接回初始位重新检测。
+        self.declare_parameter("pregrasp_pose_max_age_s", 0.50)
+        # 目标相对初始稳定位姿的允许位置变化，单位：米。小于等于该值时
+        # 直接使用最新位姿下压；超过该值时先在安全上方修正。
+        self.declare_parameter("pregrasp_position_tolerance_m", 0.007)
+        # 目标相对初始稳定位姿的允许姿态变化，单位：度。小于等于该值时
+        # 直接下压；超过该值时先在安全上方修正。
+        self.declare_parameter("pregrasp_angle_tolerance_deg", 8.0)
+        # 单次安全上方位置修正的最大位移，单位：米。超过该值说明目标
+        # 变化过大或跟踪可能跳变，不追踪移动，直接回初始位重新检测。
+        self.declare_parameter("pregrasp_max_correction_m", 0.050)
+        # 单次安全上方位置修正允许的最大姿态变化，单位：度。超过该值
+        # 不执行修正和下压，直接回初始位重新检测。
+        self.declare_parameter("pregrasp_max_correction_angle_deg", 30.0)
+        # 目标与当前 TCP 安全上方位置之间必须保留的最小垂直间隙，单位：米。
+        # 间隙不足时禁止下压，直接回初始位重新检测。
+        self.declare_parameter("pregrasp_min_hover_clearance_m", 0.030)
+        # D405 帧时间戳与机械臂反馈历史的最大允许边缘误差，单位：秒。
+        # 正常情况下使用时间戳之间的历史反馈插值；只有帧落在历史首尾
+        # 外侧时才使用这个容差，超出则丢弃该帧，避免再次套用错误的当前位姿。
+        self.declare_parameter("vision_pose_max_time_skew_s", 0.30)
         # 夹爪张开命令：点云测得的盒子短边 + 预留开爪间隙，单位为米。
         self.declare_parameter("vision_width_topic", "/gripper_target_width")
         # 盒子长边尺寸：由 SAM2 分割点云的顶面三维包围盒计算，单位为米。
@@ -343,6 +374,9 @@ class CosmeticBoxSingleArmNode(Node):
         self.data_lock = threading.Lock()
         self.pose_samples: deque[tuple[int, TcpPose]] = deque(maxlen=20)
         self.pose_count = 0
+        self.pregrasp_pose_count = 0
+        self.latest_pregrasp_pose: Optional[TcpPose] = None
+        self.latest_pregrasp_pose_received_at = 0.0
         self.width_count = 0
         self.length_count = 0
         self.height_count = 0
@@ -380,6 +414,12 @@ class CosmeticBoxSingleArmNode(Node):
         self.last_accepted_height_m: Optional[float] = None
 
         self.create_subscription(PoseStamped, str(self.get_parameter("vision_pose_topic").value), self._vision_pose_callback, 10)
+        self.create_subscription(
+            PoseStamped,
+            str(self.get_parameter("pregrasp_pose_topic").value),
+            self._pregrasp_pose_callback,
+            10,
+        )
         self.create_subscription(Float32, str(self.get_parameter("vision_width_topic").value), self._vision_width_callback, 10)
         self.create_subscription(Float32, str(self.get_parameter("vision_length_topic").value), self._vision_length_callback, 10)
         self.create_subscription(Float32, str(self.get_parameter("vision_height_topic").value), self._vision_height_callback, 10)
@@ -574,26 +614,83 @@ class CosmeticBoxSingleArmNode(Node):
         gripper.initialize(timeout_s=float(self.get_parameter("dh_timeout_s").value), init_open=True)
         return gripper
 
-    def _vision_pose_callback(self, msg: PoseStamped) -> None:
+    def _transform_vision_pose(self, msg: PoseStamped, source: str) -> Optional[TcpPose]:
         if msg.header.frame_id.strip() != str(self.get_parameter("camera_frame_id").value):
-            self.get_logger().error(f"Ignoring vision frame {msg.header.frame_id!r}")
-            return
-        try:
-            flange_pose = self.controller.current_tcp_pose(
-                user_index=int(self.get_parameter("user_index").value),
-                tool_index=int(self.get_parameter("flange_tool_index").value),
+            self.get_logger().error(
+                f"Ignoring {source} vision frame {msg.header.frame_id!r}"
             )
+            return None
+        try:
+            frame_time_s = message_stamp_seconds(msg)
+            user_index = int(self.get_parameter("user_index").value)
+            flange_tool_index = int(self.get_parameter("flange_tool_index").value)
+            max_time_skew_s = float(self.get_parameter("vision_pose_max_time_skew_s").value)
+            try:
+                flange_pose = self.controller.current_tcp_pose_at(
+                    frame_time_s,
+                    user_index=user_index,
+                    tool_index=flange_tool_index,
+                    max_skew_s=max_time_skew_s,
+                )
+            except RuntimeError as exact_history_error:
+                # The feedback packet may report a different active tool than
+                # the flange tool used by hand-eye calibration.  Reconstruct
+                # the historical flange transform from the historical active
+                # TCP motion and the current, exact GetPose(user, flange_tool)
+                # result.  This preserves the old tool-coordinate behaviour
+                # without losing the timestamp correction.
+                historical_active, historical_user, historical_tool = (
+                    self.controller.current_feedback_tcp_pose_at(
+                        frame_time_s,
+                        max_skew_s=max_time_skew_s,
+                    )
+                )
+                current_active, current_user, current_tool = self.controller.current_feedback_tcp_pose()
+                if (historical_user, historical_tool) != (current_user, current_tool):
+                    raise RuntimeError(
+                        "active User/Tool changed between the camera frame and now; "
+                        "historical transform is ambiguous"
+                    ) from exact_history_error
+                if historical_user != user_index:
+                    raise RuntimeError(
+                        f"historical active User={historical_user} does not match "
+                        f"configured User={user_index}; refusing an ambiguous transform"
+                    ) from exact_history_error
+                current_flange = self.controller.current_tcp_pose(
+                    user_index=user_index,
+                    tool_index=flange_tool_index,
+                )
+                base_to_flange_now = pose_to_transform(current_flange)
+                base_to_active_now = pose_to_transform(current_active)
+                flange_to_active = np.linalg.inv(base_to_flange_now) @ base_to_active_now
+                base_to_flange_at = pose_to_transform(historical_active) @ np.linalg.inv(flange_to_active)
+                flange_pose = transform_to_pose(base_to_flange_at)
             offset_angles = self._six_values_from_rotation("grasp_offset_rxyz_deg")
             target_to_grasp = np.eye(4, dtype=np.float64)
             target_to_grasp[:3, :3] = SciPyRot.from_euler("xyz", offset_angles, degrees=True).as_matrix()
             base_to_target = pose_to_transform(flange_pose) @ self.handeye_flange_to_cam @ message_to_transform(msg)
             command_pose = transform_to_pose(base_to_target @ target_to_grasp)
         except Exception as exc:
-            self.get_logger().error(f"Vision pose transform failed: {exc}")
+            self.get_logger().error(f"{source.capitalize()} vision pose transform failed: {exc}")
+            return None
+        return command_pose
+
+    def _vision_pose_callback(self, msg: PoseStamped) -> None:
+        command_pose = self._transform_vision_pose(msg, "stable")
+        if command_pose is None:
             return
         with self.data_lock:
             self.pose_count += 1
             self.pose_samples.append((self.pose_count, command_pose))
+
+    def _pregrasp_pose_callback(self, msg: PoseStamped) -> None:
+        command_pose = self._transform_vision_pose(msg, "pregrasp")
+        if command_pose is None:
+            return
+        with self.data_lock:
+            self.pregrasp_pose_count += 1
+            self.latest_pregrasp_pose = command_pose
+            self.latest_pregrasp_pose_received_at = time.monotonic()
 
     def _six_values_from_rotation(self, name: str) -> list[float]:
         values = [float(value) for value in self.get_parameter(name).value]
@@ -1029,6 +1126,196 @@ class CosmeticBoxSingleArmNode(Node):
         self.last_accepted_height_m = height_m
         return averaged, width_m, height_m, length_m
 
+    @staticmethod
+    def _pose_delta(first: TcpPose, second: TcpPose) -> tuple[float, float]:
+        position_delta = math.sqrt(
+            (second.x - first.x) ** 2
+            + (second.y - first.y) ** 2
+            + (second.z - first.z) ** 2
+        )
+        angle_delta = max(
+            abs((second_angle - first_angle + 180.0) % 360.0 - 180.0)
+            for first_angle, second_angle in (
+                (first.rx, second.rx),
+                (first.ry, second.ry),
+                (first.rz, second.rz),
+            )
+        )
+        return position_delta, angle_delta
+
+    def _latest_fresh_pregrasp_pose(self, previous_count: int) -> tuple[TcpPose, int, float]:
+        with self.data_lock:
+            current_count = self.pregrasp_pose_count
+            pose = self.latest_pregrasp_pose
+            received_at = self.latest_pregrasp_pose_received_at
+        age_s = time.monotonic() - received_at if received_at > 0.0 else float("inf")
+        max_age_s = max(0.05, float(self.get_parameter("pregrasp_pose_max_age_s").value))
+        if pose is None or current_count <= previous_count or age_s > max_age_s:
+            raise RecoverableGraspError(
+                stage="pregrasp revalidation",
+                message=(
+                    "no fresh D405 pregrasp pose after reaching the safe hover "
+                    f"(new_samples={max(0, current_count - previous_count)}, age={age_s:.3f}s); "
+                    "will return to startup before descent"
+                ),
+                needs_vertical_retreat=False,
+            )
+        return pose, current_count, age_s
+
+    def _apply_grasp_z_safety(
+        self,
+        pose: TcpPose,
+        z_offset_m: float,
+        minimum_safe_z: float,
+        source: str,
+    ) -> TcpPose:
+        corrected_z = pose.z + z_offset_m
+        if corrected_z < minimum_safe_z:
+            self.get_logger().warning(
+                f"Clamping {source} grasp TCP Z from {corrected_z:.4f}m "
+                f"to safe floor {minimum_safe_z:.4f}m"
+            )
+            corrected_z = minimum_safe_z
+        return TcpPose(pose.x, pose.y, corrected_z, pose.rx, pose.ry, pose.rz)
+
+    def _revalidate_target_at_hover(
+        self,
+        target: TcpPose,
+        motion: dict[str, int],
+        z_offset_m: float,
+        minimum_safe_z: float,
+        previous_count: int,
+    ) -> TcpPose:
+        """Use the latest background-tracked target before any downward motion."""
+
+        live_pose, live_count, age_s = self._latest_fresh_pregrasp_pose(previous_count)
+        live_target = self._apply_grasp_z_safety(
+            live_pose,
+            z_offset_m,
+            minimum_safe_z,
+            "live pregrasp",
+        )
+        position_delta, angle_delta = self._pose_delta(target, live_target)
+        position_tolerance = max(
+            0.001,
+            float(self.get_parameter("pregrasp_position_tolerance_m").value),
+        )
+        angle_tolerance = max(
+            0.5,
+            float(self.get_parameter("pregrasp_angle_tolerance_deg").value),
+        )
+        max_correction = max(
+            position_tolerance,
+            float(self.get_parameter("pregrasp_max_correction_m").value),
+        )
+        max_correction_angle = max(
+            angle_tolerance,
+            float(self.get_parameter("pregrasp_max_correction_angle_deg").value),
+        )
+        current = self._current_command_pose()
+        min_hover_clearance = max(
+            0.005,
+            float(self.get_parameter("pregrasp_min_hover_clearance_m").value),
+        )
+        if current.z - live_target.z < min_hover_clearance:
+            raise RecoverableGraspError(
+                stage="pregrasp revalidation",
+                message=(
+                    f"safe hover clearance is only {(current.z - live_target.z)*1000:.1f}mm, "
+                    f"below required {min_hover_clearance*1000:.1f}mm; "
+                    "will return to startup before descent"
+                ),
+                needs_vertical_retreat=False,
+            )
+        self.get_logger().info(
+            f"Pregrasp target check: age={age_s*1000:.0f}ms, "
+            f"position_delta={position_delta*1000:.1f}mm, angle_delta={angle_delta:.1f}deg"
+        )
+
+        if position_delta > max_correction or angle_delta > max_correction_angle:
+            raise RecoverableGraspError(
+                stage="pregrasp revalidation",
+                message=(
+                    f"D405 target change is outside safe hover-correction limits: "
+                    f"position_delta={position_delta*1000:.1f}mm/{max_correction*1000:.1f}mm, "
+                    f"angle_delta={angle_delta:.1f}deg/{max_correction_angle:.1f}deg; "
+                    "will return to startup before descent"
+                ),
+                needs_vertical_retreat=False,
+            )
+
+        if position_delta <= position_tolerance and angle_delta <= angle_tolerance:
+            # Even without a correction move, use the latest pose for the final
+            # descent so a small drift is not discarded.
+            return live_target
+
+        self._publish_status(
+            f"pregrasp target shifted {position_delta*1000:.1f}mm/{angle_delta:.1f}deg; "
+            "correcting at safe hover"
+        )
+        correction_hover = TcpPose(
+            live_target.x,
+            live_target.y,
+            current.z,
+            live_target.rx,
+            live_target.ry,
+            live_target.rz,
+        )
+        try:
+            self.controller.inverse_kinematics(
+                correction_hover,
+                user_index=int(self.get_parameter("user_index").value),
+                tool_index=int(self.get_parameter("command_tool_index").value),
+                joint_near=self.controller.current_joint(),
+            )
+            self._require_cycle_active("before pregrasp hover correction")
+            self.controller.move_joint_tcp(
+                correction_hover,
+                speed=motion["joint_speed"],
+                accel=motion["joint_pose_acc"],
+                user_index=int(self.get_parameter("user_index").value),
+                tool_index=int(self.get_parameter("command_tool_index").value),
+            )
+            self._require_cycle_active("after pregrasp hover correction")
+        except RecoverableGraspError:
+            raise
+        except Exception as exc:
+            raise RecoverableGraspError(
+                stage="pregrasp hover correction",
+                message=f"could not safely correct the shifted target: {exc}",
+                needs_vertical_retreat=False,
+            ) from exc
+
+        # A second update must arrive during the correction. If the object keeps
+        # moving or tracking is lost, do not chase it downward; recover to startup.
+        corrected_pose, _, corrected_age_s = self._latest_fresh_pregrasp_pose(live_count)
+        corrected_target = self._apply_grasp_z_safety(
+            corrected_pose,
+            z_offset_m,
+            minimum_safe_z,
+            "corrected live pregrasp",
+        )
+        post_correction_delta, post_correction_angle = self._pose_delta(
+            live_target,
+            corrected_target,
+        )
+        if (
+            post_correction_delta > position_tolerance
+            or post_correction_angle > angle_tolerance
+        ):
+            raise RecoverableGraspError(
+                stage="pregrasp revalidation",
+                message=(
+                    f"D405 target was not stable after hover correction: "
+                    f"delta={post_correction_delta*1000:.1f}mm/{post_correction_angle:.1f}deg, "
+                    f"age={corrected_age_s*1000:.0f}ms; "
+                    "will return to startup before descent"
+                ),
+                needs_vertical_retreat=False,
+            )
+        self._publish_status("pregrasp target confirmed after hover correction")
+        return corrected_target
+
     def _execute_one_cycle(self, target: TcpPose, width_m: float, height_m: float, length_m: float) -> None:
         motion = self._motion_profile()
         z_offset_m = float(self.get_parameter("grasp_z_offset_m").value)
@@ -1038,14 +1325,13 @@ class CosmeticBoxSingleArmNode(Node):
                 f"grasp_z_offset_m={z_offset_m:.4f} exceeds limit {z_offset_limit_m:.4f}m"
             )
         vision_target_z = target.z
-        corrected_z = target.z + z_offset_m
         minimum_safe_z = float(self.get_parameter("minimum_safe_tcp_z_m").value)
-        if corrected_z < minimum_safe_z:
-            self.get_logger().warning(
-                f"Clamping grasp TCP Z from {corrected_z:.4f}m to safe floor {minimum_safe_z:.4f}m"
-            )
-            corrected_z = minimum_safe_z
-        target = TcpPose(target.x, target.y, corrected_z, target.rx, target.ry, target.rz)
+        target = self._apply_grasp_z_safety(
+            target,
+            z_offset_m,
+            minimum_safe_z,
+            "vision",
+        )
         self._publish_status(
             f"grasp plan: vision_Z={vision_target_z*1000:.1f}mm, "
             f"Z_correction={z_offset_m*1000:+.1f}mm, command_Z={target.z*1000:.1f}mm, "
@@ -1071,6 +1357,8 @@ class CosmeticBoxSingleArmNode(Node):
             current = self._current_command_pose()
             planar = TcpPose(target.x, target.y, current.z, target.rx, target.ry, target.rz)
         self._publish_status("moving above selected box")
+        with self.data_lock:
+            pregrasp_reference_count = self.pregrasp_pose_count
         with self._timed_stage("move_above"):
             self.controller.move_joint_tcp(
                 planar,
@@ -1087,6 +1375,14 @@ class CosmeticBoxSingleArmNode(Node):
                 initial_position=pre_shape_initial,
             )
         self._require_cycle_active("after confirming gripper pre-shape")
+        with self._timed_stage("pregrasp_revalidation"):
+            target = self._revalidate_target_at_hover(
+                target,
+                motion,
+                z_offset_m,
+                minimum_safe_z,
+                pregrasp_reference_count,
+            )
         self._publish_status("descending TCP tip to 75% box height")
         with self._timed_stage("grasp_descend"):
             self.controller.move_linear_tcp(

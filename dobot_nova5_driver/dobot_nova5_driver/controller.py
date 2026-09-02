@@ -1,6 +1,7 @@
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -8,6 +9,10 @@ from .TCP_IP_Python_V4.dobot_api import DobotApiDashboard, DobotApiFeedBack
 
 
 MM_PER_METER = 1000.0
+# The D405 can finish processing a frame after the robot has already moved
+# several centimetres.  Keep enough feedback samples to reconstruct the
+# flange pose at the frame-capture time instead of using the later pose.
+FEEDBACK_POSE_HISTORY_SIZE = 1000
 ROBOT_MODE_TEXT = {
     1: "INIT",
     2: "BRAKE_OPEN",
@@ -51,6 +56,12 @@ class DobotNova5Controller:
         self.dashboard: DobotApiDashboard | None = None
         self.feedback: DobotApiFeedBack | None = None
         self.feedback_data = None
+        self._feedback_lock = threading.Lock()
+        # Entries are (wall-clock receive time, ToolVectorActual, User, Tool).
+        # D405 PoseStamped timestamps use the same host wall-clock domain.
+        self._feedback_pose_history: deque[tuple[float, TcpPose, int, int]] = deque(
+            maxlen=FEEDBACK_POSE_HISTORY_SIZE
+        )
         self._feedback_thread: threading.Thread | None = None
         self._stop_feedback = threading.Event()
         self._command_lock = threading.Lock()
@@ -139,6 +150,163 @@ class DobotNova5Controller:
             return self.read_pose(user_index=user_index, tool_index=tool_index)
         tcp = self.feedback_data["ToolVectorActual"][0]
         return self._tcp_pose_from_values(tcp)
+
+    @staticmethod
+    def _interpolate_angle_deg(first: float, second: float, ratio: float) -> float:
+        """Interpolate an angle through the shortest path across +/-180 degrees."""
+
+        delta = (float(second) - float(first) + 180.0) % 360.0 - 180.0
+        return float(first) + float(ratio) * delta
+
+    @classmethod
+    def _interpolate_tcp_pose(
+        cls,
+        first: TcpPose,
+        second: TcpPose,
+        ratio: float,
+    ) -> TcpPose:
+        ratio = max(0.0, min(1.0, float(ratio)))
+        return TcpPose(
+            x=first.x + ratio * (second.x - first.x),
+            y=first.y + ratio * (second.y - first.y),
+            z=first.z + ratio * (second.z - first.z),
+            rx=cls._interpolate_angle_deg(first.rx, second.rx, ratio),
+            ry=cls._interpolate_angle_deg(first.ry, second.ry, ratio),
+            rz=cls._interpolate_angle_deg(first.rz, second.rz, ratio),
+        )
+
+    @classmethod
+    def _pose_from_history(
+        cls,
+        history: list[tuple[float, TcpPose, int, int]],
+        timestamp_s: float,
+        max_skew_s: float,
+    ) -> TcpPose:
+        """Interpolate one timestamp from an already selected feedback stream."""
+
+        if not history:
+            raise RuntimeError("No timestamped robot feedback pose is available")
+        first = history[0]
+        last = history[-1]
+        max_skew_s = max(0.0, float(max_skew_s))
+        if timestamp_s < first[0]:
+            if first[0] - timestamp_s > max_skew_s:
+                raise RuntimeError(
+                    f"Frame timestamp is {first[0] - timestamp_s:.3f}s older than "
+                    f"the available robot pose history (limit {max_skew_s:.3f}s)"
+                )
+            return first[1]
+        if timestamp_s > last[0]:
+            if timestamp_s - last[0] > max_skew_s:
+                raise RuntimeError(
+                    f"Frame timestamp is {timestamp_s - last[0]:.3f}s newer than "
+                    f"the available robot pose history (limit {max_skew_s:.3f}s)"
+                )
+            return last[1]
+
+        previous = first
+        for following in history[1:]:
+            if following[0] >= timestamp_s:
+                interval_s = following[0] - previous[0]
+                if interval_s <= 1e-9:
+                    return following[1]
+                ratio = (timestamp_s - previous[0]) / interval_s
+                return cls._interpolate_tcp_pose(previous[1], following[1], ratio)
+            previous = following
+        return last[1]
+
+    def current_feedback_tcp_pose_at(
+        self,
+        timestamp_s: float,
+        max_skew_s: float = 0.30,
+    ) -> tuple[TcpPose, int, int]:
+        """Return the active feedback pose and its User/Tool at a past time."""
+
+        try:
+            timestamp_s = float(timestamp_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid pose timestamp: {timestamp_s!r}") from exc
+        if not (timestamp_s > 0.0):
+            raise ValueError(f"Invalid pose timestamp: {timestamp_s!r}")
+
+        with self._feedback_lock:
+            history = list(self._feedback_pose_history)
+            feedback = self.feedback_data
+        if not history:
+            raise RuntimeError(
+                f"No timestamped robot feedback pose is available for frame time "
+                f"{timestamp_s:.6f}s"
+            )
+
+        # ToolVectorActual is expressed in the currently active User/Tool.
+        # Keep one continuous coordinate stream when a command changes the
+        # active pair; mixing two pairs would make interpolation invalid.
+        active_user = int(feedback["User"][0]) if feedback is not None else history[-1][2]
+        active_tool = int(feedback["Tool"][0]) if feedback is not None else history[-1][3]
+        active_history = [
+            sample
+            for sample in history
+            if sample[2] == active_user and sample[3] == active_tool
+        ]
+        if not active_history:
+            raise RuntimeError(
+                f"No timestamped robot feedback pose is available for active "
+                f"user={active_user} tool={active_tool} at frame time {timestamp_s:.6f}s"
+            )
+        return (
+            self._pose_from_history(active_history, timestamp_s, max_skew_s),
+            active_user,
+            active_tool,
+        )
+
+    def current_feedback_tcp_pose(self) -> tuple[TcpPose, int, int]:
+        """Return the latest feedback pose together with its User/Tool pair."""
+
+        with self._feedback_lock:
+            if not self._feedback_pose_history:
+                raise RuntimeError("Timestamped robot feedback pose is not ready")
+            _, pose, user_index, tool_index = self._feedback_pose_history[-1]
+        return pose, user_index, tool_index
+
+    def current_tcp_pose_at(
+        self,
+        timestamp_s: float,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+        max_skew_s: float = 0.30,
+    ) -> TcpPose:
+        """Return a requested User/Tool TCP pose at a past host-clock time."""
+
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        try:
+            timestamp_s = float(timestamp_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid pose timestamp: {timestamp_s!r}") from exc
+        if not (timestamp_s > 0.0):
+            return self.current_tcp_pose(user_index=user_index, tool_index=tool_index)
+
+        with self._feedback_lock:
+            history = list(self._feedback_pose_history)
+        if user_index is not None and tool_index is not None:
+            requested_user = int(user_index)
+            requested_tool = int(tool_index)
+            history = [
+                sample
+                for sample in history
+                if sample[2] == requested_user and sample[3] == requested_tool
+            ]
+        if not history:
+            requested = (
+                f" user={int(user_index)} tool={int(tool_index)}"
+                if user_index is not None and tool_index is not None
+                else ""
+            )
+            raise RuntimeError(
+                f"No timestamped robot feedback pose is available for frame time "
+                f"{timestamp_s:.6f}s ({requested.strip() or 'active tool'})"
+            )
+        return self._pose_from_history(history, timestamp_s, max_skew_s)
 
     def current_joint(self) -> list[float]:
         if self.feedback_data is None:
@@ -528,7 +696,22 @@ class DobotNova5Controller:
             try:
                 packet = self.feedback.feedBackData()
                 if packet is not None:
-                    self.feedback_data = packet
+                    received_at = time.time()
+                    with self._feedback_lock:
+                        self.feedback_data = packet
+                        try:
+                            actual_pose = self._tcp_pose_from_values(packet["ToolVectorActual"][0])
+                            actual_user = int(packet["User"][0])
+                            actual_tool = int(packet["Tool"][0])
+                        except Exception:
+                            # Keep the packet usable for the existing status
+                            # paths even if a firmware variant omits one of
+                            # the optional pose fields.
+                            pass
+                        else:
+                            self._feedback_pose_history.append(
+                                (received_at, actual_pose, actual_user, actual_tool)
+                            )
             except Exception:
                 time.sleep(0.05)
 
