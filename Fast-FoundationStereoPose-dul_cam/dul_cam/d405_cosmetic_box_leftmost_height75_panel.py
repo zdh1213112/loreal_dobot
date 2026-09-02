@@ -16,6 +16,7 @@ Differences from ``d405_local_ransac_coarse_lock_wait_lock_manual_roi_exposure_p
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -54,7 +55,7 @@ CAMERA_SERIAL = "409122274792"
 FFS_MODEL_DIR = os.path.join(FFS_DIR, "weights/23-36-37/model_best_bp2_serialize.pth")
 SAM2_CHECKPOINT = os.path.join(SAM2_DIR, "checkpoints/sam2.1/sam2.1_hiera_small.pt")
 SAM2_CFG = "sam2.1/sam2.1_hiera_s.yaml"
-YOLO_MODEL_PATH = "/home/zdh/yolo_one/yolo_train_web_github/outputs/train/obb_demo-6/weights/best.pt"
+YOLO_MODEL_PATH = "/home/zdh/yolo_one/yolo_train_web_github/outputs/train/obb_demo-8/weights/best.pt"
 VALID_ITERS = 6
 MAX_DISP = 192
 ZNEAR = 0.16
@@ -111,6 +112,15 @@ AUTO_EXPOSURE = True
 MANUAL_EXPOSURE = 11000.0
 MANUAL_GAIN = 8.0
 AUTO_WHITE_BALANCE = True
+# 机械臂回到初始位后的第一次视觉触发，立即保存两张抓取前 RGB 帧；
+# 本次触发最终得到稳定抓取目标时，再保存两张稳定目标 RGB 帧。
+# 同一初始位的连续无目标重试不会重复保存；完成一次抓取后下次回到初始位会重新保存。
+# 设置为 False 时不保存，也不会自动创建 d405_output 文件夹。
+SAVE_INITIAL_POSITION_FRAMES = True
+INITIAL_POSITION_FRAME_COUNT = 2
+STABLE_TARGET_FRAME_COUNT = 2
+D405_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "d405_output")
+D405_OUTPUT_IMAGE_SUFFIX = ".png"
 MASK_ALPHA = 0.5
 MASK_COLOR_BGR = np.array([75, 70, 203], dtype=np.uint8)
 MASK_COLOR_RGB = np.array([203, 70, 75], dtype=np.float64) / 255.0
@@ -163,6 +173,8 @@ trigger_requested = False
 quit_requested = False
 reset_requested = False
 clear_target_display_requested = False
+initial_position_frames_saved_for_startup = False
+stable_target_frames = deque(maxlen=STABLE_TARGET_FRAME_COUNT)
 manual_roi = None
 roi_drawing = False
 roi_start = (-1, -1)
@@ -170,12 +182,96 @@ roi_end = (-1, -1)
 roi_lock = threading.Lock()
 vision_request_active = False
 
+next_initial_position_frame_index = 1
+initial_position_frame_output_ready = False
+
+
+def initialize_initial_position_frame_output() -> None:
+    """Create the output directory and continue numbering existing images."""
+
+    global next_initial_position_frame_index, initial_position_frame_output_ready
+    if not SAVE_INITIAL_POSITION_FRAMES:
+        return
+
+    try:
+        os.makedirs(D405_OUTPUT_DIR, exist_ok=True)
+        largest_index = 0
+        image_name_pattern = re.compile(r"^(\d+)\.(?:png|jpg|jpeg|bmp)$", re.IGNORECASE)
+        for entry in os.scandir(D405_OUTPUT_DIR):
+            if not entry.is_file():
+                continue
+            match = image_name_pattern.fullmatch(entry.name)
+            if match is not None:
+                largest_index = max(largest_index, int(match.group(1)))
+        next_initial_position_frame_index = largest_index + 1
+        initial_position_frame_output_ready = True
+        logging.info(
+            f"[D405] Initial-position frame recording enabled: "
+            f"directory={D405_OUTPUT_DIR}, next={next_initial_position_frame_index:04d}"
+        )
+    except OSError as exc:
+        initial_position_frame_output_ready = False
+        logging.error(
+            f"[D405] Cannot initialize initial-position frame directory "
+            f"{D405_OUTPUT_DIR}: {exc}"
+        )
+
+
+def save_d405_output_frame(color_bgr: np.ndarray, stage: str) -> None:
+    """Save one raw RGB-camera frame and continue the global sequence."""
+
+    global next_initial_position_frame_index
+    if not SAVE_INITIAL_POSITION_FRAMES:
+        return
+    if not initial_position_frame_output_ready:
+        initialize_initial_position_frame_output()
+    if not initial_position_frame_output_ready:
+        return
+
+    image_index = next_initial_position_frame_index
+    while True:
+        filename = f"{image_index:04d}{D405_OUTPUT_IMAGE_SUFFIX}"
+        output_path = os.path.join(D405_OUTPUT_DIR, filename)
+        if not os.path.exists(output_path):
+            break
+        image_index += 1
+
+    try:
+        if not cv2.imwrite(output_path, np.ascontiguousarray(color_bgr)):
+            logging.error(f"[D405] Failed to save {stage} frame: {output_path}")
+            return
+    except (OSError, cv2.error) as exc:
+        logging.error(f"[D405] Failed to save {stage} frame {output_path}: {exc}")
+        return
+
+    next_initial_position_frame_index = image_index + 1
+    logging.info(f"[D405] Saved {stage} frame: {output_path}")
+
+
+def save_d405_output_frames(frames, stage: str, expected_count: int) -> None:
+    """Save exactly the requested number of frames from one capture stage."""
+
+    if not SAVE_INITIAL_POSITION_FRAMES:
+        return
+    frames_to_save = list(frames)[-expected_count:]
+    if len(frames_to_save) != expected_count:
+        logging.warning(
+            f"[D405] {stage} capture contained {len(frames_to_save)} frame(s); "
+            f"expected {expected_count}."
+        )
+    for frame in frames_to_save:
+        save_d405_output_frame(frame, stage)
+
 
 def publish_vision_result(success: bool, reason: str) -> None:
     """每个触发请求最多发布一次最终结果。"""
     global vision_request_active
     if not vision_request_active:
         return
+    if not success:
+        # 同一初始位的失败重试不清除已保存的初始位图片；下一次触发
+        # 仍属于同一轮等待，直到稳定目标成功或机械臂重新回到初始位。
+        stable_target_frames.clear()
     message = String()
     message.data = f"{'success' if success else 'failure'}:{reason}"
     vision_result_pub.publish(message)
@@ -611,6 +707,7 @@ u_grid, v_grid = np.meshgrid(np.arange(0, IMG_WIDTH, PCD_STRIDE), np.arange(0, I
 u_flat, v_flat = u_grid.reshape(-1).astype(np.float32), v_grid.reshape(-1).astype(np.float32)
 
 warm_up_ffs_model(ffs_model)
+initialize_initial_position_frame_output()
 
 
 def estimate_candidate_camera_x(corners, points_3d, u_rgb, v_rgb, in_bounds):
@@ -705,6 +802,7 @@ try:
             last_handoff_state = "WAIT_TARGET"
             last_handoff_candidate_points = 0
             last_handoff_cluster_points = 0
+            stable_target_frames.clear()
             publish_handoff_clearance("WAIT_TARGET", clear=False)
             logging.info(
                 f"[D405] Flushing {CAPTURE_FLUSH_FRAMES} frames before YOLO capture..."
@@ -713,6 +811,22 @@ try:
                 pipeline.wait_for_frames()
             detection_frames = pipeline.wait_for_frames()
             detection_color = np.asanyarray(detection_frames.get_color_frame().get_data())
+            if SAVE_INITIAL_POSITION_FRAMES and not initial_position_frames_saved_for_startup:
+                # 记录并立即保存初始位置的两张原始 RGB 帧。RealSense
+                # 可能复用底层缓冲区，必须复制后再交给写盘函数。
+                initial_position_frames = [detection_color.copy()]
+                initial_followup_frames = pipeline.wait_for_frames()
+                initial_position_frames.append(
+                    np.asanyarray(
+                        initial_followup_frames.get_color_frame().get_data()
+                    ).copy()
+                )
+                save_d405_output_frames(
+                    initial_position_frames,
+                    "initial-position",
+                    INITIAL_POSITION_FRAME_COUNT,
+                )
+                initial_position_frames_saved_for_startup = True
             results = yolo_model(detection_color, conf=0.6, verbose=False)#置信度参数设置目前0.6
             if results and results[0].obb is not None and len(results[0].obb) > 0:
                 detected_obbs = results[0].obb.xyxyxyxy.cpu().numpy()
@@ -1252,6 +1366,10 @@ try:
                                         # corridor have been independently clear twice. Afterwards SAM2
                                         # remains alive only for the operator display.
                                         if handoff_clearance_passed and not locked_target_ready:
+                                            if SAVE_INITIAL_POSITION_FRAMES:
+                                                # 这两帧正是形成稳定目标的连续有效帧，
+                                                # 保存原始 RGB，不保存带标注的显示图。
+                                                stable_target_frames.append(color_bgr.copy())
                                             pose_msg = PoseStamped()
                                             pose_msg.header.stamp = ros_node.get_clock().now().to_msg()
                                             pose_msg.header.frame_id = "camera_d405_link"
@@ -1278,6 +1396,15 @@ try:
                                             if published_frames >= PUBLISH_FRAMES_BEFORE_RESET:
                                                 locked_target_ready = True
                                                 locked_target_height_m = last_height_m
+                                                save_d405_output_frames(
+                                                    stable_target_frames,
+                                                    "stable-target",
+                                                    STABLE_TARGET_FRAME_COUNT,
+                                                )
+                                                stable_target_frames.clear()
+                                                # 允许机械臂完成本轮抓取、回到初始位后，
+                                                # 下一次视觉触发重新保存初始位两张图。
+                                                initial_position_frames_saved_for_startup = False
                                                 publish_vision_result(True, "stable_target_published")
                                                 logging.info(
                                                     f"[D405] Published stable target: length={smooth_extent[0]*1000:.1f}mm, "

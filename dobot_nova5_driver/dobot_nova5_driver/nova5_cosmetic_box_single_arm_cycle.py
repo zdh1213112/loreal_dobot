@@ -148,8 +148,9 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("auto_enable", True)
         self.declare_parameter("auto_start", False)
         self.declare_parameter("startup_joint", [14.0, 14.0, -115.0, 25.0, 83.0, 10.0])
-        self.declare_parameter("transfer_joint", [14.0, -29.0, -99.0, 39.0, 88.0, 10.0])
-        self.declare_parameter("place_pose", [0.531, 0.328, 0.085, -179.0, -1.39, -85.18])
+        self.declare_parameter("transfer_joint", [14.0, -29.0, -99.0, 39.0, 88.0, 15.0])
+        # self.declare_parameter("place_pose", [0.531, 0.328, 0.085, -179.0, -1.39, -85.18]) #放置物料小车的位置
+        self.declare_parameter("place_pose", [0.531, 0.328, 0.215, -179.0, -1.39, -85.18]) #放置物料小车的位置
         # 扫码成功后的组合 PTP 目标位置，按 User 0 表达，单位为米。
         self.declare_parameter("scan_exit_user_xyz", [0.557, 0.200, 0.320])
         self.declare_parameter("user_index", 0)
@@ -1145,7 +1146,15 @@ class CosmeticBoxSingleArmNode(Node):
             self._publish_status("adaptive barcode distance reached; checking captured barcode")
         with self._timed_stage("barcode_acquisition"):
             barcode = self._rotate_until_stable_barcode()
-        self._publish_status(f"stable barcode acquired: {barcode}")
+        if barcode:
+            self._publish_status(f"stable barcode acquired: {barcode}")
+        else:
+            self.get_logger().warning(
+                "No stable barcode after checking all faces; continuing with placement"
+            )
+            self._publish_status(
+                "no barcode acquired; continuing with scanner retreat and placement"
+            )
 
         # 此时盒子侧面仍贴近扫码器，不能直接执行带 Ry/Rz 的关节 PTP，
         # 否则中间关节轨迹的旋转包络可能扫到扫码器。先沿 User X- 原路
@@ -1909,7 +1918,17 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                         self._require_cycle_active("after waiting-phase barcode face alignment")
                     return value
-            raise RuntimeError(f"Barcode not stable after checking {max_faces} faces; object retained at transfer point")
+            # A barcode is useful metadata, but it is not required to finish
+            # the physical pick/place cycle.  The caller will still perform
+            # the scanner safety retreat, post-scan motion, placement, and
+            # return to startup.  Keep this as a normal return so an unread
+            # label does not leave a gripped object stranded at the transfer
+            # point.
+            self.get_logger().warning(
+                f"Barcode not stable after checking {max_faces} faces; "
+                "continuing without barcode"
+            )
+            return ""
         finally:
             with self.barcode_lock:
                 self.barcode_window_active = False
