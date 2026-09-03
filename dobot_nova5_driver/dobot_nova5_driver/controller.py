@@ -13,6 +13,14 @@ MM_PER_METER = 1000.0
 # several centimetres.  Keep enough feedback samples to reconstruct the
 # flange pose at the frame-capture time instead of using the later pose.
 FEEDBACK_POSE_HISTORY_SIZE = 1000
+# Firmware variants expose ``TimeStamp`` either as a Unix clock or as a
+# controller-relative clock.  Unix values can be used directly; relative
+# clocks are mapped to host time from their 8 ms packet cadence and the
+# minimum observed receive offset.
+FEEDBACK_CONTROLLER_TIMESTAMP_MAX_CLOCK_ERROR_S = 5.0
+FEEDBACK_EXPECTED_PERIOD_S = 0.008
+FEEDBACK_RELATIVE_CLOCK_VOTES = 3
+FEEDBACK_RELATIVE_CLOCK_OFFSET_SAMPLES = 128
 ROBOT_MODE_TEXT = {
     1: "INIT",
     2: "BRAKE_OPEN",
@@ -57,10 +65,28 @@ class DobotNova5Controller:
         self.feedback: DobotApiFeedBack | None = None
         self.feedback_data = None
         self._feedback_lock = threading.Lock()
-        # Entries are (wall-clock receive time, ToolVectorActual, User, Tool).
-        # D405 PoseStamped timestamps use the same host wall-clock domain.
+        # Entries are (controller/host wall-clock sample time, ToolVectorActual,
+        # User, Tool).  When firmware exposes a sane Unix-ms TimeStamp, the
+        # controller sample time is used; otherwise packet receive time is kept
+        # as a safe compatibility fallback.
         self._feedback_pose_history: deque[tuple[float, TcpPose, int, int]] = deque(
             maxlen=FEEDBACK_POSE_HISTORY_SIZE
+        )
+        # TCP linear speed samples share the exact same timestamp stream as
+        # the pose history.  The vision node uses them to prefer frames taken
+        # after the left arm has settled at the hover pose, without adding a
+        # blocking settle delay.
+        self._feedback_tcp_speed_history: deque[tuple[float, float, int, int]] = deque(
+            maxlen=FEEDBACK_POSE_HISTORY_SIZE
+        )
+        self._latest_feedback_received_at = 0.0
+        self._feedback_timestamp_source = "host_receive"
+        self._latest_feedback_raw_timestamp: Optional[int] = None
+        self._feedback_previous_raw_timestamp: Optional[int] = None
+        self._feedback_relative_clock_scale: Optional[float] = None
+        self._feedback_relative_clock_votes: deque[float] = deque(maxlen=8)
+        self._feedback_relative_clock_offsets: deque[float] = deque(
+            maxlen=FEEDBACK_RELATIVE_CLOCK_OFFSET_SAMPLES
         )
         self._feedback_thread: threading.Thread | None = None
         self._stop_feedback = threading.Event()
@@ -96,6 +122,22 @@ class DobotNova5Controller:
 
             if go_to_start:
                 self.move_joint(self.startup_joint, speed=self.startup_speed)
+
+    def connect_feedback_only(self) -> None:
+        """Open only the streaming feedback socket, without Dashboard access.
+
+        This is used when another process owns the robot's Dashboard/control
+        connection.  The feedback stream is read-only and does not send any
+        command to the robot.
+        """
+
+        self.dashboard = None
+        self.feedback = DobotApiFeedBack(self.robot_ip, self.feedback_port)
+        self._stop_feedback.clear()
+        self._feedback_thread = threading.Thread(target=self._feedback_loop, daemon=True)
+        self._feedback_thread.start()
+        self._wait_for_feedback()
+        self._wait_for_feedback_pose()
 
     def disconnect(self) -> None:
         self._stop_feedback.set()
@@ -267,6 +309,208 @@ class DobotNova5Controller:
                 raise RuntimeError("Timestamped robot feedback pose is not ready")
             _, pose, user_index, tool_index = self._feedback_pose_history[-1]
         return pose, user_index, tool_index
+
+    def current_feedback_tcp_pose_with_timestamp(
+        self,
+    ) -> tuple[TcpPose, int, int, float]:
+        """Return the latest feedback TCP pose and its host receive timestamp."""
+
+        with self._feedback_lock:
+            if not self._feedback_pose_history:
+                raise RuntimeError("Timestamped robot feedback pose is not ready")
+            _, pose, user_index, tool_index = self._feedback_pose_history[-1]
+            received_at = self._latest_feedback_received_at
+            if received_at <= 0.0:
+                received_at = self._feedback_pose_history[-1][0]
+        return pose, user_index, tool_index, float(received_at)
+
+    @property
+    def feedback_timestamp_source(self) -> str:
+        """Return the clock used for temporal pose interpolation."""
+
+        with self._feedback_lock:
+            return str(self._feedback_timestamp_source)
+
+    @property
+    def feedback_raw_timestamp(self) -> Optional[int]:
+        """Return the latest unmodified 30004 TimeStamp for diagnostics."""
+
+        with self._feedback_lock:
+            return self._latest_feedback_raw_timestamp
+
+    @staticmethod
+    def _feedback_raw_timestamp(packet) -> Optional[int]:
+        try:
+            raw_timestamp = int(packet["TimeStamp"][0])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        return raw_timestamp if raw_timestamp > 0 else None
+
+    @staticmethod
+    def _feedback_packet_timestamp_s(packet, received_at: float) -> tuple[float, str]:
+        """Extract the controller Unix-ms timestamp, with a safe fallback."""
+
+        raw_timestamp = DobotNova5Controller._feedback_raw_timestamp(packet)
+        if raw_timestamp is None:
+            return float(received_at), "host_receive"
+
+        # The Dobot 30004 protocol specifies Unix milliseconds.  Try the
+        # neighbouring Unix units defensively so a firmware variant cannot
+        # silently make us use a timestamp from the wrong magnitude.
+        candidates = []
+        if raw_timestamp >= 10**17:
+            candidates.append((raw_timestamp * 1e-9, "controller_unix_ns"))
+        if raw_timestamp >= 10**14:
+            candidates.append((raw_timestamp * 1e-6, "controller_unix_us"))
+        if raw_timestamp >= 10**11:
+            candidates.append((raw_timestamp * 1e-3, "controller_unix_ms"))
+        for controller_timestamp, source in candidates:
+            if abs(controller_timestamp - float(received_at)) <= FEEDBACK_CONTROLLER_TIMESTAMP_MAX_CLOCK_ERROR_S:
+                return float(controller_timestamp), source
+        return float(received_at), "host_receive"
+
+    def _feedback_sample_timestamp_s(self, packet, received_at: float) -> tuple[float, str]:
+        """Map a Unix or controller-relative feedback stamp to host time."""
+
+        direct_time, direct_source = self._feedback_packet_timestamp_s(packet, received_at)
+        raw_timestamp = self._feedback_raw_timestamp(packet)
+        if raw_timestamp is None or direct_source != "host_receive":
+            self._feedback_previous_raw_timestamp = raw_timestamp
+            return direct_time, direct_source
+
+        previous_raw = self._feedback_previous_raw_timestamp
+        self._feedback_previous_raw_timestamp = raw_timestamp
+        if previous_raw is not None and raw_timestamp <= previous_raw:
+            # Robot reboot, wrapping clock or repeated value: learn the relative
+            # clock again rather than mixing two epochs in one pose history.
+            if raw_timestamp < previous_raw:
+                self._feedback_relative_clock_scale = None
+                self._feedback_relative_clock_votes.clear()
+                self._feedback_relative_clock_offsets.clear()
+            return float(received_at), "host_receive"
+
+        if previous_raw is not None:
+            raw_delta = raw_timestamp - previous_raw
+            candidates = []
+            for scale, source in (
+                (1e-3, "controller_relative_ms_mapped"),
+                (1e-6, "controller_relative_us_mapped"),
+                (1e-9, "controller_relative_ns_mapped"),
+            ):
+                delta_s = raw_delta * scale
+                if not 0.002 <= delta_s <= 0.50:
+                    continue
+                periods = max(1, int(round(delta_s / FEEDBACK_EXPECTED_PERIOD_S)))
+                cadence_error_s = abs(delta_s - periods * FEEDBACK_EXPECTED_PERIOD_S)
+                candidates.append((cadence_error_s, scale, source))
+            if candidates:
+                cadence_error_s, scale, _ = min(candidates, key=lambda item: item[0])
+                if cadence_error_s <= 0.003:
+                    self._feedback_relative_clock_votes.append(scale)
+                    matching_votes = sum(
+                        1
+                        for vote in self._feedback_relative_clock_votes
+                        if vote == scale
+                    )
+                    if matching_votes >= FEEDBACK_RELATIVE_CLOCK_VOTES:
+                        self._feedback_relative_clock_scale = scale
+
+        scale = self._feedback_relative_clock_scale
+        if scale is None:
+            return float(received_at), "host_receive"
+
+        controller_relative_s = raw_timestamp * scale
+        self._feedback_relative_clock_offsets.append(
+            float(received_at) - controller_relative_s
+        )
+        # Receive time equals sample time plus transport/scheduling delay.  The
+        # smallest recent offset is the least-delayed packet and gives a stable
+        # no-extra-wait mapping into the D405 host-clock domain.
+        mapped_time = controller_relative_s + min(self._feedback_relative_clock_offsets)
+        age_s = float(received_at) - mapped_time
+        if age_s < -0.010 or age_s > 0.50:
+            return float(received_at), "host_receive"
+        unit_source = {
+            1e-3: "controller_relative_ms_mapped",
+            1e-6: "controller_relative_us_mapped",
+            1e-9: "controller_relative_ns_mapped",
+        }[scale]
+        return float(mapped_time), unit_source
+
+    @staticmethod
+    def _scalar_from_history(
+        history: list[tuple[float, float, int, int]],
+        timestamp_s: float,
+        max_skew_s: float,
+    ) -> float:
+        """Interpolate a scalar from timestamped feedback samples."""
+
+        if not history:
+            raise RuntimeError("No timestamped feedback scalar is available")
+        first = history[0]
+        last = history[-1]
+        max_skew_s = max(0.0, float(max_skew_s))
+        if timestamp_s < first[0]:
+            if first[0] - timestamp_s > max_skew_s:
+                raise RuntimeError(
+                    f"Frame timestamp is {first[0] - timestamp_s:.3f}s older than "
+                    "the available feedback speed history"
+                )
+            return float(first[1])
+        if timestamp_s > last[0]:
+            if timestamp_s - last[0] > max_skew_s:
+                raise RuntimeError(
+                    f"Frame timestamp is {timestamp_s - last[0]:.3f}s newer than "
+                    "the available feedback speed history"
+                )
+            return float(last[1])
+
+        previous = first
+        for following in history[1:]:
+            if following[0] >= timestamp_s:
+                interval_s = following[0] - previous[0]
+                if interval_s <= 1e-9:
+                    return float(following[1])
+                ratio = (timestamp_s - previous[0]) / interval_s
+                return float(previous[1] + ratio * (following[1] - previous[1]))
+            previous = following
+        return float(last[1])
+
+    def current_tcp_linear_speed_at(
+        self,
+        timestamp_s: float,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+        max_skew_s: float = 0.30,
+    ) -> float:
+        """Return TCP linear speed in m/s at a historical frame timestamp."""
+
+        try:
+            timestamp_s = float(timestamp_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid speed timestamp: {timestamp_s!r}") from exc
+        if not timestamp_s > 0.0:
+            raise ValueError(f"Invalid speed timestamp: {timestamp_s!r}")
+        with self._feedback_lock:
+            history = list(self._feedback_tcp_speed_history)
+            feedback = self.feedback_data
+        if user_index is None and tool_index is None and feedback is not None:
+            active_user = int(feedback["User"][0])
+            active_tool = int(feedback["Tool"][0])
+            history = [
+                sample
+                for sample in history
+                if sample[2] == active_user and sample[3] == active_tool
+            ]
+        if user_index is not None and tool_index is not None:
+            requested_user = int(user_index)
+            requested_tool = int(tool_index)
+            history = [
+                sample
+                for sample in history
+                if sample[2] == requested_user and sample[3] == requested_tool
+            ]
+        return self._scalar_from_history(history, timestamp_s, max_skew_s)
 
     def current_tcp_pose_at(
         self,
@@ -697,8 +941,15 @@ class DobotNova5Controller:
                 packet = self.feedback.feedBackData()
                 if packet is not None:
                     received_at = time.time()
+                    sample_time, timestamp_source = self._feedback_sample_timestamp_s(
+                        packet,
+                        received_at,
+                    )
+                    raw_timestamp = self._feedback_raw_timestamp(packet)
                     with self._feedback_lock:
                         self.feedback_data = packet
+                        self._latest_feedback_received_at = received_at
+                        self._latest_feedback_raw_timestamp = raw_timestamp
                         try:
                             actual_pose = self._tcp_pose_from_values(packet["ToolVectorActual"][0])
                             actual_user = int(packet["User"][0])
@@ -709,14 +960,52 @@ class DobotNova5Controller:
                             # the optional pose fields.
                             pass
                         else:
-                            self._feedback_pose_history.append(
-                                (received_at, actual_pose, actual_user, actual_tool)
+                            # Keep the interpolation stream strictly ordered.
+                            # A repeated/out-of-order controller timestamp is
+                            # not repaired with a host timestamp: mixing clock
+                            # domains would create a much larger temporal error.
+                            # The current packet remains available through
+                            # ``feedback_data``; the stale history sample is
+                            # simply omitted.
+                            history_is_fresh = not (
+                                self._feedback_pose_history
+                                and sample_time <= self._feedback_pose_history[-1][0]
                             )
+                            if history_is_fresh:
+                                self._feedback_pose_history.append(
+                                    (sample_time, actual_pose, actual_user, actual_tool)
+                                )
+                            try:
+                                tcp_speed_values = packet["TCPSpeedActual"][0]
+                                linear_speed_mps = (
+                                    sum(float(value) ** 2 for value in tcp_speed_values[:3])
+                                    ** 0.5
+                                ) / MM_PER_METER
+                            except (KeyError, IndexError, TypeError, ValueError):
+                                linear_speed_mps = None
+                            if linear_speed_mps is not None and history_is_fresh:
+                                self._feedback_tcp_speed_history.append(
+                                    (
+                                        sample_time,
+                                        float(linear_speed_mps),
+                                        actual_user,
+                                        actual_tool,
+                                    )
+                                )
+                            if history_is_fresh:
+                                self._feedback_timestamp_source = timestamp_source
             except Exception:
                 time.sleep(0.05)
 
     def _wait_for_feedback(self, timeout_s: float = 3.0) -> None:
         self._wait_until(lambda: self.feedback_data is not None, timeout_s=timeout_s, detail="first feedback packet")
+
+    def _wait_for_feedback_pose(self, timeout_s: float = 3.0) -> None:
+        def pose_ready() -> bool:
+            with self._feedback_lock:
+                return bool(self._feedback_pose_history)
+
+        self._wait_until(pose_ready, timeout_s=timeout_s, detail="first timestamped TCP feedback pose")
 
     def _wait_for_command(self, command_id: int, timeout_s: float, command_epoch: int) -> None:
         def done() -> bool:

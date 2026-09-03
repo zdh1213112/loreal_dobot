@@ -104,6 +104,52 @@ def compose_motion_percent(ratios: tuple[float, ...], scale_percent: float) -> i
     return max(1, min(100, int(math.floor(effective + 0.5))))
 
 
+def grasp_feedback_is_plausible(
+    grip_state: int,
+    opening_m: float,
+    commanded_preshape_m: float,
+    minimum_opening_m: float,
+    minimum_closure_m: float,
+) -> bool:
+    """Reject a false ``GRIPPED`` state caused by landing on a box top/edge."""
+
+    closure_m = max(0.0, float(commanded_preshape_m) - float(opening_m))
+    return (
+        int(grip_state) == GRIP_GRIPPED
+        and float(opening_m) > float(minimum_opening_m)
+        and closure_m >= float(minimum_closure_m)
+    )
+
+
+def secondary_y_interlock_action(
+    gap_m: float,
+    robot_mode: int,
+    protective_stop_m: float,
+    emergency_retreat_m: float,
+) -> str:
+    """Classify the left-arm-only response to the live common-Y TCP gap."""
+
+    gap_m = float(gap_m)
+    protective_stop_m = float(protective_stop_m)
+    emergency_retreat_m = float(emergency_retreat_m)
+    if emergency_retreat_m <= 0.0 or protective_stop_m <= emergency_retreat_m:
+        raise ValueError(
+            "secondary protective stop distance must be greater than the "
+            "emergency retreat distance"
+        )
+    if gap_m < emergency_retreat_m:
+        return "retreat"
+    if gap_m < protective_stop_m and int(robot_mode) in (7, 8, 10):
+        return "stop"
+    return "none"
+
+
+def secondary_y_retreat_axis(left_y_m: float, right_common_y_m: float) -> str:
+    """Return the User-Y jog direction that increases the current TCP gap."""
+
+    return "Y+" if float(left_y_m) >= float(right_common_y_m) else "Y-"
+
+
 class RecoverableGraspError(RuntimeError):
     """A confirmed empty/lost grasp for which returning to startup is safe."""
 
@@ -111,6 +157,10 @@ class RecoverableGraspError(RuntimeError):
         super().__init__(message)
         self.stage = stage
         self.needs_vertical_retreat = needs_vertical_retreat
+
+
+class SecondaryClearanceRetry(RuntimeError):
+    """The left arm must retry a cycle because the right arm is too close."""
 
 
 @dataclass
@@ -144,6 +194,17 @@ class CycleTiming:
         }
 
 
+@dataclass(frozen=True)
+class PregraspObservation:
+    """One base-frame target observation with its original camera-frame time."""
+
+    count: int
+    pose: TcpPose
+    frame_time_s: float
+    received_at_monotonic: float
+    tcp_linear_speed_mps: Optional[float] = None
+
+
 class CosmeticBoxSingleArmNode(Node):
     def __init__(self) -> None:
         super().__init__("nova5_cosmetic_box_single_arm_cycle")
@@ -155,6 +216,33 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("auto_start", False)
         self.declare_parameter("startup_joint", [14.0, 14.0, -115.0, 25.0, 83.0, 10.0])
         self.declare_parameter("transfer_joint", [14.0, -29.0, -99.0, 39.0, 88.0, 15.0])
+        # 101 is the left pick arm.  These parameters only read 102 feedback;
+        # the left node never sends a motion command to the right/VLA arm.
+        self.declare_parameter("secondary_collision_check_enabled", True)
+        self.declare_parameter("secondary_robot_ip", "192.168.111.102")
+        self.declare_parameter("secondary_dashboard_port", 29999)
+        self.declare_parameter("secondary_feedback_port", 30004)
+        self.declare_parameter("secondary_user_index", 0)
+        self.declare_parameter("secondary_tool_index", 1)
+        # 102 base is 725 mm on the -Y side of 101 base.  Convert 102 User-Y
+        # to the common 101 User frame as y_102_common = y_102 - 0.725.
+        self.declare_parameter("secondary_base_y_offset_m", -0.725)
+        self.declare_parameter("secondary_tcp_max_age_s", 0.05)
+        # Two-stage, left-arm-only interlock.  Below 165 mm an active 101
+        # motion is cancelled and held.  Only if the live gap then falls below
+        # 145 mm does 101 execute a monitored User-Y escape away from 102.
+        # 102 remains feedback-only and never receives a command from here.
+        self.declare_parameter("secondary_y_clearance_m", 0.165)
+        self.declare_parameter("secondary_emergency_retreat_m", 0.145)
+        self.declare_parameter("secondary_emergency_recover_m", 0.200)
+        self.declare_parameter("secondary_motion_monitor_poll_s", 0.010)
+        self.declare_parameter("secondary_emergency_retreat_speed", 100)
+        self.declare_parameter("secondary_emergency_retreat_timeout_s", 3.0)
+        self.declare_parameter("secondary_emergency_retreat_max_travel_m", 0.200)
+        self.declare_parameter("secondary_clearance_wait_timeout_s", 20.0)
+        self.declare_parameter("secondary_clearance_poll_s", 0.05)
+        self.declare_parameter("secondary_connection_retry_s", 2.0)
+        self.declare_parameter("secondary_clearance_log_period_s", 1.0)
         # self.declare_parameter("place_pose", [0.531, 0.328, 0.085, -179.0, -1.39, -85.18]) #放置物料小车的位置
         self.declare_parameter("place_pose", [0.531, 0.328, 0.215, -179.0, -1.39, -85.18]) #放置物料小车的位置
         # 扫码成功后的组合 PTP 目标位置，按 User 0 表达，单位为米。
@@ -228,26 +316,54 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("camera_frame_id", "camera_d405_link")
         self.declare_parameter("vision_pose_topic", "/target_pose_cam_fine")
         # D405 稳定目标后发布的后台预抓取位姿话题。机器人到达抓取上方
-        # 后只消费这条话题的最新一帧，不增加单独视觉等待。
+        # 后只消费这条话题中本次目标的已到达新鲜帧，不增加单独视觉等待。
         self.declare_parameter("pregrasp_pose_topic", "/target_pose_cam_pregrasp")
         # 最新预抓取位姿允许的最大年龄，单位：秒。超过该时间视为视觉
         # 跟踪失效，机械臂不下压，直接回初始位重新检测。
-        self.declare_parameter("pregrasp_pose_max_age_s", 0.50)
-        # 目标相对初始稳定位姿的允许位置变化，单位：米。小于等于该值时
-        # 直接使用最新位姿下压；超过该值时先在安全上方修正。
+        self.declare_parameter("pregrasp_pose_max_age_s", 0.65)
+        # 允许后台预抓取跟踪修正目标位置。修正不是增加一段等待：目标帧
+        # 在 move-above 期间异步累积，到达悬停位后立即消费。
+        self.declare_parameter("pregrasp_use_live_pose_for_descent", True)
+        # 目标相对初始稳定位姿的位置变化阈值，单位：米。小变化继续使用
+        # 首次稳定位置；超过该值且最新悬停附近实测帧有连续帧支持时，
+        # 才在安全悬停高度做一次水平修正。
         self.declare_parameter("pregrasp_position_tolerance_m", 0.007)
-        # 目标相对初始稳定位姿的允许姿态变化，单位：度。小于等于该值时
-        # 直接下压；超过该值时先在安全上方修正。
+        # 实时 OBB 姿态变化阈值，单位：度。姿态使用旋转矩阵的几何角度
+        # 判断，不使用易跳变的 Euler 单轴差值。
         self.declare_parameter("pregrasp_angle_tolerance_deg", 8.0)
-        # 单次安全上方位置修正的最大位移，单位：米。超过该值说明目标
-        # 变化过大或跟踪可能跳变，不追踪移动，直接回初始位重新检测。
+        # 单次安全上方位置修正的最大位移，单位：米。
         self.declare_parameter("pregrasp_max_correction_m", 0.050)
-        # 单次安全上方位置修正允许的最大姿态变化，单位：度。超过该值
-        # 不执行修正和下压，直接回初始位重新检测。
+        # 单次姿态修正允许的最大几何角度，单位：度。超过该值不把实时
+        # OBB 姿态带到 TCP，保留首次稳定姿态。
         self.declare_parameter("pregrasp_max_correction_angle_deg", 30.0)
         # 目标与当前 TCP 安全上方位置之间必须保留的最小垂直间隙，单位：米。
         # 间隙不足时禁止下压，直接回初始位重新检测。
         self.declare_parameter("pregrasp_min_hover_clearance_m", 0.030)
+        # 兼容旧 launch 参数保留。实机数据证明眼在手相机运动期间的细小
+        # 时序误差会形成平滑但虚假的“目标速度”，因此抓取位置不再外推。
+        self.declare_parameter("pregrasp_prediction_horizon_s", 0.0)
+        # TCP 线速度低于该值的视觉帧视为“悬停后稳定帧”。这些帧优先于
+        # 机械臂运动中的帧，用于获得稳定的当前手眼变换结果。
+        self.declare_parameter("pregrasp_settled_tcp_speed_mps", 0.015)
+        # D405 通常约 4--5 Hz；允许使用到达悬停前约一个帧周期内的
+        # 已采集稳定帧，不额外等待相机再拍一帧。
+        self.declare_parameter("pregrasp_hover_frame_window_s", 0.25)
+        # 连续位置帧聚类半径。单帧跳点不会触发水平修正。
+        self.declare_parameter("pregrasp_position_consensus_m", 0.006)
+        self.declare_parameter("pregrasp_position_consensus_samples", 2)
+        # A large one-frame jump is target loss/mask drift, not a safe hover
+        # correction.  It must be confirmed by the normal spatial consensus
+        # before the robot is allowed to descend.
+        self.declare_parameter("pregrasp_unconfirmed_shift_reject_m", 0.020)
+        # 兼容旧参数保留；运动轨迹现在只写入诊断，不参与抓取点选择。
+        self.declare_parameter("pregrasp_motion_min_displacement_m", 0.006)
+        self.declare_parameter("pregrasp_motion_max_residual_m", 0.005)
+        # 平放盒子默认锁定首次稳定姿态；若现场确实允许盒子在空中旋转，
+        # 可显式打开，且仍必须满足至少 3 帧旋转共识和法向一致。
+        self.declare_parameter("pregrasp_live_orientation_enabled", False)
+        self.declare_parameter("pregrasp_orientation_consensus_samples", 3)
+        self.declare_parameter("pregrasp_orientation_consensus_spread_deg", 4.0)
+        self.declare_parameter("pregrasp_live_orientation_max_delta_deg", 20.0)
         # D405 帧时间戳与机械臂反馈历史的最大允许边缘误差，单位：秒。
         # 正常情况下使用时间戳之间的历史反馈插值；只有帧落在历史首尾
         # 外侧时才使用这个容差，超出则丢弃该帧，避免再次套用错误的当前位姿。
@@ -351,6 +467,12 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("grasp_feedback_wait_s", 0.7)
         self.declare_parameter("single_cycle_grasp_retry_limit", 3)
         self.declare_parameter("grasp_success_min_opening_m", 0.003)
+        # A correct side grasp starts with roughly 20 mm clearance and must
+        # visibly close before state=GRIPPED is trusted.  If the fingers land
+        # on the top/edge, DH can report GRIPPED while the opening hardly
+        # changes (cycle 1398: 89.3 -> 89.1 mm).  Reject that condition before
+        # sending any lift command; this uses existing feedback and adds no wait.
+        self.declare_parameter("grasp_min_closure_from_preshape_m", 0.005)
         self.declare_parameter("grasp_feedback_required", True)
         self.declare_parameter("timing_enabled", True)
         self.declare_parameter("timing_topic", "/cosmetic_pick_cycle_timing")
@@ -371,12 +493,36 @@ class CosmeticBoxSingleArmNode(Node):
         self.controller.enable_single_command_motion_scaling()
         self.gripper = self._initialize_gripper()
 
+        # 101 is the left pick arm.  Keep only a read-only feedback connection
+        # for 102.  The VLA process remains the owner of 102's Dashboard/control
+        # connection; this node must not open port 29999 on the right arm.
+        self.secondary_controller: Optional[DobotNova5Controller] = None
+        self.secondary_connection_lock = threading.Lock()
+        self.secondary_next_connect_attempt = 0.0
+        self.secondary_last_measurement: Optional[dict[str, object]] = None
+        self.secondary_last_clearance_state: Optional[bool] = None
+        self.secondary_last_clearance_log_at = 0.0
+        self.secondary_safety_lock = threading.Lock()
+        self.secondary_protective_stop_latched = threading.Event()
+        self.secondary_retreat_active = threading.Event()
+        self.secondary_retreat_attempted = threading.Event()
+        # A hard Y-clearance retreat may interrupt a continuous production
+        # cycle.  Remember that intent separately from ``cycle_enabled`` so
+        # the old trajectory can stay cancelled while a fresh cycle is
+        # started after the retreat reaches its recovery distance.
+        self.secondary_auto_resume_requested = threading.Event()
+        self.secondary_safety_shutdown = threading.Event()
+        self.secondary_safety_reason = ""
+        self.secondary_safety_thread: Optional[threading.Thread] = None
+        self.secondary_resume_thread: Optional[threading.Thread] = None
+
         self.data_lock = threading.Lock()
         self.pose_samples: deque[tuple[int, TcpPose]] = deque(maxlen=20)
         self.pose_count = 0
         self.pregrasp_pose_count = 0
         self.latest_pregrasp_pose: Optional[TcpPose] = None
         self.latest_pregrasp_pose_received_at = 0.0
+        self.pregrasp_observations: deque[PregraspObservation] = deque(maxlen=40)
         self.width_count = 0
         self.length_count = 0
         self.height_count = 0
@@ -436,11 +582,21 @@ class CosmeticBoxSingleArmNode(Node):
         )
 
         self.start_timer = self.create_timer(1.0, self._start_automatically_once)
+        self._connect_secondary_safety_feedback()
+        self.secondary_safety_thread = threading.Thread(
+            target=self._secondary_motion_safety_loop,
+            name="secondary-y-motion-interlock",
+            daemon=True,
+        )
+        self.secondary_safety_thread.start()
         self.get_logger().warning(
             "Using handeye_flange_to_cam parameter for robot 192.168.111.101 / D405 409122274792; "
             "verify this calibration on the real cell before enabling motion."
         )
-        self.get_logger().info("Single-arm cosmetic-box controller connected; no 192.168.111.102 connection is created.")
+        self.get_logger().info(
+            "101 left-arm controller ready; monitoring 102 right-arm TCP feedback "
+            "read-only for the Y-clearance interlock."
+        )
         self._log_effective_motion_profile()
 
     def _six_values(self, name: str) -> list[float]:
@@ -533,6 +689,51 @@ class CosmeticBoxSingleArmNode(Node):
             f"Normalized motion scaling active: scale={scale}% (100%=legacy effective baseline); "
             f"SpeedFactor/VelJ/VelL/AccJ/AccL replay layers fixed at 100; {details}"
         )
+        if bool(self.get_parameter("secondary_collision_check_enabled").value):
+            self.get_logger().info(
+                "Secondary TCP Y two-stage interlock active (101 commands only): "
+                f"102={self.get_parameter('secondary_robot_ip').value}, "
+                f"base_y_offset={float(self.get_parameter('secondary_base_y_offset_m').value) * 1000.0:+.1f}mm, "
+                f"stop_101_gap<{float(self.get_parameter('secondary_y_clearance_m').value) * 1000.0:.1f}mm, "
+                f"retreat_101_gap<{float(self.get_parameter('secondary_emergency_retreat_m').value) * 1000.0:.1f}mm, "
+                f"recover_gap={float(self.get_parameter('secondary_emergency_recover_m').value) * 1000.0:.1f}mm, "
+                f"feedback_max_age={float(self.get_parameter('secondary_tcp_max_age_s').value) * 1000.0:.0f}ms, "
+                "continuous_auto_restart=fresh-startup-after-retreat"
+            )
+        if bool(self.get_parameter("pregrasp_use_live_pose_for_descent").value):
+            orientation_mode = (
+                "orientation requires consensus"
+                if bool(self.get_parameter("pregrasp_live_orientation_enabled").value)
+                else "orientation locked to initial stable pose"
+            )
+            self.get_logger().info(
+                "Pregrasp revalidation mode: latest near-hover measured consensus; "
+                f"no motion extrapolation; {orientation_mode}; unconfirmed shifts "
+                f">{float(self.get_parameter('pregrasp_unconfirmed_shift_reject_m').value) * 1000.0:.1f}mm "
+                "are treated as target loss"
+            )
+        else:
+            self.get_logger().info(
+                "Pregrasp revalidation mode: initial-stable pose protected; "
+                "live D405 pose is diagnostic only"
+            )
+        self.get_logger().info(
+            "Grasp plausibility interlock active: minimum closure from pre-shape="
+            f"{float(self.get_parameter('grasp_min_closure_from_preshape_m').value) * 1000.0:.1f}mm; "
+            "false GRIPPED feedback is released before vertical retreat"
+        )
+        self.get_logger().info(
+            "Vision/robot time alignment: feedback "
+            f"{self.controller.feedback_timestamp_source} timestamp; "
+            f"raw_TimeStamp={self.controller.feedback_raw_timestamp}; "
+            "pregrasp tracking uses no extra hover wait"
+        )
+        if self.controller.feedback_timestamp_source == "host_receive":
+            self.get_logger().warning(
+                "101 feedback TimeStamp is not a usable Unix clock on this firmware; "
+                "robot history uses packet receive time. Moving-camera trends are "
+                "diagnostic only and cannot command a pregrasp correction."
+            )
 
     def _emit_timing(self, payload: dict[str, object]) -> None:
         if self.shutting_down or not rclpy.ok() or not bool(self.get_parameter("timing_enabled").value):
@@ -614,6 +815,669 @@ class CosmeticBoxSingleArmNode(Node):
         gripper.initialize(timeout_s=float(self.get_parameter("dh_timeout_s").value), init_open=True)
         return gripper
 
+    def _drop_secondary_safety_feedback(self) -> None:
+        """Close the optional 102 feedback connection without touching its motion."""
+
+        with self.secondary_connection_lock:
+            controller = self.secondary_controller
+            self.secondary_controller = None
+        if controller is not None:
+            try:
+                controller.disconnect()
+            except Exception as exc:
+                self.get_logger().warning(f"Closing 102 safety feedback reported: {exc}")
+
+    def _connect_secondary_safety_feedback(self) -> bool:
+        """Connect to 102 for feedback only; never issue a command to that arm."""
+
+        if not bool(self.get_parameter("secondary_collision_check_enabled").value):
+            return False
+
+        with self.secondary_connection_lock:
+            controller = self.secondary_controller
+            if controller is not None:
+                try:
+                    controller.current_feedback_tcp_pose_with_timestamp()
+                except Exception:
+                    self.secondary_controller = None
+                    try:
+                        controller.disconnect()
+                    except Exception:
+                        pass
+                else:
+                    return True
+
+            now = time.monotonic()
+            if now < self.secondary_next_connect_attempt:
+                return False
+            retry_s = max(
+                0.5,
+                float(self.get_parameter("secondary_connection_retry_s").value),
+            )
+            self.secondary_next_connect_attempt = now + retry_s
+            controller = DobotNova5Controller(
+                robot_ip=str(self.get_parameter("secondary_robot_ip").value),
+                dashboard_port=int(self.get_parameter("secondary_dashboard_port").value),
+                feedback_port=int(self.get_parameter("secondary_feedback_port").value),
+                # The dashboard_port is retained as a parameter for config
+                # compatibility, but feedback-only connect never opens it.
+                startup_joint=[0.0] * 6,
+                startup_speed=1,
+            )
+            try:
+                controller.connect_feedback_only()
+            except Exception as exc:
+                try:
+                    controller.disconnect()
+                except Exception:
+                    pass
+                self.get_logger().warning(
+                    f"102 read-only safety feedback unavailable: {exc}; "
+                    "left-arm Y-clearance interlock remains closed"
+                )
+                return False
+
+            self.secondary_controller = controller
+            self.get_logger().info(
+                "102 right-arm read-only TCP feedback connected: "
+                f"ip={self.get_parameter('secondary_robot_ip').value}; "
+                f"feedback_port={self.get_parameter('secondary_feedback_port').value}; "
+                "Dashboard 29999 was not opened; "
+                "no 102 motion commands are sent"
+            )
+            pose, active_user, active_tool, received_at = (
+                controller.current_feedback_tcp_pose_with_timestamp()
+            )
+            feedback_age_ms = max(0.0, time.time() - float(received_at)) * 1000.0
+            common_y_m = pose.y + float(
+                self.get_parameter("secondary_base_y_offset_m").value
+            )
+            self.get_logger().info(
+                "102 startup TCP pose: "
+                f"XYZ=({pose.x * 1000.0:.1f}, {pose.y * 1000.0:.1f}, "
+                f"{pose.z * 1000.0:.1f})mm, "
+                f"RPY=({pose.rx:.1f}, {pose.ry:.1f}, {pose.rz:.1f})deg, "
+                f"User={active_user}, Tool={active_tool}, "
+                f"age={feedback_age_ms:.1f}ms, "
+                f"common_Y_for_101={common_y_m * 1000.0:.1f}mm, "
+                f"timestamp_source={controller.feedback_timestamp_source}, "
+                f"raw_TimeStamp={controller.feedback_raw_timestamp}"
+            )
+            return True
+
+    def _read_secondary_y_clearance(
+        self,
+        *,
+        allow_reconnect: bool = True,
+    ) -> dict[str, object]:
+        """Measure the 101/102 TCP Y gap in the common 101 User frame."""
+
+        if not bool(self.get_parameter("secondary_collision_check_enabled").value):
+            return {"enabled": False, "clear": True}
+        if allow_reconnect and not self._connect_secondary_safety_feedback():
+            raise RuntimeError("102 TCP feedback is not connected")
+
+        with self.secondary_connection_lock:
+            controller = self.secondary_controller
+        if controller is None:
+            raise RuntimeError("102 TCP feedback is not connected")
+
+        expected_user = int(self.get_parameter("secondary_user_index").value)
+        expected_tool = int(self.get_parameter("secondary_tool_index").value)
+        feedback_pose, actual_user, actual_tool, received_at = (
+            controller.current_feedback_tcp_pose_with_timestamp()
+        )
+        feedback_age_s = max(0.0, time.time() - float(received_at))
+        source = "feedback"
+        if (actual_user, actual_tool) == (expected_user, expected_tool):
+            secondary_pose = feedback_pose
+        else:
+            # Feedback-only mode intentionally has no Dashboard fallback.  A
+            # pose in another User/Tool frame cannot safely be compared with
+            # 101's frame, so fail closed until the VLA selects the configured
+            # pair (normally User 0 / Tool 1).
+            raise RuntimeError(
+                "102 feedback active User/Tool does not match the configured "
+                f"pair: active=({actual_user},{actual_tool}), "
+                f"expected=({expected_user},{expected_tool}); "
+                "feedback-only safety connection cannot query GetPose"
+            )
+
+        max_age_s = max(
+            0.05,
+            float(self.get_parameter("secondary_tcp_max_age_s").value),
+        )
+        if feedback_age_s > max_age_s:
+            if allow_reconnect:
+                self._drop_secondary_safety_feedback()
+            raise RuntimeError(
+                f"102 TCP feedback stale: age={feedback_age_s * 1000.0:.0f}ms "
+                f"> {max_age_s * 1000.0:.0f}ms"
+            )
+
+        left_pose = self._current_command_pose()
+        base_y_offset_m = float(
+            self.get_parameter("secondary_base_y_offset_m").value
+        )
+        right_common_y_m = secondary_pose.y + base_y_offset_m
+        gap_y_m = abs(left_pose.y - right_common_y_m)
+        threshold_m = max(
+            0.001,
+            float(self.get_parameter("secondary_y_clearance_m").value),
+        )
+        return {
+            "enabled": True,
+            "clear": gap_y_m >= threshold_m,
+            "left_y_m": float(left_pose.y),
+            "right_y_m": float(secondary_pose.y),
+            "right_common_y_m": float(right_common_y_m),
+            "gap_y_m": float(gap_y_m),
+            "threshold_m": float(threshold_m),
+            "feedback_age_s": float(feedback_age_s),
+            "secondary_user": int(actual_user),
+            "secondary_tool": int(actual_tool),
+            "source": source,
+        }
+
+    def _wait_for_secondary_y_clearance(self, stage: str) -> dict[str, object]:
+        """Hold 101 before an approach until 102's common-frame Y gap is safe."""
+
+        if not bool(self.get_parameter("secondary_collision_check_enabled").value):
+            return {"enabled": False, "clear": True}
+
+        timeout_s = max(
+            0.1,
+            float(self.get_parameter("secondary_clearance_wait_timeout_s").value),
+        )
+        poll_s = max(
+            0.01,
+            float(self.get_parameter("secondary_clearance_poll_s").value),
+        )
+        log_period_s = max(
+            0.2,
+            float(self.get_parameter("secondary_clearance_log_period_s").value),
+        )
+        deadline = time.monotonic() + timeout_s
+        last_state = self.secondary_last_clearance_state
+        last_error = "no measurement"
+
+        while self.running and self.cycle_enabled:
+            try:
+                measurement = self._read_secondary_y_clearance()
+                self.secondary_last_measurement = measurement
+                clear = bool(measurement.get("clear", False))
+                now = time.monotonic()
+                if clear:
+                    if last_state is not True:
+                        self._publish_status(
+                            "102 TCP Y clearance CLEAR: "
+                            f"101={float(measurement['left_y_m']) * 1000.0:.1f}mm, "
+                            f"102(common)={float(measurement['right_common_y_m']) * 1000.0:.1f}mm, "
+                            f"gap={float(measurement['gap_y_m']) * 1000.0:.1f}mm "
+                            f">= {float(measurement['threshold_m']) * 1000.0:.1f}mm; "
+                            f"continuing {stage}"
+                        )
+                    self.secondary_last_clearance_state = True
+                    return measurement
+
+                if (
+                    last_state is not False
+                    or now - self.secondary_last_clearance_log_at >= log_period_s
+                ):
+                    self._publish_status(
+                        "102 TCP Y clearance BLOCKED: "
+                        f"101={float(measurement['left_y_m']) * 1000.0:.1f}mm, "
+                        f"102(common)={float(measurement['right_common_y_m']) * 1000.0:.1f}mm, "
+                        f"gap={float(measurement['gap_y_m']) * 1000.0:.1f}mm "
+                        f"< {float(measurement['threshold_m']) * 1000.0:.1f}mm; "
+                        f"holding 101 before {stage}"
+                    )
+                    self.secondary_last_clearance_log_at = now
+                self.secondary_last_clearance_state = False
+                last_state = False
+            except Exception as exc:
+                last_error = str(exc)
+                now = time.monotonic()
+                if now - self.secondary_last_clearance_log_at >= log_period_s:
+                    self._publish_status(
+                        "102 TCP safety feedback unavailable; "
+                        f"holding 101 before {stage}: {last_error}"
+                    )
+                    self.secondary_last_clearance_log_at = now
+                last_state = None
+
+            if time.monotonic() >= deadline:
+                raise SecondaryClearanceRetry(
+                    f"102 TCP Y clearance was not available for {stage} within "
+                    f"{timeout_s:.1f}s; no left-arm approach was issued; "
+                    f"last status: {last_error}"
+                )
+            time.sleep(poll_s)
+
+        raise SecondaryClearanceRetry(
+            f"cycle cancelled while waiting for 102 TCP Y clearance before {stage}"
+        )
+
+    def _secondary_interlock_distances(self) -> tuple[float, float, float]:
+        protective_m = max(
+            0.001,
+            float(self.get_parameter("secondary_y_clearance_m").value),
+        )
+        retreat_m = max(
+            0.001,
+            float(self.get_parameter("secondary_emergency_retreat_m").value),
+        )
+        recover_m = max(
+            retreat_m,
+            float(self.get_parameter("secondary_emergency_recover_m").value),
+        )
+        if protective_m <= retreat_m:
+            raise RuntimeError(
+                "secondary_y_clearance_m must be greater than "
+                "secondary_emergency_retreat_m"
+            )
+        if recover_m < protective_m:
+            raise RuntimeError(
+                "secondary_emergency_recover_m must be at least "
+                "secondary_y_clearance_m"
+            )
+        return protective_m, retreat_m, recover_m
+
+    def _latch_secondary_protective_stop(
+        self,
+        detail: str,
+        robot_mode: int,
+    ) -> None:
+        """Cancel the active 101 cycle and stop only the left-arm controller."""
+
+        with self.secondary_safety_lock:
+            first_trigger = not self.secondary_protective_stop_latched.is_set()
+            interrupted_continuous_cycle = (
+                first_trigger
+                and self.cycle_enabled
+                and self.worker is not None
+                and self.worker.is_alive()
+            )
+            if interrupted_continuous_cycle:
+                self.secondary_auto_resume_requested.set()
+            # Re-close the cycle on every unsafe sample.  This also handles an
+            # enable request racing with a latch that has not cleared yet.
+            self.cycle_enabled = False
+            if first_trigger:
+                self.secondary_protective_stop_latched.set()
+                self.secondary_safety_reason = str(detail)
+
+        if first_trigger:
+            self.get_logger().warning(str(detail))
+            self._publish_status(str(detail))
+        if int(robot_mode) not in (7, 8, 10):
+            return
+        try:
+            self.controller.stop_motion()
+        except Exception as exc:
+            self.get_logger().fatal(
+                f"101 protective Stop failed after secondary TCP trigger: {exc}"
+            )
+
+    def _schedule_continuous_restart_after_secondary_retreat(self) -> None:
+        """Start a fresh continuous worker after the cancelled worker exits."""
+
+        with self.secondary_safety_lock:
+            if not self.secondary_auto_resume_requested.is_set():
+                return
+            if (
+                self.secondary_resume_thread is not None
+                and self.secondary_resume_thread.is_alive()
+            ):
+                return
+            resume_thread = threading.Thread(
+                target=self._resume_continuous_after_secondary_retreat,
+                name="secondary-y-continuous-restart",
+                daemon=True,
+            )
+            self.secondary_resume_thread = resume_thread
+        resume_thread.start()
+
+    def _resume_continuous_after_secondary_retreat(self) -> None:
+        """Restart at startup; never continue the interrupted trajectory."""
+
+        current_thread = threading.current_thread()
+        try:
+            # The emergency retreat could acquire ``action_lock`` as soon as
+            # the cancelled cycle left its robot sequence, while that old
+            # Python thread still had a few log statements to finish.  Do not
+            # let _ensure_worker mistake it for the replacement worker.
+            while self.running and not self.secondary_safety_shutdown.is_set():
+                if not self.secondary_auto_resume_requested.is_set():
+                    return
+                previous_worker = self.worker
+                if previous_worker is None or not previous_worker.is_alive():
+                    break
+                time.sleep(0.01)
+            else:
+                return
+
+            with self.secondary_safety_lock:
+                if (
+                    not self.running
+                    or self.secondary_safety_shutdown.is_set()
+                    or not self.secondary_auto_resume_requested.is_set()
+                    or self.secondary_protective_stop_latched.is_set()
+                    or self.secondary_retreat_active.is_set()
+                ):
+                    return
+                if self.controller.robot_mode != 5:
+                    self.secondary_auto_resume_requested.clear()
+                    self._publish_status(
+                        "101 retreat completed, but automatic restart was cancelled: "
+                        f"controller is {self.controller.robot_mode_text()}"
+                    )
+                    return
+                # Clearing the request and enabling the replacement worker are
+                # atomic with respect to operator Stop/manual recovery methods.
+                self.secondary_auto_resume_requested.clear()
+                self.cycle_enabled = True
+
+            self._publish_status(
+                "101 retreat recovery complete; starting a fresh continuous "
+                "cycle from the startup joint"
+            )
+            self._ensure_worker()
+        finally:
+            with self.secondary_safety_lock:
+                if self.secondary_resume_thread is current_thread:
+                    self.secondary_resume_thread = None
+
+    def _wait_for_action_lock_during_emergency(self, deadline: float) -> bool:
+        """Wait for the cancelled worker to unwind, re-stopping any late motion."""
+
+        while self.running and not self.secondary_safety_shutdown.is_set():
+            if self.action_lock.acquire(blocking=False):
+                return True
+            if self.controller.robot_mode in (7, 8, 10):
+                try:
+                    self.controller.stop_motion()
+                except Exception as exc:
+                    self.get_logger().fatal(
+                        f"101 remained active while emergency retreat waited for control: {exc}"
+                    )
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+        return False
+
+    def _run_secondary_emergency_retreat(self) -> None:
+        """Jog 101 directly away in User Y until the common-Y gap is recovered."""
+
+        if self.secondary_retreat_active.is_set():
+            return
+        self.secondary_retreat_active.set()
+        poll_s = max(
+            0.005,
+            min(
+                0.05,
+                float(self.get_parameter("secondary_motion_monitor_poll_s").value),
+            ),
+        )
+        timeout_s = max(
+            0.2,
+            float(self.get_parameter("secondary_emergency_retreat_timeout_s").value),
+        )
+        deadline = time.monotonic() + timeout_s
+        action_lock_acquired = False
+        jog_started = False
+        recovered = False
+        retreat_cleanup_ok = True
+        axis_name = ""
+        start_left_y_m = 0.0
+        last_gap_m = float("nan")
+        try:
+            action_lock_acquired = self._wait_for_action_lock_during_emergency(deadline)
+            if not action_lock_acquired:
+                raise RuntimeError(
+                    "101 emergency retreat could not obtain robot control before timeout"
+                )
+
+            if self.controller.robot_mode in (7, 8, 10):
+                self.controller.stop_motion()
+                remaining_s = max(0.05, deadline - time.monotonic())
+                self.controller.wait_until_idle(timeout_s=remaining_s)
+            if self.controller.robot_mode != 5:
+                raise RuntimeError(
+                    "101 is not enabled and idle for emergency retreat: "
+                    f"mode={self.controller.robot_mode_text()}"
+                )
+
+            _, retreat_trigger_m, recover_m = self._secondary_interlock_distances()
+            measurement = self._read_secondary_y_clearance(allow_reconnect=False)
+            last_gap_m = float(measurement["gap_y_m"])
+            if last_gap_m >= recover_m:
+                recovered = True
+                self.secondary_retreat_attempted.clear()
+                self._publish_status(
+                    "101 emergency retreat no longer required: "
+                    f"TCP Y gap recovered to {last_gap_m * 1000.0:.1f}mm"
+                )
+                return
+            if last_gap_m >= retreat_trigger_m:
+                # The hard threshold was crossed before this worker obtained
+                # command ownership, but 102 has already moved back out.  Keep
+                # 101 stopped; do not create an unnecessary new trajectory.
+                self._publish_status(
+                    "101 remains stopped after emergency trigger: "
+                    f"TCP Y gap={last_gap_m * 1000.0:.1f}mm; "
+                    f"waiting for {recover_m * 1000.0:.1f}mm before restart"
+                )
+                self.secondary_retreat_attempted.clear()
+                return
+
+            start_left_y_m = float(measurement["left_y_m"])
+            right_common_y_m = float(measurement["right_common_y_m"])
+            axis_name = secondary_y_retreat_axis(
+                start_left_y_m,
+                right_common_y_m,
+            )
+            retreat_speed = max(
+                1,
+                min(
+                    100,
+                    int(self.get_parameter("secondary_emergency_retreat_speed").value),
+                ),
+            )
+            max_travel_m = max(
+                0.001,
+                float(
+                    self.get_parameter(
+                        "secondary_emergency_retreat_max_travel_m"
+                    ).value
+                ),
+            )
+            self._publish_status(
+                "EMERGENCY 101 Y retreat starting: "
+                f"gap={last_gap_m * 1000.0:.1f}mm "
+                f"< {retreat_trigger_m * 1000.0:.1f}mm, "
+                f"direction={axis_name}, target_gap={recover_m * 1000.0:.1f}mm, "
+                f"speed={retreat_speed}%"
+            )
+            self.controller.set_speed_factor(retreat_speed)
+            self.controller.move_jog(
+                axis_name,
+                coord_type=1,
+                user=int(self.get_parameter("user_index").value),
+                tool=int(self.get_parameter("command_tool_index").value),
+            )
+            jog_started = True
+            clear_samples = 0
+            while self.running and not self.secondary_safety_shutdown.is_set():
+                measurement = self._read_secondary_y_clearance(allow_reconnect=False)
+                last_gap_m = float(measurement["gap_y_m"])
+                travel_m = abs(float(measurement["left_y_m"]) - start_left_y_m)
+                if last_gap_m >= recover_m:
+                    clear_samples += 1
+                    if clear_samples >= 2:
+                        recovered = True
+                        break
+                else:
+                    clear_samples = 0
+                if travel_m >= max_travel_m:
+                    raise RuntimeError(
+                        f"101 emergency retreat reached max travel "
+                        f"{travel_m * 1000.0:.1f}mm before recovering gap"
+                    )
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"101 emergency retreat timed out with TCP Y gap "
+                        f"{last_gap_m * 1000.0:.1f}mm"
+                    )
+                time.sleep(poll_s)
+        except Exception as exc:
+            with self.secondary_safety_lock:
+                self.secondary_auto_resume_requested.clear()
+            self.secondary_safety_reason = f"101 emergency retreat failed: {exc}"
+            self.get_logger().fatal(self.secondary_safety_reason)
+            self._publish_status(self.secondary_safety_reason)
+        finally:
+            if jog_started:
+                try:
+                    self.controller.move_jog("")
+                    self.controller.wait_until_idle(timeout_s=5.0)
+                except Exception as exc:
+                    retreat_cleanup_ok = False
+                    self.get_logger().fatal(
+                        f"Stopping 101 emergency {axis_name} retreat failed: {exc}"
+                    )
+                try:
+                    self.controller.set_speed_factor(100)
+                except Exception as exc:
+                    retreat_cleanup_ok = False
+                    self.get_logger().warning(
+                        f"Restoring 101 speed after emergency retreat failed: {exc}"
+                    )
+            if action_lock_acquired:
+                self.action_lock.release()
+            self.secondary_retreat_active.clear()
+
+        if recovered and retreat_cleanup_ok:
+            with self.secondary_safety_lock:
+                self.secondary_protective_stop_latched.clear()
+                self.secondary_retreat_attempted.clear()
+                auto_restart = self.secondary_auto_resume_requested.is_set()
+            if auto_restart:
+                self._publish_status(
+                    "101 emergency Y retreat completed: "
+                    f"TCP Y gap={last_gap_m * 1000.0:.1f}mm; "
+                    "returning to startup before automatic continuous restart"
+                )
+                self._schedule_continuous_restart_after_secondary_retreat()
+            else:
+                self._publish_status(
+                    "101 emergency Y retreat completed: "
+                    f"TCP Y gap={last_gap_m * 1000.0:.1f}mm; "
+                    "manual operation remains stopped"
+                )
+        elif recovered:
+            with self.secondary_safety_lock:
+                self.secondary_auto_resume_requested.clear()
+            self.secondary_safety_reason = (
+                "101 reached the emergency recovery distance, but retreat cleanup "
+                "failed; automatic restart is disabled"
+            )
+            self.get_logger().fatal(self.secondary_safety_reason)
+            self._publish_status(self.secondary_safety_reason)
+
+    def _secondary_motion_safety_loop(self) -> None:
+        """Continuously enforce the two-stage common-Y policy for 101 only."""
+
+        while self.running and not self.secondary_safety_shutdown.is_set():
+            try:
+                poll_s = max(
+                    0.005,
+                    min(
+                        0.05,
+                        float(
+                            self.get_parameter(
+                                "secondary_motion_monitor_poll_s"
+                            ).value
+                        ),
+                    ),
+                )
+                if not bool(
+                    self.get_parameter("secondary_collision_check_enabled").value
+                ):
+                    self.secondary_safety_shutdown.wait(poll_s)
+                    continue
+                robot_mode = self.controller.robot_mode
+                monitoring_active = (
+                    self.cycle_enabled
+                    or self.secondary_protective_stop_latched.is_set()
+                    or robot_mode in (7, 8, 10)
+                )
+                if not monitoring_active or self.secondary_retreat_active.is_set():
+                    self.secondary_safety_shutdown.wait(poll_s)
+                    continue
+
+                try:
+                    measurement = self._read_secondary_y_clearance(
+                        allow_reconnect=False
+                    )
+                except Exception as exc:
+                    if robot_mode in (7, 8, 10):
+                        self._latch_secondary_protective_stop(
+                            "102 TCP safety feedback failed while 101 was moving; "
+                            f"stopping 101: {exc}",
+                            robot_mode,
+                        )
+                    self.secondary_safety_shutdown.wait(poll_s)
+                    continue
+
+                self.secondary_last_measurement = measurement
+                protective_m, retreat_m, _ = self._secondary_interlock_distances()
+                gap_m = float(measurement["gap_y_m"])
+                action = secondary_y_interlock_action(
+                    gap_m,
+                    robot_mode,
+                    protective_m,
+                    retreat_m,
+                )
+                if action == "stop":
+                    self._latch_secondary_protective_stop(
+                        "101 protective stop: common-Y TCP gap "
+                        f"{gap_m * 1000.0:.1f}mm "
+                        f"< {protective_m * 1000.0:.1f}mm; "
+                        "current left-arm trajectory cancelled; 102 remains read-only",
+                        robot_mode,
+                    )
+                elif action == "retreat":
+                    self._latch_secondary_protective_stop(
+                        "101 emergency retreat trigger: common-Y TCP gap "
+                        f"{gap_m * 1000.0:.1f}mm "
+                        f"< {retreat_m * 1000.0:.1f}mm; "
+                        "cancelling the cycle before left-arm-only Y retreat",
+                        robot_mode,
+                    )
+                    if not self.secondary_retreat_attempted.is_set():
+                        self.secondary_retreat_attempted.set()
+                        self._run_secondary_emergency_retreat()
+                elif (
+                    self.secondary_protective_stop_latched.is_set()
+                    and gap_m >= protective_m
+                    and self.controller.robot_mode == 5
+                ):
+                    # The interrupted cycle remains disabled.  Clearing only
+                    # the monitor latch prevents a later idle 102 motion from
+                    # unexpectedly moving 101 after the incident is over.
+                    self.secondary_protective_stop_latched.clear()
+                    self.secondary_retreat_attempted.clear()
+                    # A warning-band Stop that never required a physical 101
+                    # retreat is intentionally not auto-resumed.
+                    self.secondary_auto_resume_requested.clear()
+
+                self.secondary_safety_shutdown.wait(poll_s)
+            except Exception as exc:
+                # A supervisor bug must not terminate monitoring silently.
+                self.get_logger().error(f"Secondary motion safety loop error: {exc}")
+                self.secondary_safety_shutdown.wait(0.05)
+
     def _transform_vision_pose(self, msg: PoseStamped, source: str) -> Optional[TcpPose]:
         if msg.header.frame_id.strip() != str(self.get_parameter("camera_frame_id").value):
             self.get_logger().error(
@@ -687,10 +1551,32 @@ class CosmeticBoxSingleArmNode(Node):
         command_pose = self._transform_vision_pose(msg, "pregrasp")
         if command_pose is None:
             return
+        frame_time_s = message_stamp_seconds(msg)
+        tcp_linear_speed_mps: Optional[float] = None
+        try:
+            tcp_linear_speed_mps = self.controller.current_tcp_linear_speed_at(
+                frame_time_s,
+                max_skew_s=float(self.get_parameter("vision_pose_max_time_skew_s").value),
+            )
+        except (RuntimeError, ValueError):
+            # Speed is a quality hint only.  The pose transform has already
+            # passed the strict timestamped feedback check above, so a
+            # firmware variant without speed history must not discard it.
+            pass
         with self.data_lock:
             self.pregrasp_pose_count += 1
+            observation_count = self.pregrasp_pose_count
             self.latest_pregrasp_pose = command_pose
             self.latest_pregrasp_pose_received_at = time.monotonic()
+            self.pregrasp_observations.append(
+                PregraspObservation(
+                    count=observation_count,
+                    pose=command_pose,
+                    frame_time_s=frame_time_s,
+                    received_at_monotonic=self.latest_pregrasp_pose_received_at,
+                    tcp_linear_speed_mps=tcp_linear_speed_mps,
+                )
+            )
 
     def _six_values_from_rotation(self, name: str) -> list[float]:
         values = [float(value) for value in self.get_parameter(name).value]
@@ -762,15 +1648,44 @@ class CosmeticBoxSingleArmNode(Node):
         self.get_logger().info(f"Barcode stability: value={value!r}, hits={hits}")
 
     def _cycle_enable_callback(self, msg: Bool) -> None:
-        self.cycle_enabled = bool(msg.data)
-        self._publish_status("cycle enabled" if self.cycle_enabled else "cycle will stop after current blocking motion")
-        if self.cycle_enabled:
-            self._ensure_worker()
+        requested = bool(msg.data)
+        if not requested:
+            with self.secondary_safety_lock:
+                self.secondary_auto_resume_requested.clear()
+                self.cycle_enabled = False
+            self._publish_status("cycle will stop after current blocking motion")
+            return
+        with self.secondary_safety_lock:
+            protection_latched = self.secondary_protective_stop_latched.is_set()
+            if protection_latched:
+                self.cycle_enabled = False
+            else:
+                self.secondary_auto_resume_requested.clear()
+                self.cycle_enabled = True
+        if protection_latched:
+            protective_m, _, _ = self._secondary_interlock_distances()
+            self._publish_status(
+                "cycle enable refused: 101/102 Y-clearance protection is still "
+                f"latched; wait for an idle gap of at least "
+                f"{protective_m * 1000.0:.1f}mm, then enable again"
+            )
+            return
+        self._publish_status("cycle enabled")
+        self._ensure_worker()
 
     def _start_automatically_once(self) -> None:
         self.start_timer.cancel()
         if bool(self.get_parameter("auto_start").value):
-            self.cycle_enabled = True
+            with self.secondary_safety_lock:
+                protection_latched = self.secondary_protective_stop_latched.is_set()
+                if not protection_latched:
+                    self.secondary_auto_resume_requested.clear()
+                    self.cycle_enabled = True
+            if protection_latched:
+                self._publish_status(
+                    "auto-start refused while 101/102 Y-clearance protection is latched"
+                )
+                return
             self._ensure_worker()
 
     def _ensure_worker(self) -> None:
@@ -794,11 +1709,26 @@ class CosmeticBoxSingleArmNode(Node):
     def _cycle_worker(self) -> None:
         try:
             with self.action_lock:
+                self._wait_for_secondary_y_clearance("startup motion")
                 self._move_startup_and_open(require_cycle_active=True)
                 cycle_index = 0
                 while self.running and self.cycle_enabled:
                     cycle_index += 1
                     self._begin_cycle_timing(f"continuous-{cycle_index}")
+                    # Do not let YOLO/SAM2 lock onto a box while 102 is still
+                    # carrying or releasing it.  Waiting on the already-open
+                    # read-only 102 feedback connection is cheap and avoids a
+                    # slow discard/reacquire cycle after the target is placed.
+                    try:
+                        with self._timed_stage("prevision_secondary_clearance"):
+                            self._wait_for_secondary_y_clearance("vision capture")
+                    except SecondaryClearanceRetry as exc:
+                        if not self.running or not self.cycle_enabled:
+                            self._finish_cycle_timing("cancelled")
+                            break
+                        self._publish_status(str(exc))
+                        self._finish_cycle_timing("prevision_secondary_clearance_retry")
+                        continue
                     self._publish_status(f"cycle {cycle_index}: detecting minimum-camera-X box")
                     with self._timed_stage("vision_detection"):
                         target_bundle = self._request_vision_target()
@@ -812,6 +1742,16 @@ class CosmeticBoxSingleArmNode(Node):
                     target_pose, width_m, height_m, length_m = target_bundle
                     try:
                         self._execute_one_cycle(target_pose, width_m, height_m, length_m)
+                    except SecondaryClearanceRetry as exc:
+                        if not self.running or not self.cycle_enabled:
+                            self._finish_cycle_timing("cancelled")
+                            break
+                        self._publish_status(str(exc))
+                        delay = max(0.1, float(self.get_parameter("vision_retry_delay_s").value))
+                        with self._timed_stage("secondary_clearance_retry_delay"):
+                            time.sleep(delay)
+                        self._finish_cycle_timing("secondary_clearance_retry")
+                        continue
                     except RecoverableGraspError as exc:
                         with self._timed_stage("grasp_failure_recovery"):
                             self._recover_failed_grasp_for_retry(exc)
@@ -843,6 +1783,8 @@ class CosmeticBoxSingleArmNode(Node):
     ) -> None:
         self._publish_status("moving to startup joint")
         motion = self._motion_profile()
+        if require_cycle_active:
+            self._require_cycle_active("before startup joint motion")
         self.controller.move_joint(
             self._six_values("startup_joint"),
             speed=motion["return_startup_speed"],
@@ -852,11 +1794,54 @@ class CosmeticBoxSingleArmNode(Node):
             self._require_cycle_active("at startup joint")
         if open_gripper:
             self.gripper.set_force(int(self.get_parameter("dh_force").value))
-            self.gripper.open(wait=True)
+            self.gripper.open(
+                wait=True,
+                cancel_check=self._cycle_cancel_requested
+                if require_cycle_active
+                else None,
+            )
 
     def move_startup(self) -> None:
         """Always recover control, return to startup, and open the gripper."""
-        self.cycle_enabled = False
+        # This method is an explicit operator recovery request.  It overrides
+        # any pending post-retreat automatic continuous restart.
+        with self.secondary_safety_lock:
+            self.secondary_auto_resume_requested.clear()
+            self.cycle_enabled = False
+        if self.secondary_protective_stop_latched.is_set():
+            protective_m, _, _ = self._secondary_interlock_distances()
+            raise RuntimeError(
+                "startup motion refused while 101/102 Y-clearance protection "
+                f"is latched; wait for an idle gap of at least "
+                f"{protective_m * 1000.0:.1f}mm"
+            )
+        if bool(self.get_parameter("secondary_collision_check_enabled").value):
+            try:
+                measurement = self._read_secondary_y_clearance()
+            except Exception as exc:
+                raise RuntimeError(
+                    "startup motion refused because 102 safety feedback is unavailable: "
+                    f"{exc}"
+                ) from exc
+            protective_m, retreat_m, _ = self._secondary_interlock_distances()
+            gap_m = float(measurement["gap_y_m"])
+            if gap_m < protective_m:
+                emergency_detail = (
+                    "; the left-only emergency Y retreat will start"
+                    if gap_m < retreat_m
+                    else "; waiting for 102 to move away"
+                )
+                detail = (
+                    "startup motion refused by Y-clearance protection: "
+                    f"gap={gap_m * 1000.0:.1f}mm "
+                    f"< {protective_m * 1000.0:.1f}mm"
+                    f"{emergency_detail}"
+                )
+                self._latch_secondary_protective_stop(
+                    detail,
+                    self.controller.robot_mode,
+                )
+                raise RuntimeError(detail)
         self._publish_status("return-to-startup request accepted; cancelling the previous action")
 
         # Stop an active/paused command before waiting for the sequence lock.
@@ -927,19 +1912,31 @@ class CosmeticBoxSingleArmNode(Node):
         self._publish_status("robot error cleared")
 
     def stop_robot(self) -> None:
-        self.cycle_enabled = False
+        with self.secondary_safety_lock:
+            self.secondary_auto_resume_requested.clear()
+            self.cycle_enabled = False
         self.controller.stop_motion()
         self._publish_status("robot stopped; continuous cycle disabled")
 
     def start_continuous_cycle(self) -> None:
         if self.worker is not None and self.worker.is_alive():
             raise RuntimeError("cycle worker is already running")
-        self.cycle_enabled = True
+        with self.secondary_safety_lock:
+            if self.secondary_protective_stop_latched.is_set():
+                protective_m, _, _ = self._secondary_interlock_distances()
+                raise RuntimeError(
+                    "101/102 Y-clearance protection is latched; wait for an idle "
+                    f"gap of at least {protective_m * 1000.0:.1f}mm before restarting"
+                )
+            self.secondary_auto_resume_requested.clear()
+            self.cycle_enabled = True
         self._ensure_worker()
         self._publish_status("continuous cycle started")
 
     def stop_continuous_cycle(self) -> None:
-        self.cycle_enabled = False
+        with self.secondary_safety_lock:
+            self.secondary_auto_resume_requested.clear()
+            self.cycle_enabled = False
         self._publish_status("continuous cycle will stop after the current blocking motion")
 
     def sample_vision_only(self) -> tuple[TcpPose, float, float, float]:
@@ -959,10 +1956,19 @@ class CosmeticBoxSingleArmNode(Node):
     def execute_single_cycle(self) -> None:
         if self.worker is not None and self.worker.is_alive():
             raise RuntimeError("continuous cycle is running")
-        self.cycle_enabled = True
+        with self.secondary_safety_lock:
+            if self.secondary_protective_stop_latched.is_set():
+                protective_m, _, _ = self._secondary_interlock_distances()
+                raise RuntimeError(
+                    "101/102 Y-clearance protection is latched; wait for an idle "
+                    f"gap of at least {protective_m * 1000.0:.1f}mm before restarting"
+                )
+            self.secondary_auto_resume_requested.clear()
+            self.cycle_enabled = True
         try:
             with self.action_lock:
                 # 单轮流程开始前必须确保夹爪已经打开。
+                self._wait_for_secondary_y_clearance("single-cycle startup motion")
                 self._move_startup_and_open(require_cycle_active=True)
                 retry_limit = max(
                     0, int(self.get_parameter("single_cycle_grasp_retry_limit").value)
@@ -980,6 +1986,16 @@ class CosmeticBoxSingleArmNode(Node):
                     try:
                         self._execute_one_cycle(*result)
                         break
+                    except SecondaryClearanceRetry as exc:
+                        if not self.running or not self.cycle_enabled:
+                            self._finish_cycle_timing("cancelled")
+                            return
+                        self._publish_status(str(exc))
+                        delay = max(0.1, float(self.get_parameter("vision_retry_delay_s").value))
+                        with self._timed_stage("secondary_clearance_retry_delay"):
+                            time.sleep(delay)
+                        self._finish_cycle_timing("secondary_clearance_retry")
+                        continue
                     except RecoverableGraspError as exc:
                         grasp_failures += 1
                         with self._timed_stage("grasp_failure_recovery"):
@@ -1133,34 +2149,330 @@ class CosmeticBoxSingleArmNode(Node):
             + (second.y - first.y) ** 2
             + (second.z - first.z) ** 2
         )
-        angle_delta = max(
-            abs((second_angle - first_angle + 180.0) % 360.0 - 180.0)
-            for first_angle, second_angle in (
-                (first.rx, second.rx),
-                (first.ry, second.ry),
-                (first.rz, second.rz),
-            )
+        first_rotation = SciPyRot.from_euler(
+            "xyz", [first.rx, first.ry, first.rz], degrees=True
+        )
+        second_rotation = SciPyRot.from_euler(
+            "xyz", [second.rx, second.ry, second.rz], degrees=True
+        )
+        angle_delta = float(
+            np.rad2deg((first_rotation.inv() * second_rotation).magnitude())
         )
         return position_delta, angle_delta
 
-    def _latest_fresh_pregrasp_pose(self, previous_count: int) -> tuple[TcpPose, int, float]:
+    def _fresh_pregrasp_observations(
+        self,
+        previous_count: int,
+    ) -> tuple[list[PregraspObservation], float]:
+        """Return this attempt's fresh tracked poses without waiting for a frame."""
+
         with self.data_lock:
             current_count = self.pregrasp_pose_count
-            pose = self.latest_pregrasp_pose
-            received_at = self.latest_pregrasp_pose_received_at
-        age_s = time.monotonic() - received_at if received_at > 0.0 else float("inf")
+            observations = list(self.pregrasp_observations)
+        # ``previous_count`` delimits the current grasp attempt.  Even when a
+        # post-correction diagnostic refresh is requested without waiting for a
+        # new message, never mix observations from an earlier box/cycle.
+        if previous_count >= 0:
+            observations = [observation for observation in observations if observation.count > previous_count]
+        now_monotonic = time.monotonic()
         max_age_s = max(0.05, float(self.get_parameter("pregrasp_pose_max_age_s").value))
-        if pose is None or current_count <= previous_count or age_s > max_age_s:
+        observations = [
+            observation
+            for observation in observations
+            if now_monotonic - observation.received_at_monotonic <= max_age_s
+        ]
+        observations.sort(key=lambda observation: observation.frame_time_s)
+        latest_age_s = (
+            now_monotonic - observations[-1].received_at_monotonic
+            if observations
+            else float("inf")
+        )
+        if not observations:
             raise RecoverableGraspError(
                 stage="pregrasp revalidation",
                 message=(
                     "no fresh D405 pregrasp pose after reaching the safe hover "
-                    f"(new_samples={max(0, current_count - previous_count)}, age={age_s:.3f}s); "
+                    f"(new_samples={max(0, current_count - previous_count)}, age={latest_age_s:.3f}s); "
                     "will return to startup before descent"
                 ),
                 needs_vertical_retreat=False,
             )
-        return pose, current_count, age_s
+        return observations, latest_age_s
+
+    @staticmethod
+    def _pose_position(pose: TcpPose) -> np.ndarray:
+        return np.asarray([pose.x, pose.y, pose.z], dtype=np.float64)
+
+    @staticmethod
+    def _pose_rotation(pose: TcpPose) -> SciPyRot:
+        return SciPyRot.from_euler(
+            "xyz", [pose.rx, pose.ry, pose.rz], degrees=True
+        )
+
+    @staticmethod
+    def _mean_rotation(rotations: list[SciPyRot]) -> SciPyRot:
+        """Average quaternions while explicitly resolving their sign."""
+
+        if not rotations:
+            raise ValueError("Cannot average an empty rotation list")
+        quaternions = np.asarray([rotation.as_quat() for rotation in rotations], dtype=np.float64)
+        reference = quaternions[0]
+        signs = np.where((quaternions @ reference) < 0.0, -1.0, 1.0)
+        mean_quaternion = np.sum(quaternions * signs[:, None], axis=0)
+        norm = np.linalg.norm(mean_quaternion)
+        if norm <= 1e-9:
+            return rotations[0]
+        return SciPyRot.from_quat(mean_quaternion / norm)
+
+    @staticmethod
+    def _fit_pregrasp_xy_motion(
+        observations: list[PregraspObservation],
+    ) -> tuple[np.ndarray, float, float, float]:
+        """Fit XY velocity; return velocity, max residual, displacement, span."""
+
+        if len(observations) < 3:
+            return np.zeros(2, dtype=np.float64), float("inf"), 0.0, 0.0
+        times = np.asarray([observation.frame_time_s for observation in observations], dtype=np.float64)
+        positions = np.asarray(
+            [[observation.pose.x, observation.pose.y] for observation in observations],
+            dtype=np.float64,
+        )
+        relative_times = times - times[-1]
+        span_s = float(times[-1] - times[0])
+        if span_s < 0.10 or not np.all(np.isfinite(positions)):
+            return np.zeros(2, dtype=np.float64), float("inf"), 0.0, max(0.0, span_s)
+        design = np.column_stack((relative_times, np.ones(len(relative_times))))
+        coefficients, _, _, _ = np.linalg.lstsq(design, positions, rcond=None)
+        velocity = np.asarray(coefficients[0], dtype=np.float64)
+        fitted = design @ coefficients
+        residuals = np.linalg.norm(positions - fitted, axis=1)
+        displacement_m = float(np.linalg.norm(velocity * span_s))
+        return velocity, float(np.max(residuals)), displacement_m, span_s
+
+    def _estimate_pregrasp_target(
+        self,
+        reference: TcpPose,
+        observations: list[PregraspObservation],
+        now_s: float,
+        hover_reached_at_s: float,
+    ) -> dict[str, object]:
+        """Select a no-wait target from the latest near-hover measured consensus.
+
+        Eye-in-hand motion plus a small camera/feedback timestamp offset can look
+        exactly like a smooth target trajectory.  Such a trajectory must never
+        be extrapolated into a descent command.  A correction is accepted only
+        when the newest near-hover measurement is itself outside tolerance and
+        one or more immediately preceding measurements support that position.
+        """
+
+        recent = sorted(observations, key=lambda observation: observation.frame_time_s)[-8:]
+        consensus_radius_m = max(
+            0.002,
+            float(self.get_parameter("pregrasp_position_consensus_m").value),
+        )
+        consensus_samples = max(
+            2,
+            int(self.get_parameter("pregrasp_position_consensus_samples").value),
+        )
+        settled_speed_mps = max(
+            0.001,
+            float(self.get_parameter("pregrasp_settled_tcp_speed_mps").value),
+        )
+
+        # Frames immediately around completion are preferred.  The window is
+        # intentionally about one D405 period: this uses an already captured
+        # frame when the camera/robot callback phases do not line up, without
+        # inserting a settle sleep.
+        hover_frame_window_s = max(
+            0.08,
+            float(self.get_parameter("pregrasp_hover_frame_window_s").value),
+        )
+        near_hover = [
+            observation
+            for observation in recent
+            if observation.frame_time_s >= hover_reached_at_s - hover_frame_window_s
+        ]
+
+        def latest_suffix_consensus(
+            candidates: list[PregraspObservation],
+            require_settled: bool,
+        ) -> Optional[list[PregraspObservation]]:
+            """Return a consecutive consensus ending at the newest sample."""
+
+            if len(candidates) < consensus_samples:
+                return None
+            newest = candidates[-1]
+            newest_xy = np.asarray([newest.pose.x, newest.pose.y], dtype=np.float64)
+            members_reversed: list[PregraspObservation] = []
+            for observation in reversed(candidates):
+                if require_settled and (
+                    observation.tcp_linear_speed_mps is None
+                    or observation.tcp_linear_speed_mps > settled_speed_mps
+                ):
+                    break
+                observation_xy = np.asarray(
+                    [observation.pose.x, observation.pose.y], dtype=np.float64
+                )
+                if np.linalg.norm(observation_xy - newest_xy) > consensus_radius_m:
+                    break
+                members_reversed.append(observation)
+            if len(members_reversed) < consensus_samples:
+                return None
+            return list(reversed(members_reversed))
+
+        # Keep the old fit only as evidence in logs.  It is deliberately never
+        # used to choose or extrapolate a grasp point.
+        velocity_xy, residual_m, displacement_m, span_s = self._fit_pregrasp_xy_motion(recent)
+        _ = now_s
+        reference_xy = np.asarray([reference.x, reference.y], dtype=np.float64)
+        position_tolerance_m = max(
+            0.001,
+            float(self.get_parameter("pregrasp_position_tolerance_m").value),
+        )
+        consensus_members = None
+        position_mode = "initial-stable-protected"
+        selected_xy = reference_xy.copy()
+        latest_xy_delta_m = float("inf")
+        latest_speed_mps = None
+        if near_hover:
+            latest = near_hover[-1]
+            latest_xy = np.asarray([latest.pose.x, latest.pose.y], dtype=np.float64)
+            latest_xy_delta_m = float(np.linalg.norm(latest_xy - reference_xy))
+            latest_speed_mps = latest.tcp_linear_speed_mps
+            # A settled suffix has the best temporal quality.  If the feedback
+            # speed hint is unavailable or the last frame was captured during
+            # final deceleration, the same newest-ending measured consensus is
+            # still usable; unlike the old estimator it is never extrapolated.
+            consensus_members = latest_suffix_consensus(near_hover, require_settled=True)
+            if consensus_members is not None:
+                position_mode = "settled-hover-measured-consensus"
+            else:
+                consensus_members = latest_suffix_consensus(
+                    near_hover, require_settled=False
+                )
+                if consensus_members is not None:
+                    position_mode = "near-hover-measured-consensus"
+        if consensus_members is not None:
+            positions = np.asarray(
+                [[observation.pose.x, observation.pose.y] for observation in consensus_members],
+                dtype=np.float64,
+            )
+            selected_xy = np.median(positions, axis=0)
+            selected_delta_m = float(np.linalg.norm(selected_xy - reference_xy))
+            # The newest physical measurement is a mandatory gate.  This is
+            # what prevents an older moving-camera trend from outvoting a fresh
+            # frame that is already back at the original, correct box pose.
+            if (
+                latest_xy_delta_m <= position_tolerance_m
+                or selected_delta_m <= position_tolerance_m
+            ):
+                consensus_members = None
+                selected_xy = reference_xy.copy()
+                position_mode = "initial-stable-protected"
+
+        orientation_mode = "initial-stable-protected"
+        selected_rotation = self._pose_rotation(reference)
+        # Orientation is allowed to follow only when position evidence already
+        # says that the target moved.  A stationary target with a persistent
+        # but wrong OBB angle therefore cannot rewrite the TCP attitude.
+        position_evidence_for_orientation = (
+            consensus_members is not None
+            and float(np.linalg.norm(selected_xy - reference_xy))
+            > position_tolerance_m
+        )
+        if (
+            bool(self.get_parameter("pregrasp_live_orientation_enabled").value)
+            and position_evidence_for_orientation
+        ):
+            orientation_limit_deg = max(
+                1.0,
+                float(self.get_parameter("pregrasp_live_orientation_max_delta_deg").value),
+            )
+            orientation_required = max(
+                3,
+                int(self.get_parameter("pregrasp_orientation_consensus_samples").value),
+            )
+            orientation_spread_limit_deg = max(
+                0.5,
+                float(self.get_parameter("pregrasp_orientation_consensus_spread_deg").value),
+            )
+            orientation_candidates = []
+            reference_rotation = self._pose_rotation(reference)
+            reference_normal = reference_rotation.as_matrix()[:, 2]
+            for observation in consensus_members or []:
+                rotation = self._pose_rotation(observation.pose)
+                relative_angle_deg = float(
+                    np.rad2deg((reference_rotation.inv() * rotation).magnitude())
+                )
+                live_normal = rotation.as_matrix()[:, 2]
+                normal_angle_deg = float(
+                    np.rad2deg(
+                        np.arccos(
+                            np.clip(float(np.dot(reference_normal, live_normal)), -1.0, 1.0)
+                        )
+                    )
+                )
+                # A flat box may yaw in its plane, but a sudden normal change
+                # indicates an OBB flip/tilt and must not reach the TCP.
+                if relative_angle_deg <= orientation_limit_deg and normal_angle_deg <= 5.0:
+                    orientation_candidates.append((observation, rotation))
+            if len(orientation_candidates) >= orientation_required:
+                medoid_observation, _ = min(
+                    orientation_candidates,
+                    key=lambda candidate: sum(
+                        float(
+                            np.rad2deg(
+                                (candidate[1].inv() * other[1]).magnitude()
+                            )
+                        )
+                        for other in orientation_candidates
+                    ),
+                )
+                medoid_rotation = next(
+                    rotation
+                    for observation, rotation in orientation_candidates
+                    if observation is medoid_observation
+                )
+                consistent_rotations = [
+                    rotation
+                    for _, rotation in orientation_candidates
+                    if float(
+                        np.rad2deg((medoid_rotation.inv() * rotation).magnitude())
+                    ) <= orientation_spread_limit_deg
+                ]
+                if len(consistent_rotations) >= orientation_required:
+                    selected_rotation = self._mean_rotation(consistent_rotations)
+                    orientation_mode = "live-planar-consensus"
+
+        selected_rpy = selected_rotation.as_euler("xyz", degrees=True)
+        selected_pose = TcpPose(
+            float(selected_xy[0]),
+            float(selected_xy[1]),
+            reference.z,
+            float(selected_rpy[0]),
+            float(selected_rpy[1]),
+            float(selected_rpy[2]),
+        )
+        position_delta, angle_delta = self._pose_delta(reference, selected_pose)
+        return {
+            "pose": selected_pose,
+            "position_mode": position_mode,
+            "orientation_mode": orientation_mode,
+            "position_delta_m": float(position_delta),
+            "angle_delta_deg": float(angle_delta),
+            # Retained for compatibility with diagnostics.  Commanded target
+            # velocity is always zero because grasp positions are not predicted.
+            "velocity_xy_mps": np.zeros(2, dtype=np.float64),
+            "apparent_velocity_xy_mps": velocity_xy,
+            "motion_residual_m": float(residual_m),
+            "motion_displacement_m": float(displacement_m),
+            "motion_span_s": float(span_s),
+            "observation_count": len(recent),
+            "near_hover_count": len(near_hover),
+            "consensus_count": len(consensus_members or []),
+            "latest_xy_delta_m": float(latest_xy_delta_m),
+            "latest_tcp_speed_mps": latest_speed_mps,
+        }
 
     def _apply_grasp_z_safety(
         self,
@@ -1178,6 +2490,19 @@ class CosmeticBoxSingleArmNode(Node):
             corrected_z = minimum_safe_z
         return TcpPose(pose.x, pose.y, corrected_z, pose.rx, pose.ry, pose.rz)
 
+    @staticmethod
+    def _keep_reference_orientation(pose: TcpPose, reference: TcpPose) -> TcpPose:
+        """Keep position from ``pose`` while preserving a known-safe RPY."""
+
+        return TcpPose(
+            pose.x,
+            pose.y,
+            pose.z,
+            reference.rx,
+            reference.ry,
+            reference.rz,
+        )
+
     def _revalidate_target_at_hover(
         self,
         target: TcpPose,
@@ -1185,17 +2510,29 @@ class CosmeticBoxSingleArmNode(Node):
         z_offset_m: float,
         minimum_safe_z: float,
         previous_count: int,
+        hover_reached_at_s: float,
     ) -> TcpPose:
-        """Use the latest background-tracked target before any downward motion."""
+        """Use synchronized, consensus-filtered tracking before descent."""
 
-        live_pose, live_count, age_s = self._latest_fresh_pregrasp_pose(previous_count)
-        live_target = self._apply_grasp_z_safety(
-            live_pose,
+        observations, age_s = self._fresh_pregrasp_observations(previous_count)
+        raw_live_target = self._apply_grasp_z_safety(
+            observations[-1].pose,
             z_offset_m,
             minimum_safe_z,
             "live pregrasp",
         )
-        position_delta, angle_delta = self._pose_delta(target, live_target)
+        raw_position_delta, raw_angle_delta = self._pose_delta(target, raw_live_target)
+        estimate = self._estimate_pregrasp_target(
+            target,
+            observations,
+            time.time(),
+            hover_reached_at_s,
+        )
+        selected_target = estimate["pose"]
+        if not isinstance(selected_target, TcpPose):
+            raise RuntimeError("Pregrasp estimator returned an invalid TCP pose")
+        position_delta = float(estimate["position_delta_m"])
+        angle_delta = float(estimate["angle_delta_deg"])
         position_tolerance = max(
             0.001,
             float(self.get_parameter("pregrasp_position_tolerance_m").value),
@@ -1217,11 +2554,14 @@ class CosmeticBoxSingleArmNode(Node):
             0.005,
             float(self.get_parameter("pregrasp_min_hover_clearance_m").value),
         )
-        if current.z - live_target.z < min_hover_clearance:
+        # Clearance is checked against the already accepted target pose.  A
+        # noisy live depth sample must not create a new descent target or make
+        # the safety check depend on a different frame.
+        if current.z - target.z < min_hover_clearance:
             raise RecoverableGraspError(
                 stage="pregrasp revalidation",
                 message=(
-                    f"safe hover clearance is only {(current.z - live_target.z)*1000:.1f}mm, "
+                    f"safe hover clearance is only {(current.z - target.z)*1000:.1f}mm, "
                     f"below required {min_hover_clearance*1000:.1f}mm; "
                     "will return to startup before descent"
                 ),
@@ -1229,37 +2569,102 @@ class CosmeticBoxSingleArmNode(Node):
             )
         self.get_logger().info(
             f"Pregrasp target check: age={age_s*1000:.0f}ms, "
-            f"position_delta={position_delta*1000:.1f}mm, angle_delta={angle_delta:.1f}deg"
+            f"position_delta={raw_position_delta*1000:.1f}mm, "
+            f"angle_delta={raw_angle_delta:.1f}deg, "
+            f"selected={position_delta*1000:.1f}mm/{angle_delta:.1f}deg, "
+            f"position_source={estimate['position_mode']}, "
+            f"orientation_source={estimate['orientation_mode']}, "
+            f"samples={estimate['observation_count']}, "
+            f"near_hover={estimate['near_hover_count']}, "
+            f"consensus={estimate['consensus_count']}, "
+            f"apparent_track={estimate['motion_displacement_m']*1000:.1f}mm "
+            "(diagnostic-only)"
         )
 
-        if position_delta > max_correction or angle_delta > max_correction_angle:
+        unconfirmed_shift_limit = max(
+            position_tolerance,
+            float(
+                self.get_parameter("pregrasp_unconfirmed_shift_reject_m").value
+            ),
+        )
+        required_consensus = max(
+            1,
+            int(self.get_parameter("pregrasp_position_consensus_samples").value),
+        )
+        if (
+            raw_position_delta > unconfirmed_shift_limit
+            and int(estimate["consensus_count"]) < required_consensus
+        ):
+            raise RecoverableGraspError(
+                stage="pregrasp target identity",
+                message=(
+                    f"D405 target jumped {raw_position_delta*1000:.1f}mm but only "
+                    f"{int(estimate['consensus_count'])}/{required_consensus} "
+                    "near-hover samples agree; treating this as target loss or "
+                    "SAM mask drift and refusing descent"
+                ),
+                needs_vertical_retreat=False,
+            )
+
+        if not bool(self.get_parameter("pregrasp_use_live_pose_for_descent").value):
+            if raw_position_delta > max_correction:
+                self.get_logger().warning(
+                    f"Live pregrasp position differs by {raw_position_delta*1000:.1f}mm; "
+                    f"outside the {max_correction*1000:.1f}mm diagnostic range, "
+                    "live correction is disabled; protected descent pose remains active"
+                )
+            return target
+
+        # A 90-degree OBB axis flip is an orientation-quality failure, not a
+        # reason to reject a valid translational target.  The estimator already
+        # falls back to the initial orientation in that case.
+        if position_delta > max_correction:
             raise RecoverableGraspError(
                 stage="pregrasp revalidation",
                 message=(
                     f"D405 target change is outside safe hover-correction limits: "
                     f"position_delta={position_delta*1000:.1f}mm/{max_correction*1000:.1f}mm, "
-                    f"angle_delta={angle_delta:.1f}deg/{max_correction_angle:.1f}deg; "
+                    f"orientation_delta={angle_delta:.1f}deg/{max_correction_angle:.1f}deg; "
                     "will return to startup before descent"
                 ),
                 needs_vertical_retreat=False,
             )
 
-        if position_delta <= position_tolerance and angle_delta <= angle_tolerance:
-            # Even without a correction move, use the latest pose for the final
-            # descent so a small drift is not discarded.
-            return live_target
+        if position_delta <= position_tolerance:
+            if angle_delta > angle_tolerance:
+                # Translation is already within the safe grasp tolerance.  An
+                # orientation-only update is not worth a second hover motion;
+                # retain the first stable attitude so a 90-degree OBB flip
+                # cannot make the TCP descend diagonally into a flat box.
+                self.get_logger().warning(
+                    f"Ignoring orientation-only live pregrasp change {angle_delta:.1f}deg; "
+                    "translation is stable, keeping the initial grasp attitude"
+                )
+                return target
+            # Never hide a small XY adjustment inside the vertical descent.
+            # Changes within tolerance use the original stable target exactly.
+            return target
+
+        if angle_delta > max_correction_angle:
+            self.get_logger().warning(
+                f"Ignoring live pregrasp orientation change {angle_delta:.1f}deg; "
+                f"safe limit is {max_correction_angle:.1f}deg"
+            )
+            selected_target = self._keep_reference_orientation(selected_target, target)
+            position_delta, _ = self._pose_delta(target, selected_target)
 
         self._publish_status(
-            f"pregrasp target shifted {position_delta*1000:.1f}mm/{angle_delta:.1f}deg; "
-            "correcting at safe hover"
+            f"pregrasp target corrected by {position_delta*1000:.1f}mm; "
+            f"source={estimate['position_mode']}, "
+            "using synchronized target at safe hover"
         )
         correction_hover = TcpPose(
-            live_target.x,
-            live_target.y,
+            selected_target.x,
+            selected_target.y,
             current.z,
-            live_target.rx,
-            live_target.ry,
-            live_target.rz,
+            selected_target.rx,
+            selected_target.ry,
+            selected_target.rz,
         )
         try:
             self.controller.inverse_kinematics(
@@ -1286,34 +2691,15 @@ class CosmeticBoxSingleArmNode(Node):
                 needs_vertical_retreat=False,
             ) from exc
 
-        # A second update must arrive during the correction. If the object keeps
-        # moving or tracking is lost, do not chase it downward; recover to startup.
-        corrected_pose, _, corrected_age_s = self._latest_fresh_pregrasp_pose(live_count)
-        corrected_target = self._apply_grasp_z_safety(
-            corrected_pose,
-            z_offset_m,
-            minimum_safe_z,
-            "corrected live pregrasp",
+        # The correction already moved to the latest measured consensus at a
+        # safe Z.  Do not reinterpret frames captured during this correction:
+        # they contain the same moving-camera timestamp error that caused the
+        # observed 16--25 mm overshoots.  Descend vertically at the measured XY.
+        corrected_target = selected_target
+        self._publish_status(
+            f"pregrasp correction complete; descending with measured target "
+            f"({corrected_target.x*1000:.1f},{corrected_target.y*1000:.1f})mm"
         )
-        post_correction_delta, post_correction_angle = self._pose_delta(
-            live_target,
-            corrected_target,
-        )
-        if (
-            post_correction_delta > position_tolerance
-            or post_correction_angle > angle_tolerance
-        ):
-            raise RecoverableGraspError(
-                stage="pregrasp revalidation",
-                message=(
-                    f"D405 target was not stable after hover correction: "
-                    f"delta={post_correction_delta*1000:.1f}mm/{post_correction_angle:.1f}deg, "
-                    f"age={corrected_age_s*1000:.0f}ms; "
-                    "will return to startup before descent"
-                ),
-                needs_vertical_retreat=False,
-            )
-        self._publish_status("pregrasp target confirmed after hover correction")
         return corrected_target
 
     def _execute_one_cycle(self, target: TcpPose, width_m: float, height_m: float, length_m: float) -> None:
@@ -1356,6 +2742,14 @@ class CosmeticBoxSingleArmNode(Node):
             )
             current = self._current_command_pose()
             planar = TcpPose(target.x, target.y, current.z, target.rx, target.ry, target.rz)
+        # The point-cloud handoff check is not enough when 102's TCP is not
+        # visible in the D405 cloud.  Check the actual 102 feedback immediately
+        # before issuing 101's approach command.  A blocked check leaves 101
+        # at startup; once 102 retreats past the threshold, this same cycle
+        # continues without manual intervention.
+        with self._timed_stage("secondary_y_clearance"):
+            self._wait_for_secondary_y_clearance("move-above")
+        self._require_cycle_active("immediately before move-above")
         self._publish_status("moving above selected box")
         with self.data_lock:
             pregrasp_reference_count = self.pregrasp_pose_count
@@ -1368,11 +2762,16 @@ class CosmeticBoxSingleArmNode(Node):
                 tool_index=int(self.get_parameter("command_tool_index").value),
             )
         self._require_cycle_active("after move-above")
+        # Keep the same host-wall-clock domain as the D405 frame stamps.  The
+        # revalidation stage does not sleep for a settle period; it simply
+        # prefers any already-arrived frames captured after this instant.
+        hover_reached_at_s = time.time()
         with self._timed_stage("gripper_preshape_wait"):
             self.gripper.wait_until_stopped(
                 timeout_s=float(self.get_parameter("dh_timeout_s").value),
                 target_position=pre_shape_position,
                 initial_position=pre_shape_initial,
+                cancel_check=self._cycle_cancel_requested,
             )
         self._require_cycle_active("after confirming gripper pre-shape")
         with self._timed_stage("pregrasp_revalidation"):
@@ -1382,8 +2781,10 @@ class CosmeticBoxSingleArmNode(Node):
                 z_offset_m,
                 minimum_safe_z,
                 pregrasp_reference_count,
+                hover_reached_at_s,
             )
         self._publish_status("descending TCP tip to 75% box height")
+        self._require_cycle_active("immediately before grasp descent")
         with self._timed_stage("grasp_descend"):
             self.controller.move_linear_tcp(
                 target,
@@ -1396,12 +2797,16 @@ class CosmeticBoxSingleArmNode(Node):
         self._publish_status("at grasp depth; closing gripper now")
         with self._timed_stage("gripper_close"):
             self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
-            self.gripper.close(wait=True)
+            self.gripper.close(
+                wait=True,
+                cancel_check=self._cycle_cancel_requested,
+            )
         self._require_cycle_active("after gripper close")
         with self._timed_stage("grasp_confirm"):
-            self._confirm_grasp_before_lift(max_opening)
+            self._confirm_grasp_before_lift(max_opening, width_m)
 
         with self._timed_stage("grasp_lift"):
+            self._require_cycle_active("immediately before grasp lift")
             self._relative_user_move(
                 z=float(self.get_parameter("grasp_lift_m").value),
                 label="lifting grasp",
@@ -1416,6 +2821,7 @@ class CosmeticBoxSingleArmNode(Node):
         # 运动前开启窗口，否则这条比“到达中转点”早几十毫秒的消息会被回调丢弃。
         self._reset_barcode_window()
         self._publish_status("moving to barcode transfer joint; barcode window armed")
+        self._require_cycle_active("immediately before barcode transfer motion")
         with self._timed_stage("move_transfer"):
             self.controller.move_joint(
                 self._six_values("transfer_joint"),
@@ -1505,12 +2911,18 @@ class CosmeticBoxSingleArmNode(Node):
                 timeout_s=float(self.get_parameter("dh_timeout_s").value),
                 target_position=release_position,
                 initial_position=current_position,
+                cancel_check=self._cycle_cancel_requested,
             )
         self._publish_status("placed box; returning to startup")
 
     def _require_cycle_active(self, stage: str) -> None:
         if not self.running or not self.cycle_enabled:
             raise RuntimeError(f"Cycle cancelled by operator at {stage}; no subsequent motion was issued")
+
+    def _cycle_cancel_requested(self) -> bool:
+        """Let gripper waits release the robot sequence lock after a trip."""
+
+        return not self.running or not self.cycle_enabled
 
     @staticmethod
     def _grip_state_text(state: int) -> str:
@@ -1526,13 +2938,25 @@ class CosmeticBoxSingleArmNode(Node):
         self._publish_status(
             f"recoverable grasp failure at {exc.stage}: {exc}; returning to startup"
         )
+        gripper_opened_for_retreat = False
         if exc.needs_vertical_retreat:
+            # A false GRIPPED state can mean one or both fingers are resting on
+            # the box top.  Open in place before the vertical escape so the
+            # recovery cannot drag or launch the box.
+            self.gripper.open(
+                wait=True,
+                cancel_check=self._cycle_cancel_requested,
+            )
+            gripper_opened_for_retreat = True
             self._relative_user_move(
                 z=float(self.get_parameter("grasp_lift_m").value),
-                label="empty grasp at lowered TCP; retreating vertically before startup",
+                label="invalid grasp released; retreating vertically before startup",
             )
             self._require_cycle_active("after empty-grasp vertical retreat")
-        self._move_startup_and_open(require_cycle_active=True)
+        self._move_startup_and_open(
+            require_cycle_active=True,
+            open_gripper=not gripper_opened_for_retreat,
+        )
 
     def _validate_grasp_feedback(self, stage: str, max_opening: float) -> None:
         opening_m = self.gripper.read_position() * max_opening
@@ -1547,6 +2971,7 @@ class CosmeticBoxSingleArmNode(Node):
                     timeout_s=wait_s,
                     target_position=0.0,
                     initial_position=opening_m / max(1e-9, max_opening),
+                    cancel_check=self._cycle_cancel_requested,
                 )
             except TimeoutError:
                 pass
@@ -1575,7 +3000,11 @@ class CosmeticBoxSingleArmNode(Node):
                 f"state={grip_state} ({state_text}), opening={opening_m:.4f}m"
             )
 
-    def _confirm_grasp_before_lift(self, max_opening: float) -> None:
+    def _confirm_grasp_before_lift(
+        self,
+        max_opening: float,
+        commanded_preshape_m: float,
+    ) -> None:
         """Keep the TCP stationary until the DH gripper is stably holding an object."""
         settle_s = max(0.0, float(self.get_parameter("grasp_close_settle_s").value))
         required = max(1, int(self.get_parameter("grasp_confirm_samples").value))
@@ -1590,6 +3019,10 @@ class CosmeticBoxSingleArmNode(Node):
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
         minimum_opening = float(self.get_parameter("grasp_success_min_opening_m").value)
+        minimum_closure = max(
+            0.0,
+            float(self.get_parameter("grasp_min_closure_from_preshape_m").value),
+        )
         confirmed = 0
         last_state = GRIP_IN_MOTION
         last_opening_m = 0.0
@@ -1598,11 +3031,19 @@ class CosmeticBoxSingleArmNode(Node):
             last_opening_m = self.gripper.read_position() * max_opening
             last_state = self.gripper.read_grip_state()
             state_text = self._grip_state_text(last_state)
+            closure_m = max(0.0, commanded_preshape_m - last_opening_m)
             self._publish_status(
                 f"grasp confirmation {sample_index + 1}/{required}: "
-                f"state={last_state} ({state_text}), opening={last_opening_m*1000:.1f}mm"
+                f"state={last_state} ({state_text}), opening={last_opening_m*1000:.1f}mm, "
+                f"closure_from_preshape={closure_m*1000:.1f}mm"
             )
-            if last_state == GRIP_GRIPPED and last_opening_m > minimum_opening:
+            if grasp_feedback_is_plausible(
+                last_state,
+                last_opening_m,
+                commanded_preshape_m,
+                minimum_opening,
+                minimum_closure,
+            ):
                 confirmed += 1
             else:
                 confirmed = 0
@@ -1616,7 +3057,10 @@ class CosmeticBoxSingleArmNode(Node):
         detail = (
             f"Grasp not stable before lift: confirmed={confirmed}/{required}, "
             f"state={last_state} ({self._grip_state_text(last_state)}), "
-            f"opening={last_opening_m:.4f}m; TCP remains at grasp depth"
+            f"opening={last_opening_m:.4f}m, "
+            f"closure_from_preshape="
+            f"{max(0.0, commanded_preshape_m-last_opening_m):.4f}m "
+            f"(required>={minimum_closure:.4f}m); TCP remains at grasp depth"
         )
         if bool(self.get_parameter("grasp_feedback_required").value):
             raise RecoverableGraspError(
@@ -2444,7 +3888,23 @@ class CosmeticBoxSingleArmNode(Node):
         self.shutting_down = True
         self.running = False
         self.cycle_enabled = False
+        self.secondary_auto_resume_requested.clear()
+        self.secondary_safety_shutdown.set()
         try:
+            safety_thread = self.secondary_safety_thread
+            if safety_thread is not None and safety_thread is not threading.current_thread():
+                safety_thread.join(timeout=6.0)
+                if safety_thread.is_alive():
+                    self.get_logger().warning(
+                        "Secondary motion safety thread did not exit before shutdown"
+                    )
+            resume_thread = self.secondary_resume_thread
+            if resume_thread is not None and resume_thread is not threading.current_thread():
+                resume_thread.join(timeout=2.0)
+                if resume_thread.is_alive():
+                    self.get_logger().warning(
+                        "Secondary automatic restart thread did not exit before shutdown"
+                    )
             # Close Modbus without issuing DHGripper.disconnect(), which would
             # open the gripper and could drop an object during a fault shutdown.
             if self.gripper.modbus_index is not None and self.controller.dashboard is not None:
@@ -2452,6 +3912,7 @@ class CosmeticBoxSingleArmNode(Node):
                     self.controller.dashboard.ModbusClose(self.gripper.modbus_index)
                 finally:
                     self.gripper.modbus_index = None
+            self._drop_secondary_safety_feedback()
             self.controller.disconnect()
         finally:
             super().destroy_node()
@@ -2600,6 +4061,14 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.grasp_lift = self._new_double(float(self.node.get_parameter("grasp_lift_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
         self.place_release_clearance = self._new_double(float(self.node.get_parameter("place_release_clearance_m").value) * 1000.0, 1.0, 50.0, 1, 1.0)
         self.grasp_close_settle = self._new_double(float(self.node.get_parameter("grasp_close_settle_s").value), 0.0, 5.0, 2, 0.1)
+        self.grasp_min_closure = self._new_double(
+            float(self.node.get_parameter("grasp_min_closure_from_preshape_m").value)
+            * 1000.0,
+            0.0,
+            30.0,
+            1,
+            0.5,
+        )
         self.grasp_feedback_wait = self._new_double(float(self.node.get_parameter("grasp_feedback_wait_s").value), 0.1, 5.0, 2, 0.1)
         self.grasp_retry_limit = QSpinBox(); self.grasp_retry_limit.setRange(0, 20); self.grasp_retry_limit.setValue(int(self.node.get_parameter("single_cycle_grasp_retry_limit").value))
         self.feedback_required = QCheckBox("启用空抓检测与自动重试")
@@ -2629,6 +4098,7 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("抓取后抬升 mm", self.grasp_lift)
         form.addRow("放置释放额外开度 mm", self.place_release_clearance)
         form.addRow("闭合后原地确认秒", self.grasp_close_settle)
+        form.addRow("有效抓取最小闭合量 mm", self.grasp_min_closure)
         form.addRow("运动状态反馈等待秒", self.grasp_feedback_wait)
         form.addRow("单轮空抓重试次数", self.grasp_retry_limit)
         form.addRow("夹爪反馈保护", self.feedback_required)
@@ -2728,7 +4198,22 @@ class CosmeticBoxControlWindow(QMainWindow):
         grid.addWidget(tip, 5, 0, 1, 2)
         layout.addWidget(box)
 
-    def apply_parameters(self) -> None:
+    def apply_parameters(self) -> bool:
+        if self.node.secondary_retreat_active.is_set():
+            self.cycle_status_label.setText(
+                "101 正在执行安全退让，参数将在退让完成后才能应用"
+            )
+            return False
+        try:
+            robot_mode = self.node.controller.robot_mode
+        except Exception as exc:
+            self.cycle_status_label.setText(f"无法确认机械臂状态，参数未应用: {exc}")
+            return False
+        if robot_mode in (7, 8, 10):
+            self.cycle_status_label.setText(
+                "101 正在运动或暂停，参数未应用；请先停止并等待机械臂空闲"
+            )
+            return False
         startup = [field.value() for field in self.joint_fields["startup_joint"]]
         transfer = [field.value() for field in self.joint_fields["transfer_joint"]]
         scan_xyz = [field.value() / 1000.0 for field in self.pose_fields["scan_exit_user_xyz"]]
@@ -2760,6 +4245,10 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("grasp_lift_m", value=self.grasp_lift.value() / 1000.0),
             Parameter("place_release_clearance_m", value=self.place_release_clearance.value() / 1000.0),
             Parameter("grasp_close_settle_s", value=self.grasp_close_settle.value()),
+            Parameter(
+                "grasp_min_closure_from_preshape_m",
+                value=self.grasp_min_closure.value() / 1000.0,
+            ),
             Parameter("grasp_feedback_wait_s", value=self.grasp_feedback_wait.value()),
             Parameter("single_cycle_grasp_retry_limit", value=self.grasp_retry_limit.value()),
             Parameter("grasp_feedback_required", value=self.feedback_required.isChecked()),
@@ -2784,21 +4273,62 @@ class CosmeticBoxControlWindow(QMainWindow):
         failures = [result.reason for result in results if not result.successful]
         if failures:
             self.cycle_status_label.setText("参数应用失败: " + "; ".join(failures))
-            return
-        self.node.controller.enable_single_command_motion_scaling()
+            return False
+        try:
+            # AccJ/VelJ/AccL/VelL are controller-global settings and some Nova5
+            # firmware rejects them with -1 while MoveJog is active.  Recheck
+            # immediately before issuing them and turn a race into a clean GUI
+            # refusal instead of an uncaught Qt callback traceback.
+            if (
+                self.node.secondary_retreat_active.is_set()
+                or self.node.controller.robot_mode in (7, 8, 10)
+            ):
+                self.cycle_status_label.setText(
+                    "101 在参数应用期间开始运动，控制器运动参数未写入；空闲后请重试"
+                )
+                return False
+            self.node.controller.enable_single_command_motion_scaling()
+        except Exception as exc:
+            message = f"控制器运动参数应用失败: {exc}"
+            self.cycle_status_label.setText(message)
+            self.node.get_logger().warning(message)
+            return False
         self.node._log_effective_motion_profile()
         self._refresh_effective_motion_label()
         self.node._publish_status("GUI parameters applied")
+        return True
 
     def apply_and_run(self, function) -> None:
-        self.apply_parameters()
+        if not self.apply_parameters():
+            return
         self.run_action(function)
 
     def apply_and_run_recovery(self, function) -> None:
         if self.recovery_worker is not None and self.recovery_worker.isRunning():
             self.cycle_status_label.setText("回初始位请求已经执行中，请等待机械臂恢复")
             return
-        self.apply_parameters()
+        if self.node.secondary_retreat_active.is_set():
+            self.cycle_status_label.setText(
+                "101 正在自动退让到 200 mm，无需再次点击回初始位；请等待退让完成"
+            )
+            return
+        if self.node.secondary_protective_stop_latched.is_set():
+            protective_m, _, _ = self.node._secondary_interlock_distances()
+            self.cycle_status_label.setText(
+                "Y 间距保护仍处于闭锁状态；请等待间距恢复到 "
+                f"{protective_m * 1000.0:.1f} mm 后再回初始位"
+            )
+            return
+        ordinary_action_running = (
+            (self.worker is not None and self.worker.isRunning())
+            or (self.node.worker is not None and self.node.worker.is_alive())
+            or self.node.controller.robot_mode in (7, 8, 10)
+        )
+        # Recovery is allowed to interrupt an ordinary action.  In that case
+        # retain the already-applied profile: writing global AccJ/VelJ settings
+        # while motion is active is rejected by the controller.
+        if not ordinary_action_running and not self.apply_parameters():
+            return
         self.run_recovery_action(function)
 
     def run_action(self, function) -> None:
@@ -2844,15 +4374,25 @@ class CosmeticBoxControlWindow(QMainWindow):
             else:
                 self.cycle_status_label.setText("操作完成")
         else:
-            self.cycle_status_label.setText("操作失败: " + message)
-            self.node.get_logger().error("GUI action failed: " + message)
+            expected_stop = (
+                "cancelled by Stop" in message
+                or "cancelled by safety interlock" in message
+                or "Y-clearance protection" in message
+            )
+            if expected_stop:
+                self.cycle_status_label.setText("操作已由停止/安全联锁取消: " + message)
+                self.node.get_logger().warning("GUI action cancelled: " + message)
+            else:
+                self.cycle_status_label.setText("操作失败: " + message)
+                self.node.get_logger().error("GUI action failed: " + message)
         self.refresh_status()
 
     def start_continuous(self) -> None:
         if self.worker is not None and self.worker.isRunning():
             self.cycle_status_label.setText("当前界面操作尚未完成，不能启动连续循环")
             return
-        self.apply_parameters()
+        if not self.apply_parameters():
+            return
         try:
             self.node.start_continuous_cycle()
         except Exception as exc:

@@ -59,3 +59,4 @@ calibration/calib_imgs/
 
 # dul_cam runtime artifacts
 dul_cam/__pycache__/
+dul_cam/d405_fault_snapshots/

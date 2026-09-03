@@ -30,6 +30,7 @@ import pyrealsense2 as rs
 import rclpy
 import torch
 import yaml
+from builtin_interfaces.msg import Time as RosTime
 from geometry_msgs.msg import PoseStamped
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from scipy.spatial.transform import Rotation as SciPyRot
@@ -38,6 +39,13 @@ from std_msgs.msg import Bool, Float32, String
 
 from dobot_nova5_driver.handoff_clearance import (
     evaluate_camera_right_handoff_clearance,
+    evaluate_gripper_side_clearance,
+)
+from dobot_nova5_driver.gripper_width_policy import select_gripper_width
+from dobot_nova5_driver.top_surface_geometry import (
+    fit_top_surface_axes,
+    normalized_plane,
+    select_top_plane_candidate,
 )
 
 SAM2_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "SAM2_streaming")
@@ -56,7 +64,7 @@ CAMERA_SERIAL = "409122274792"
 FFS_MODEL_DIR = os.path.join(FFS_DIR, "weights/23-36-37/model_best_bp2_serialize.pth")
 SAM2_CHECKPOINT = os.path.join(SAM2_DIR, "checkpoints/sam2.1/sam2.1_hiera_small.pt")
 SAM2_CFG = "sam2.1/sam2.1_hiera_s.yaml"
-YOLO_MODEL_PATH = "/home/zdh/yolo_one/yolo_train_web_github/outputs/train/obb_demo-8/weights/best.pt"
+YOLO_MODEL_PATH = "/home/zdh/yolo_one/yolo_train_web_github/outputs/train/obb_demo-10/weights/best.pt"
 VALID_ITERS = 6
 MAX_DISP = 192
 ZNEAR = 0.16
@@ -86,17 +94,29 @@ TABLE_RING_KERNEL_PX = 41
 TABLE_EXCLUSION_KERNEL_PX = 7
 MIN_TABLE_PLANE_POINTS = 30
 TABLE_RANSAC_DISTANCE_M = 0.003
+TOP_TABLE_NORMAL_ALIGNMENT = 0.90
+MIN_TOP_CAMERA_FACING_COS = 0.55
+TOP_SURFACE_DISTANCE_M = 0.006
+MIN_TOP_SURFACE_POINTS = 20
+TOP_NEAR_SQUARE_AXIS_RATIO = 1.25
 HEIGHT_PERCENTILE = 98.0
 MIN_BOX_HEIGHT_M = 0.005
 MAX_BOX_HEIGHT_M = 0.150
 GRASP_DEPTH_RATIO = 0.75
 GRIP_CLEARANCE_M = 0.020
 MAX_GRIPPER_OPENING_M = 0.095
+# 宽目标下降时需要更大的单侧余量。实测短边严格大于 60 mm 时直接
+# 全开；近方形目标也全开，避免长短轴接近时发生 90 度标签互换而低估宽度。
+GRIPPER_FULL_OPEN_WIDTH_THRESHOLD_M = 0.060
+GRIPPER_NEAR_SQUARE_ASPECT_RATIO = 1.20
 OBB_SMOOTH = 0.65
 # 连续两帧有效几何结果用于机器人端稳定性检查；相比原来的三帧少一次
 # FFS/SAM2/平面拟合，但不退化成不做跨帧验证的单帧抓取。
 PUBLISH_FRAMES_BEFORE_RESET = 2
 MAX_TRACKING_FRAMES_WITHOUT_HEIGHT = 18
+# 右臂遮挡阶段已经出现过 BLOCKED 时，继续等待 18 帧只会保留已经漂移的
+# SAM2 轨迹。连续少量无高度帧后直接在视觉节点内部重新检测。
+HANDOFF_FAST_REACQUIRE_INVALID_HEIGHT_FRAMES = 4
 YOLO_BOX_DISPLAY_TTL_S = 0.8
 
 # 102 从 D405 图像右侧把盒子放到交接区并沿右侧退出。101 在发布抓取
@@ -112,6 +132,16 @@ HANDOFF_CLEARANCE_CHECK_HEIGHT_M = 0.180
 HANDOFF_CLEARANCE_VOXEL_SIZE_M = 0.015
 HANDOFF_CLEARANCE_MIN_CLUSTER_POINTS = 30
 
+# 在发布抓取目标之前，同时检查夹爪两根手指各自的垂直下探通道。
+# 任意一侧出现连续点簇都禁止放行；SAM 目标点显式剔除，桌面由高度边界排除。
+GRIPPER_SIDE_FINGER_SPAN_M = 0.060
+GRIPPER_SIDE_TARGET_EXCLUSION_M = 0.004
+GRIPPER_SIDE_CHECK_DEPTH_M = 0.030
+GRIPPER_SIDE_GRASP_BELOW_CENTER_FRACTION = 0.25
+GRIPPER_SIDE_VERTICAL_MARGIN_ABOVE_M = 0.080
+GRIPPER_SIDE_VOXEL_SIZE_M = 0.010
+GRIPPER_SIDE_MIN_CLUSTER_POINTS = 20
+
 # Camera/panel parameters
 AUTO_EXPOSURE = True
 MANUAL_EXPOSURE = 11000.0
@@ -121,7 +151,7 @@ AUTO_WHITE_BALANCE = True
 # 本次触发最终得到稳定抓取目标时，再保存两张稳定目标 RGB 帧。
 # 同一初始位的连续无目标重试不会重复保存；完成一次抓取后下次回到初始位会重新保存。
 # 设置为 False 时不保存，也不会自动创建 d405_output 文件夹。
-SAVE_INITIAL_POSITION_FRAMES = True
+SAVE_INITIAL_POSITION_FRAMES = False
 INITIAL_POSITION_FRAME_COUNT = 2
 STABLE_TARGET_FRAME_COUNT = 2
 D405_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "d405_output")
@@ -196,7 +226,17 @@ cloud_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local
 # 机器人端下一次视觉请求的 2 帧稳定性计数。
 pregrasp_pose_pub = ros_node.create_publisher(PoseStamped, PREGRASP_POSE_TOPIC, 10)
 
+# RealSense timestamps are milliseconds.  SYSTEM/GLOBAL timestamps are already
+# Unix-like; HARDWARE timestamps are mapped to the host Unix clock using a
+# rolling arrival offset.  Dobot feedback ``TimeStamp`` is also Unix-ms, so
+# both streams can be matched by capture time.  This adds no frame wait or
+# processing stage.
+camera_clock_offset_samples = deque(maxlen=30)
+camera_timestamp_source = "host_return"
+camera_timestamp_logged = False
+
 trigger_requested = False
+fast_reacquire_requested = False
 quit_requested = False
 reset_requested = False
 clear_target_display_requested = False
@@ -516,6 +556,19 @@ def build_fault_panel_info(
                 "handoff_clearance_passed": bool(handoff_clearance_passed),
                 "handoff_candidate_points": int(last_handoff_candidate_points),
                 "handoff_cluster_points": int(last_handoff_cluster_points),
+                "gripper_negative_side_points": int(last_gripper_negative_side_points),
+                "gripper_positive_side_points": int(last_gripper_positive_side_points),
+                "gripper_negative_side_cluster": int(last_gripper_negative_side_cluster),
+                "gripper_positive_side_cluster": int(last_gripper_positive_side_cluster),
+                "gripper_negative_target_excluded": int(
+                    last_gripper_negative_target_excluded
+                ),
+                "gripper_positive_target_excluded": int(
+                    last_gripper_positive_target_excluded
+                ),
+                "gripper_negative_side_clear": bool(last_gripper_negative_side_clear),
+                "gripper_positive_side_clear": bool(last_gripper_positive_side_clear),
+                "handoff_reacquire_required": bool(handoff_reacquire_required),
                 "handoff_clear_streak": int(handoff_clear_streak),
                 "handoff_required_clear_frames": int(HANDOFF_CLEARANCE_CLEAR_FRAMES),
                 "height_m": last_height_m,
@@ -523,6 +576,9 @@ def build_fault_panel_info(
                 "side_planes": int(last_side_planes),
                 "side_points": int(last_side_points),
                 "height_evidence": str(last_height_evidence_mode),
+                "top_plane_selection": str(last_top_plane_selection),
+                "top_surface_points": int(last_top_surface_points),
+                "grasp_axis_source": str(last_grasp_axis_source),
                 "target_ready": bool(locked_target_ready),
                 "target_id": int(locked_target_id),
                 "target_camera_x_m": locked_target_camera_x,
@@ -539,6 +595,7 @@ def build_fault_panel_info(
                 "resolution": [IMG_WIDTH, IMG_HEIGHT],
                 "pcd_stride": int(PCD_STRIDE),
                 "frame_stamp_ns": frame_stamp_ns,
+                "timestamp_source": camera_timestamp_source,
             },
             "scanner": {
                 "latest_barcode": barcode_value,
@@ -555,6 +612,9 @@ def build_fault_panel_info(
                 "grasp_depth_ratio": float(GRASP_DEPTH_RATIO),
                 "pregrasp_tracking_window_s": float(PREGRASP_TRACKING_WINDOW_S),
                 "handoff_clearance_enabled": bool(HANDOFF_CLEARANCE_ENABLED),
+                "gripper_side_min_cluster_points": int(
+                    GRIPPER_SIDE_MIN_CLUSTER_POINTS
+                ),
             },
         }
     )
@@ -717,6 +777,14 @@ def publish_handoff_clearance(
     candidate_points: int = 0,
     largest_cluster_points: int = 0,
     clear_streak: int = 0,
+    negative_side_points: int = 0,
+    positive_side_points: int = 0,
+    negative_side_cluster: int = 0,
+    positive_side_cluster: int = 0,
+    negative_target_excluded: int = 0,
+    positive_target_excluded: int = 0,
+    negative_side_clear: bool = False,
+    positive_side_clear: bool = False,
 ) -> None:
     """Publish a fail-closed handoff-zone state for monitoring and logging."""
 
@@ -732,6 +800,14 @@ def publish_handoff_clearance(
             "largest_cluster_points": int(largest_cluster_points),
             "clear_streak": int(clear_streak),
             "required_clear_frames": int(HANDOFF_CLEARANCE_CLEAR_FRAMES),
+            "negative_side_points": int(negative_side_points),
+            "positive_side_points": int(positive_side_points),
+            "negative_side_cluster": int(negative_side_cluster),
+            "positive_side_cluster": int(positive_side_cluster),
+            "negative_target_excluded": int(negative_target_excluded),
+            "positive_target_excluded": int(positive_target_excluded),
+            "negative_side_clear": bool(negative_side_clear),
+            "positive_side_clear": bool(positive_side_clear),
             "stamp_ns": int(ros_node.get_clock().now().nanoseconds),
         },
         ensure_ascii=False,
@@ -760,6 +836,77 @@ def publish_pregrasp_pose(frame_stamp) -> None:
     pose_msg.pose.orientation.z = float(quat[2])
     pose_msg.pose.orientation.w = float(quat[3])
     pregrasp_pose_pub.publish(pose_msg)
+
+
+def frame_capture_stamp(frames, host_return_s: float) -> tuple[float, str]:
+    """Return the D405 capture time in the host Unix-clock domain."""
+
+    global camera_timestamp_source, camera_timestamp_logged
+    try:
+        color_frame = frames.get_color_frame()
+        device_timestamp_ms = float(color_frame.get_timestamp())
+        if not np.isfinite(device_timestamp_ms) or device_timestamp_ms <= 0.0:
+            raise ValueError("invalid RealSense device timestamp")
+
+        timestamp_domain = None
+        try:
+            timestamp_domain = color_frame.get_frame_timestamp_domain()
+        except AttributeError:
+            # Older pyrealsense2 builds may not expose the domain accessor.
+            # Their hardware-clock path is still handled by arrival-based
+            # offset estimation below.
+
+            pass
+        system_domains = {
+            getattr(rs.timestamp_domain, "system_time", None),
+            getattr(rs.timestamp_domain, "global_time", None),
+        }
+        system_domains.discard(None)
+        if timestamp_domain is not None and timestamp_domain in system_domains:
+            # On Linux, SYSTEM_TIME/GLOBAL_TIME is already Unix-like.  Do not
+            # replace the capture timestamp with wait_for_frames() return time;
+            # that would reintroduce the robot-motion latency we are removing.
+            mapped_s = device_timestamp_ms * 1e-3
+            if abs(mapped_s - float(host_return_s)) > 0.25:
+                raise ValueError("system-domain frame timestamp is too far from host time")
+            camera_timestamp_source = "d405_system_time"
+        else:
+            offset_s = float(host_return_s) - device_timestamp_ms * 1e-3
+            camera_clock_offset_samples.append(offset_s)
+            mapped_s = device_timestamp_ms * 1e-3 + float(
+                np.median(np.asarray(camera_clock_offset_samples, dtype=np.float64))
+            )
+            # A disconnected/restarted device can reset its clock.  Do not
+            # pass a wildly wrong stamp to the hand-eye transform in that case.
+            if abs(mapped_s - float(host_return_s)) > 0.25:
+                raise ValueError("mapped device timestamp is too far from host time")
+            camera_timestamp_source = "d405_hardware_clock_mapped_to_host"
+        if not camera_timestamp_logged:
+            logging.info(
+                "[camera] Frame timestamps use D405 capture time in the host Unix domain; "
+                f"source={camera_timestamp_source}"
+                + (
+                    f", offset={float(np.median(np.asarray(camera_clock_offset_samples))):+.3f}s"
+                    if camera_clock_offset_samples
+                    else ""
+                )
+            )
+            camera_timestamp_logged = True
+        return float(mapped_s), camera_timestamp_source
+    except (AttributeError, TypeError, ValueError, FloatingPointError):
+        camera_timestamp_source = "host_return"
+        return float(host_return_s), camera_timestamp_source
+
+
+def host_seconds_to_ros_time(timestamp_s: float) -> RosTime:
+    """Build a ROS wall-clock stamp without depending on /use_sim_time."""
+
+    seconds = int(float(timestamp_s))
+    nanoseconds = int(round((float(timestamp_s) - seconds) * 1e9))
+    if nanoseconds >= 1_000_000_000:
+        seconds += 1
+        nanoseconds -= 1_000_000_000
+    return RosTime(sec=seconds, nanosec=nanoseconds)
 
 
 def trigger_callback(msg: Bool) -> None:
@@ -1166,6 +1313,13 @@ u_flat, v_flat = u_grid.reshape(-1).astype(np.float32), v_grid.reshape(-1).astyp
 warm_up_ffs_model(ffs_model)
 initialize_initial_position_frame_output()
 initialize_fault_snapshot_output()
+logging.info(
+    "[geometry] Tall-box-safe grasp enabled: top plane follows tabletop; "
+    "grasp axes use only metric 3-D top-surface points; near-square 90deg "
+    "axis swaps are continuity-locked; legacy first-frame axis direction is "
+    "preserved to prevent equivalent 180deg wrist turns; both finger descent "
+    "corridors must be clear before a target can be published."
+)
 
 
 def estimate_candidate_camera_x(corners, points_3d, u_rgb, v_rgb, in_bounds):
@@ -1219,6 +1373,9 @@ last_height_m = None
 last_side_points = 0
 last_side_planes = 0
 last_height_evidence_mode = "none"
+last_top_plane_selection = "none"
+last_top_surface_points = 0
+last_grasp_axis_source = "none"
 tracking_frames_without_height = 0
 last_height_warning_time = 0.0
 last_cloud_fallback_time = 0.0
@@ -1228,6 +1385,15 @@ handoff_force_live_cloud = False
 last_handoff_state = "IDLE"
 last_handoff_candidate_points = 0
 last_handoff_cluster_points = 0
+last_gripper_negative_side_points = 0
+last_gripper_positive_side_points = 0
+last_gripper_negative_side_cluster = 0
+last_gripper_positive_side_cluster = 0
+last_gripper_negative_target_excluded = 0
+last_gripper_positive_target_excluded = 0
+last_gripper_negative_side_clear = False
+last_gripper_positive_side_clear = False
+handoff_reacquire_required = False
 pregrasp_tracking_deadline = 0.0
 
 if ENABLE_LOCAL_WINDOWS:
@@ -1243,6 +1409,8 @@ try:
         loop_start = time.time()
 
         if trigger_requested:
+            is_fast_reacquire = fast_reacquire_requested
+            fast_reacquire_requested = False
             vision_request_active = True
             # A new request supersedes the previous pick indication. The newly
             # selected target will remain visible until the following request.
@@ -1265,13 +1433,29 @@ try:
             last_handoff_state = "WAIT_TARGET"
             last_handoff_candidate_points = 0
             last_handoff_cluster_points = 0
+            last_gripper_negative_side_points = 0
+            last_gripper_positive_side_points = 0
+            last_gripper_negative_side_cluster = 0
+            last_gripper_positive_side_cluster = 0
+            last_gripper_negative_target_excluded = 0
+            last_gripper_positive_target_excluded = 0
+            last_gripper_negative_side_clear = False
+            last_gripper_positive_side_clear = False
+            handoff_reacquire_required = False
             pregrasp_tracking_deadline = 0.0
             stable_target_frames.clear()
             publish_handoff_clearance("WAIT_TARGET", clear=False)
-            logging.info(
-                f"[D405] Flushing {CAPTURE_FLUSH_FRAMES} frames before YOLO capture..."
-            )
-            for _ in range(CAPTURE_FLUSH_FRAMES):
+            flush_frames = 0 if is_fast_reacquire else CAPTURE_FLUSH_FRAMES
+            if is_fast_reacquire:
+                logging.info(
+                    "[D405] Starting immediate in-request reacquisition from the "
+                    "first clear frame; skipping capture flush."
+                )
+            else:
+                logging.info(
+                    f"[D405] Flushing {flush_frames} frames before YOLO capture..."
+                )
+            for _ in range(flush_frames):
                 pipeline.wait_for_frames()
             detection_frames = pipeline.wait_for_frames()
             detection_color = np.asanyarray(detection_frames.get_color_frame().get_data())
@@ -1336,10 +1520,13 @@ try:
             trigger_requested = False
 
         frames = pipeline.wait_for_frames()
-        # Stamp immediately after frame acquisition.  D405 and the robot
-        # driver run on this host, so this is the common wall-clock domain used
-        # by the robot feedback history for eye-in-hand compensation.
-        frame_stamp = ros_node.get_clock().now().to_msg()
+        # Use the D405 device capture time mapped to the host Unix clock.  The
+        # Dobot feedback history uses the controller's Unix-ms TimeStamp, so
+        # both sides now refer to the same physical instant rather than the
+        # later ROS callback/packet-arrival time.
+        frame_return_s = time.time()
+        frame_stamp_s, _ = frame_capture_stamp(frames, frame_return_s)
+        frame_stamp = host_seconds_to_ros_time(frame_stamp_s)
         color_bgr = np.asanyarray(frames.get_color_frame().get_data())
 
         if reset_requested:
@@ -1355,6 +1542,9 @@ try:
             published_frames = 0
             tracking_frames_without_height = 0
             last_height_evidence_mode = "none"
+            last_top_plane_selection = "none"
+            last_top_surface_points = 0
+            last_grasp_axis_source = "none"
             if clear_target_display_requested:
                 locked_target_corners = None
                 locked_target_id = -1
@@ -1493,6 +1683,15 @@ try:
                 last_handoff_state = "CHECKING"
                 last_handoff_candidate_points = 0
                 last_handoff_cluster_points = 0
+                last_gripper_negative_side_points = 0
+                last_gripper_positive_side_points = 0
+                last_gripper_negative_side_cluster = 0
+                last_gripper_positive_side_cluster = 0
+                last_gripper_negative_target_excluded = 0
+                last_gripper_positive_target_excluded = 0
+                last_gripper_negative_side_clear = False
+                last_gripper_positive_side_clear = False
+                handoff_reacquire_required = False
                 publish_handoff_clearance("CHECKING", clear=False)
                 x1, y1 = np.min(corners, axis=0)
                 x2, y2 = np.max(corners, axis=0)
@@ -1598,6 +1797,9 @@ try:
                     filtered, filtered_uv = object_points[keep], object_uv[keep]
 
                     if len(filtered) >= 40:
+                        last_top_plane_selection = "rejected-no-valid-top"
+                        last_top_surface_points = 0
+                        last_grasp_axis_source = "rejected-no-valid-top-axis"
                         remaining = o3d.geometry.PointCloud()
                         remaining.points = o3d.utility.Vector3dVector(filtered)
                         plane_candidates = []
@@ -1610,15 +1812,62 @@ try:
                             plane_candidates.append((len(inliers), np.asarray(model, dtype=np.float64)))
                             remaining = remaining.select_by_index(inliers, invert=True)
 
-                        if plane_candidates:
-                            top_inliers, top_plane = max(plane_candidates, key=lambda item: item[0])
-                            raw_normal = top_plane[:3].copy()
-                            normal_norm = np.linalg.norm(raw_normal) + 1e-12
-                            normal = raw_normal / normal_norm
-                            plane_d = float(top_plane[3]) / normal_norm
+                        # Fit the support table independently before deciding
+                        # which segmented object face is the top.  This is the
+                        # key distinction for tall boxes: their largest visible
+                        # object plane is often a vertical front face.
+                        mask_u8 = (current_mask > 0).astype(np.uint8)
+                        table_plane_points = 0
+                        table_candidate_normal = None
+                        table_inlier_points = None
+                        table_ring_kernel = np.ones(
+                            (TABLE_RING_KERNEL_PX, TABLE_RING_KERNEL_PX), np.uint8
+                        )
+                        table_exclusion_kernel = np.ones(
+                            (TABLE_EXCLUSION_KERNEL_PX, TABLE_EXCLUSION_KERNEL_PX),
+                            np.uint8,
+                        )
+                        table_ring = (
+                            cv2.dilate(mask_u8, table_ring_kernel, iterations=1)
+                            > cv2.dilate(mask_u8, table_exclusion_kernel, iterations=1)
+                        )
+                        table_hits = np.zeros(len(points_3d), dtype=bool)
+                        table_hits[in_bounds] = table_ring[v_rgb[in_bounds], u_rgb[in_bounds]]
+                        table_points = points_3d[table_hits]
+                        if len(table_points) >= MIN_TABLE_PLANE_POINTS:
+                            table_cloud = o3d.geometry.PointCloud()
+                            table_cloud.points = o3d.utility.Vector3dVector(table_points)
+                            table_model, table_inliers = table_cloud.segment_plane(
+                                TABLE_RANSAC_DISTANCE_M, 3, 500
+                            )
+                            fitted_table_normal, _ = normalized_plane(table_model)
+                            if (
+                                len(table_inliers) >= MIN_TABLE_PLANE_POINTS
+                                and abs(float(fitted_table_normal[2]))
+                                >= MIN_TOP_CAMERA_FACING_COS
+                            ):
+                                table_candidate_normal = fitted_table_normal
+                                table_inlier_points = table_points[
+                                    np.asarray(table_inliers, dtype=np.int64)
+                                ]
+
+                        selected_top = select_top_plane_candidate(
+                            plane_candidates,
+                            table_candidate_normal,
+                            table_normal_alignment=TOP_TABLE_NORMAL_ALIGNMENT,
+                            minimum_camera_facing_cos=MIN_TOP_CAMERA_FACING_COS,
+                        )
+                        if selected_top is not None:
+                            top_inliers, top_plane, last_top_plane_selection = selected_top
+                            normal, plane_d = normalized_plane(top_plane)
                             if normal[2] > 0:
                                 normal, plane_d = -normal, -plane_d
                             top_coordinate = -plane_d
+                            top_surface_distance = np.abs(filtered @ normal + plane_d)
+                            top_surface_points = filtered[
+                                top_surface_distance <= TOP_SURFACE_DISTANCE_M
+                            ]
+                            last_top_surface_points = len(top_surface_points)
                             down_from_top = top_coordinate - mask_object_points @ normal
                             raw_side_mask = (
                                 (down_from_top > SIDE_START_DEPTH_M)
@@ -1638,7 +1887,6 @@ try:
                                 if abs(float(np.dot(candidate_normal, normal))) < 0.55:
                                     last_side_planes += 1
 
-                            mask_u8 = (current_mask > 0).astype(np.uint8)
                             edge_kernel = np.ones((EDGE_EVIDENCE_KERNEL_PX, EDGE_EVIDENCE_KERNEL_PX), np.uint8)
                             mask_interior = cv2.erode(mask_u8, edge_kernel, iterations=1)
                             mask_edge_band = (mask_u8 > mask_interior)
@@ -1650,39 +1898,20 @@ try:
                             # outside the SAM mask and require its normal to be
                             # parallel to the detected box top.
                             table_height = None
-                            table_plane_points = 0
-                            table_ring_kernel = np.ones((TABLE_RING_KERNEL_PX, TABLE_RING_KERNEL_PX), np.uint8)
-                            table_exclusion_kernel = np.ones(
-                                (TABLE_EXCLUSION_KERNEL_PX, TABLE_EXCLUSION_KERNEL_PX), np.uint8
-                            )
-                            table_ring = (
-                                cv2.dilate(mask_u8, table_ring_kernel, iterations=1)
-                                > cv2.dilate(mask_u8, table_exclusion_kernel, iterations=1)
-                            )
-                            table_hits = np.zeros(len(points_3d), dtype=bool)
-                            table_hits[in_bounds] = table_ring[v_rgb[in_bounds], u_rgb[in_bounds]]
-                            table_points = points_3d[table_hits]
-                            if len(table_points) >= MIN_TABLE_PLANE_POINTS:
-                                table_cloud = o3d.geometry.PointCloud()
-                                table_cloud.points = o3d.utility.Vector3dVector(table_points)
-                                table_model, table_inliers = table_cloud.segment_plane(
-                                    TABLE_RANSAC_DISTANCE_M, 3, 500
-                                )
-                                table_candidate_normal = np.asarray(table_model[:3], dtype=np.float64)
-                                table_candidate_normal /= np.linalg.norm(table_candidate_normal) + 1e-12
-                                if (
-                                    len(table_inliers) >= MIN_TABLE_PLANE_POINTS
-                                    and abs(float(np.dot(table_candidate_normal, normal))) >= 0.90
-                                ):
-                                    table_inlier_points = table_points[np.asarray(table_inliers, dtype=np.int64)]
-                                    table_depths = top_coordinate - table_inlier_points @ normal
-                                    table_depths = table_depths[
-                                        (table_depths >= MIN_BOX_HEIGHT_M)
-                                        & (table_depths <= MAX_BOX_HEIGHT_M)
-                                    ]
-                                    if len(table_depths) >= MIN_TABLE_PLANE_POINTS:
-                                        table_height = float(np.median(table_depths))
-                                        table_plane_points = len(table_depths)
+                            if (
+                                table_candidate_normal is not None
+                                and table_inlier_points is not None
+                                and abs(float(np.dot(table_candidate_normal, normal)))
+                                >= TOP_TABLE_NORMAL_ALIGNMENT
+                            ):
+                                table_depths = top_coordinate - table_inlier_points @ normal
+                                table_depths = table_depths[
+                                    (table_depths >= MIN_BOX_HEIGHT_M)
+                                    & (table_depths <= MAX_BOX_HEIGHT_M)
+                                ]
+                                if len(table_depths) >= MIN_TABLE_PLANE_POINTS:
+                                    table_height = float(np.median(table_depths))
+                                    table_plane_points = len(table_depths)
 
                             measured_height = None
                             if table_height is not None:
@@ -1706,28 +1935,20 @@ try:
 
                             if measured_height is not None:
                                 if MIN_BOX_HEIGHT_M <= measured_height <= MAX_BOX_HEIGHT_M:
-                                    mask_contours, _ = cv2.findContours(current_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                    if mask_contours:
-                                        box2d = cv2.boxPoints(cv2.minAreaRect(max(mask_contours, key=cv2.contourArea)))
-                                        d01 = np.linalg.norm(box2d[0] - box2d[1])
-                                        d12 = np.linalg.norm(box2d[1] - box2d[2])
-                                        if d01 < d12:
-                                            midpoint1, midpoint2 = (box2d[0] + box2d[1]) / 2, (box2d[2] + box2d[3]) / 2
-                                        else:
-                                            midpoint1, midpoint2 = (box2d[1] + box2d[2]) / 2, (box2d[3] + box2d[0]) / 2
-                                        vector2d = midpoint2 - midpoint1
-                                        midpoint1 += vector2d * 0.10
-                                        midpoint2 -= vector2d * 0.10
-                                        point1 = np.mean(filtered[np.argsort(np.linalg.norm(filtered_uv - midpoint1, axis=1))[:5]], axis=0)
-                                        point2 = np.mean(filtered[np.argsort(np.linalg.norm(filtered_uv - midpoint2, axis=1))[:5]], axis=0)
-                                        x_axis = point2 - point1
-                                        x_axis -= np.dot(x_axis, normal) * normal
-                                        x_axis /= np.linalg.norm(x_axis) + 1e-12
-                                        if x_axis[1] > 0:
-                                            x_axis = -x_axis
-                                        y_axis = np.cross(normal, x_axis)
-                                        y_axis /= np.linalg.norm(y_axis) + 1e-12
-                                        axes = np.column_stack((x_axis, y_axis, normal))
+                                    axes = fit_top_surface_axes(
+                                        top_surface_points,
+                                        normal,
+                                        smooth_rotation,
+                                        minimum_points=MIN_TOP_SURFACE_POINTS,
+                                        near_square_axis_ratio=TOP_NEAR_SQUARE_AXIS_RATIO,
+                                    )
+                                    if axes is not None:
+                                        last_grasp_axis_source = "3d-top-surface-rectangle"
+                                        x_axis, y_axis, normal = (
+                                            axes[:, 0],
+                                            axes[:, 1],
+                                            axes[:, 2],
+                                        )
                                         x_values, y_values = filtered @ x_axis, filtered @ y_axis
                                         x_mid = 0.5 * (x_values.min() + x_values.max())
                                         y_mid = 0.5 * (y_values.min() + y_values.max())
@@ -1777,22 +1998,100 @@ try:
                                                 voxel_size_m=HANDOFF_CLEARANCE_VOXEL_SIZE_M,
                                                 min_obstacle_points=HANDOFF_CLEARANCE_MIN_CLUSTER_POINTS,
                                             )
-                                            handoff_candidate_mask = clearance.candidate_mask
-                                            last_handoff_candidate_points = clearance.candidate_point_count
-                                            last_handoff_cluster_points = clearance.largest_cluster_point_count
+                                            side_clearance = evaluate_gripper_side_clearance(
+                                                points_3d,
+                                                smooth_box_center,
+                                                smooth_extent,
+                                                smooth_rotation,
+                                                target_point_mask=object_hits,
+                                                finger_span_m=GRIPPER_SIDE_FINGER_SPAN_M,
+                                                target_exclusion_m=GRIPPER_SIDE_TARGET_EXCLUSION_M,
+                                                side_check_depth_m=GRIPPER_SIDE_CHECK_DEPTH_M,
+                                                grasp_below_center_fraction=(
+                                                    GRIPPER_SIDE_GRASP_BELOW_CENTER_FRACTION
+                                                ),
+                                                vertical_margin_above_m=(
+                                                    GRIPPER_SIDE_VERTICAL_MARGIN_ABOVE_M
+                                                ),
+                                                voxel_size_m=GRIPPER_SIDE_VOXEL_SIZE_M,
+                                                min_obstacle_points=(
+                                                    GRIPPER_SIDE_MIN_CLUSTER_POINTS
+                                                ),
+                                            )
+                                            handoff_candidate_mask = (
+                                                clearance.candidate_mask
+                                                | side_clearance.candidate_mask
+                                            )
+                                            last_gripper_negative_side_points = (
+                                                side_clearance.negative_candidate_point_count
+                                            )
+                                            last_gripper_positive_side_points = (
+                                                side_clearance.positive_candidate_point_count
+                                            )
+                                            last_gripper_negative_side_cluster = (
+                                                side_clearance.negative_largest_cluster_point_count
+                                            )
+                                            last_gripper_positive_side_cluster = (
+                                                side_clearance.positive_largest_cluster_point_count
+                                            )
+                                            last_gripper_negative_target_excluded = (
+                                                side_clearance.negative_target_excluded_point_count
+                                            )
+                                            last_gripper_positive_target_excluded = (
+                                                side_clearance.positive_target_excluded_point_count
+                                            )
+                                            last_gripper_negative_side_clear = (
+                                                side_clearance.negative_side_clear
+                                            )
+                                            last_gripper_positive_side_clear = (
+                                                side_clearance.positive_side_clear
+                                            )
+                                            last_handoff_candidate_points = (
+                                                clearance.candidate_point_count
+                                                + side_clearance.negative_candidate_point_count
+                                                + side_clearance.positive_candidate_point_count
+                                            )
+                                            last_handoff_cluster_points = max(
+                                                clearance.largest_cluster_point_count,
+                                                side_clearance.negative_largest_cluster_point_count,
+                                                side_clearance.positive_largest_cluster_point_count,
+                                            )
+                                            complete_clearance = (
+                                                clearance.clear and side_clearance.clear
+                                            )
                                             # After the first snapshot (or any BLOCKED
                                             # result), a CLEAR result only counts when it
                                             # comes from a newly inferred LIVE FFS cloud.
                                             independent_clear_sample = not (
                                                 handoff_force_live_cloud and using_locked_cloud
                                             )
-                                            if not clearance.clear:
+                                            if not complete_clearance:
                                                 handoff_clear_streak = 0
                                                 handoff_force_live_cloud = True
+                                                # Geometry measured while the handoff arm
+                                                # occupies the scene can follow the moving
+                                                # box or include an occluded side.  Once the
+                                                # arm leaves, require a fresh YOLO/SAM/FFS
+                                                # request instead of accepting this stale
+                                                # tracked geometry for descent.
+                                                handoff_reacquire_required = True
                                                 handoff_state = "BLOCKED"
                                             elif not independent_clear_sample:
                                                 handoff_force_live_cloud = True
                                                 handoff_state = "WAIT_LIVE_CLOUD"
+                                            elif handoff_reacquire_required:
+                                                handoff_clear_streak = 0
+                                                handoff_force_live_cloud = False
+                                                handoff_state = "REACQUIRE_TARGET"
+                                                # Keep the robot's current vision request
+                                                # open.  The next camera-loop iteration
+                                                # immediately reruns YOLO/SAM2/FFS, which
+                                                # avoids a failure response, the driver's
+                                                # retry delay, and two unnecessary flushed
+                                                # frames.
+                                                reset_requested = True
+                                                fast_reacquire_requested = True
+                                                trigger_requested = True
                                             else:
                                                 handoff_clear_streak += 1
                                                 if handoff_clear_streak >= HANDOFF_CLEARANCE_CLEAR_FRAMES:
@@ -1813,17 +2112,35 @@ try:
                                                     handoff_state = "VERIFYING_CLEAR"
 
                                             if clearance.candidate_point_count:
-                                                obstacle_color = (
+                                                colors[clearance.candidate_mask] = (
                                                     np.array([1.0, 0.0, 1.0])
                                                     if not clearance.clear
                                                     else np.array([1.0, 0.65, 0.0])
                                                 )
-                                                colors[clearance.candidate_mask] = obstacle_color
+                                            if (
+                                                side_clearance.negative_candidate_point_count
+                                                or side_clearance.positive_candidate_point_count
+                                            ):
+                                                colors[side_clearance.candidate_mask] = (
+                                                    np.array([1.0, 0.0, 0.0])
+                                                    if not side_clearance.clear
+                                                    else np.array([0.0, 0.8, 1.0])
+                                                )
                                             if handoff_state != last_handoff_state:
                                                 logging.info(
                                                     f"[handoff-clearance] {handoff_state}: "
                                                     f"candidate_points={clearance.candidate_point_count}, "
                                                     f"largest_cluster={clearance.largest_cluster_point_count}, "
+                                                    f"finger_sides="
+                                                    f"-Y:{side_clearance.negative_candidate_point_count}/"
+                                                    f"{side_clearance.negative_largest_cluster_point_count}/"
+                                                    f"{'CLEAR' if side_clearance.negative_side_clear else 'BLOCKED'}, "
+                                                    f"+Y:{side_clearance.positive_candidate_point_count}/"
+                                                    f"{side_clearance.positive_largest_cluster_point_count}/"
+                                                    f"{'CLEAR' if side_clearance.positive_side_clear else 'BLOCKED'}, "
+                                                    f"target_excluded="
+                                                    f"-Y:{side_clearance.negative_target_excluded_point_count},"
+                                                    f"+Y:{side_clearance.positive_target_excluded_point_count}, "
                                                     f"clear_streak={handoff_clear_streak}/"
                                                     f"{HANDOFF_CLEARANCE_CLEAR_FRAMES}, "
                                                     f"cloud={'LOCKED' if using_locked_cloud else 'LIVE'}"
@@ -1832,14 +2149,38 @@ try:
                                             publish_handoff_clearance(
                                                 handoff_state,
                                                 clear=handoff_clearance_passed,
-                                                candidate_points=clearance.candidate_point_count,
-                                                largest_cluster_points=clearance.largest_cluster_point_count,
+                                                candidate_points=last_handoff_candidate_points,
+                                                largest_cluster_points=last_handoff_cluster_points,
                                                 clear_streak=handoff_clear_streak,
+                                                negative_side_points=(
+                                                    last_gripper_negative_side_points
+                                                ),
+                                                positive_side_points=(
+                                                    last_gripper_positive_side_points
+                                                ),
+                                                negative_side_cluster=(
+                                                    last_gripper_negative_side_cluster
+                                                ),
+                                                positive_side_cluster=(
+                                                    last_gripper_positive_side_cluster
+                                                ),
+                                                negative_target_excluded=(
+                                                    last_gripper_negative_target_excluded
+                                                ),
+                                                positive_target_excluded=(
+                                                    last_gripper_positive_target_excluded
+                                                ),
+                                                negative_side_clear=(
+                                                    last_gripper_negative_side_clear
+                                                ),
+                                                positive_side_clear=(
+                                                    last_gripper_positive_side_clear
+                                                ),
                                             )
 
-                                        # Publish only after the target core and right-side handoff
-                                        # corridor have been independently clear twice. Afterwards SAM2
-                                        # remains alive only for the operator display.
+                                        # Publish only after the overhead/right handoff corridor and
+                                        # both gripper-finger descent paths have independently been
+                                        # clear twice. Afterwards SAM2 remains alive for tracking.
                                         if handoff_clearance_passed and not locked_target_ready:
                                             if SAVE_INITIAL_POSITION_FRAMES:
                                                 # 这两帧正是形成稳定目标的连续有效帧，
@@ -1853,8 +2194,20 @@ try:
                                             pose_msg.pose.orientation.x, pose_msg.pose.orientation.y = float(quat[0]), float(quat[1])
                                             pose_msg.pose.orientation.z, pose_msg.pose.orientation.w = float(quat[2]), float(quat[3])
                                             pose_pub.publish(pose_msg)
+                                            width_decision = select_gripper_width(
+                                                float(smooth_extent[0]),
+                                                float(smooth_extent[1]),
+                                                clearance_m=GRIP_CLEARANCE_M,
+                                                max_opening_m=MAX_GRIPPER_OPENING_M,
+                                                full_open_width_threshold_m=(
+                                                    GRIPPER_FULL_OPEN_WIDTH_THRESHOLD_M
+                                                ),
+                                                near_square_aspect_ratio=(
+                                                    GRIPPER_NEAR_SQUARE_ASPECT_RATIO
+                                                ),
+                                            )
                                             width_msg = Float32()
-                                            width_msg.data = float(min(MAX_GRIPPER_OPENING_M, smooth_extent[1] + GRIP_CLEARANCE_M))
+                                            width_msg.data = width_decision.command_m
                                             width_pub.publish(width_msg)
                                             length_msg = Float32()
                                             # x_axis follows the long side of the segmented
@@ -1887,7 +2240,11 @@ try:
                                                 publish_vision_result(True, "stable_target_published")
                                                 logging.info(
                                                     f"[D405] Published stable target: length={smooth_extent[0]*1000:.1f}mm, "
+                                                    f"width={smooth_extent[1]*1000:.1f}mm, "
                                                     f"height={last_height_m*1000:.1f}mm, "
+                                                    f"aspect={width_decision.aspect_ratio:.3f}, "
+                                                    f"gripper={width_decision.command_m*1000:.1f}mm "
+                                                    f"({width_decision.reason}), "
                                                     f"depth={GRASP_DEPTH_RATIO*100:.0f}%, evidence={last_height_evidence_mode}; "
                                                     "SAM2 display tracking remains active."
                                                 )
@@ -1915,27 +2272,47 @@ try:
                                     )
                                     last_height_warning_time = now
 
+        invalid_height_limit = (
+            HANDOFF_FAST_REACQUIRE_INVALID_HEIGHT_FRAMES
+            if handoff_reacquire_required
+            else MAX_TRACKING_FRAMES_WITHOUT_HEIGHT
+        )
         if (
             sam_initialized
             and published_frames == 0
-            and tracking_frames_without_height >= MAX_TRACKING_FRAMES_WITHOUT_HEIGHT
+            and tracking_frames_without_height >= invalid_height_limit
         ):
-            logging.warning(
-                f"[height] No valid height after {tracking_frames_without_height} tracked frames; "
-                "resetting SAM2 so the next request starts cleanly."
-            )
-            publish_vision_result(False, "no_valid_height")
-            locked_target_corners = None
-            locked_target_id = -1
-            locked_target_camera_x = None
-            locked_target_ready = False
-            locked_target_height_m = None
-            locked_cloud_points = None
-            locked_cloud_u_rgb = None
-            locked_cloud_v_rgb = None
-            locked_cloud_in_bounds = None
-            locked_cloud_colors = None
-            reset_requested = True
+            if handoff_reacquire_required:
+                logging.warning(
+                    f"[height] Handoff-blocked track has no valid height for "
+                    f"{tracking_frames_without_height} frames; immediately reacquiring "
+                    "inside the current vision request."
+                )
+                handoff_clear_streak = 0
+                handoff_clearance_passed = False
+                handoff_force_live_cloud = False
+                last_handoff_state = "REACQUIRE_TARGET"
+                publish_handoff_clearance("REACQUIRE_TARGET", clear=False)
+                reset_requested = True
+                fast_reacquire_requested = True
+                trigger_requested = True
+            else:
+                logging.warning(
+                    f"[height] No valid height after {tracking_frames_without_height} tracked frames; "
+                    "resetting SAM2 so the next request starts cleanly."
+                )
+                publish_vision_result(False, "no_valid_height")
+                locked_target_corners = None
+                locked_target_id = -1
+                locked_target_camera_x = None
+                locked_target_ready = False
+                locked_target_height_m = None
+                locked_cloud_points = None
+                locked_cloud_u_rgb = None
+                locked_cloud_v_rgb = None
+                locked_cloud_in_bounds = None
+                locked_cloud_colors = None
+                reset_requested = True
 
         if last_yolo_obbs is not None and time.time() - last_yolo_time <= YOLO_BOX_DISPLAY_TTL_S:
             for index, corners in enumerate(last_yolo_obbs):
@@ -2015,7 +2392,15 @@ try:
         draw_manual_roi(display)
         fps = 1.0 / max(1e-6, time.time() - loop_start)
         if last_handoff_state == "BLOCKED":
-            status = "HANDOFF BLOCKED - WAITING FOR 102 RETREAT"
+            if (
+                not last_gripper_negative_side_clear
+                or not last_gripper_positive_side_clear
+            ):
+                status = "FINGER PATH BLOCKED - REFUSING DESCENT"
+            else:
+                status = "HANDOFF BLOCKED - WAITING FOR 102 RETREAT"
+        elif last_handoff_state == "REACQUIRE_TARGET":
+            status = "HANDOFF CLEARED - REACQUIRING STATIONARY TARGET"
         elif last_handoff_state in ("VERIFYING_CLEAR", "WAIT_LIVE_CLOUD"):
             status = (
                 f"HANDOFF VERIFYING CLEAR {handoff_clear_streak}/"
@@ -2049,10 +2434,36 @@ try:
                 clearance_color,
                 2,
             )
+            cv2.putText(
+                display,
+                "finger paths "
+                f"-Y={last_gripper_negative_side_points}/"
+                f"{last_gripper_negative_side_cluster}/"
+                f"{'CLEAR' if last_gripper_negative_side_clear else 'BLOCKED'} "
+                f"+Y={last_gripper_positive_side_points}/"
+                f"{last_gripper_positive_side_cluster}/"
+                f"{'CLEAR' if last_gripper_positive_side_clear else 'BLOCKED'} "
+                f"self=-Y:{last_gripper_negative_target_excluded}/"
+                f"+Y:{last_gripper_positive_target_excluded}",
+                (10, 88),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                clearance_color,
+                2,
+            )
         if last_height_m is not None:
             length_text = "" if smooth_extent is None else f" length={smooth_extent[0]*1000:.1f}mm"
             cv2.putText(display, f"height={last_height_m*1000:.1f}mm{length_text} side_planes={last_side_planes} side_pts={last_side_points} depth=75%", (10, IMG_HEIGHT - 31), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1)
-            cv2.putText(display, f"height evidence: {last_height_evidence_mode}", (10, IMG_HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 255, 255), 1)
+            cv2.putText(
+                display,
+                f"height evidence: {last_height_evidence_mode} | top={last_top_plane_selection} "
+                f"axis={last_grasp_axis_source} pts={last_top_surface_points}",
+                (10, IMG_HEIGHT - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.36,
+                (0, 255, 255),
+                1,
+            )
 
         cloud_source = "LOCKED SNAPSHOT" if using_locked_cloud else "LIVE FFS"
         cloud_image = render_cloud(

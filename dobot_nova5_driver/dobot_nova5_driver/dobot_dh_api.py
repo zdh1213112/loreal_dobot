@@ -32,6 +32,7 @@ import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Callable
 
 try:
     from .TCP_IP_Python_V4.dobot_api import DobotApiDashboard  # noqa: E402
@@ -179,7 +180,11 @@ class DHGripper:
         self.write_register(REG_FORCE, force)
 
     def set_position(
-        self, position: float, wait: bool = False, timeout_s: float = 10.0
+        self,
+        position: float,
+        wait: bool = False,
+        timeout_s: float = 10.0,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         if not 0.0 <= position <= 1.0:
             raise ValueError(f"position must be in [0, 1], got {position}.")
@@ -190,24 +195,36 @@ class DHGripper:
                 timeout_s=timeout_s,
                 target_position=position,
                 initial_position=initial_position,
+                cancel_check=cancel_check,
             )
 
-    def open(self, wait: bool = False) -> None:
-        self.set_position(1.0, wait=wait)
+    def open(
+        self,
+        wait: bool = False,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> None:
+        self.set_position(1.0, wait=wait, cancel_check=cancel_check)
 
-    def close(self, wait: bool = False) -> None:
-        self.set_position(0.0, wait=wait)
+    def close(
+        self,
+        wait: bool = False,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> None:
+        self.set_position(0.0, wait=wait, cancel_check=cancel_check)
 
     def wait_until_stopped(
         self,
         timeout_s: float = 10.0,
         target_position: float | None = None,
         initial_position: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> int:
         start = time.monotonic()
         deadline = time.monotonic() + timeout_s
         motion_seen = False
         while time.monotonic() < deadline:
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError("DH gripper wait cancelled by safety interlock")
             state = self.read_grip_state()
             if state == GRIP_IN_MOTION:
                 motion_seen = True

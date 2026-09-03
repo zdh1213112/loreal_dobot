@@ -2,6 +2,7 @@ import numpy as np
 
 from dobot_nova5_driver.handoff_clearance import (
     evaluate_camera_right_handoff_clearance,
+    evaluate_gripper_side_clearance,
     evaluate_target_overhead_clearance,
 )
 
@@ -180,3 +181,139 @@ def test_camera_right_direction_does_not_rotate_with_target():
     result = evaluate_right_corridor(right_side, rotation=rotation)
 
     assert not result.clear
+
+
+SIDE_CLEARANCE_DEFAULTS = {
+    "finger_span_m": 0.060,
+    "target_exclusion_m": 0.004,
+    "side_check_depth_m": 0.030,
+    "grasp_below_center_fraction": 0.25,
+    "vertical_margin_above_m": 0.080,
+    "voxel_size_m": 0.010,
+    "min_obstacle_points": 20,
+}
+
+
+def evaluate_finger_sides(points, rotation=None, target_point_mask=None):
+    return evaluate_gripper_side_clearance(
+        np.asarray(points, dtype=np.float64),
+        box_center=np.array([0.0, 0.0, 0.05]),
+        box_extent=np.array([0.10, 0.06, 0.10]),
+        box_rotation=np.eye(3) if rotation is None else rotation,
+        target_point_mask=target_point_mask,
+        **SIDE_CLEARANCE_DEFAULTS,
+    )
+
+
+def test_gripper_side_clearance_ignores_target_and_table_surfaces():
+    target_sides = [
+        [x, sign * 0.03, z]
+        for sign in (-1.0, 1.0)
+        for x in (-0.02, 0.0, 0.02)
+        for z in (0.04, 0.07, 0.10)
+    ]
+    table = [
+        [x, y, 0.0]
+        for x in (-0.02, 0.0, 0.02)
+        for y in (-0.05, 0.0, 0.05)
+    ]
+
+    result = evaluate_finger_sides(target_sides + table)
+
+    assert result.clear
+    assert result.negative_candidate_point_count == 0
+    assert result.positive_candidate_point_count == 0
+
+
+def test_gripper_side_clearance_blocks_if_either_finger_path_is_occupied():
+    negative_obstacle = [
+        [0.001 * (index % 4), -0.045, 0.06 + 0.001 * (index // 4)]
+        for index in range(24)
+    ]
+
+    result = evaluate_finger_sides(negative_obstacle)
+
+    assert not result.clear
+    assert not result.negative_side_clear
+    assert result.positive_side_clear
+    assert result.negative_largest_cluster_point_count == 24
+
+
+def test_gripper_side_clearance_reports_both_occupied_finger_paths():
+    obstacles = [
+        [0.001 * (index % 4), sign * 0.045, 0.06 + 0.001 * (index // 4)]
+        for sign in (-1.0, 1.0)
+        for index in range(24)
+    ]
+
+    result = evaluate_finger_sides(obstacles)
+
+    assert not result.clear
+    assert not result.negative_side_clear
+    assert not result.positive_side_clear
+    assert result.negative_candidate_point_count == 24
+    assert result.positive_candidate_point_count == 24
+
+
+def test_gripper_side_clearance_only_checks_centered_finger_span():
+    obstacle_beside_long_box_end = [
+        [0.040 + 0.001 * (index % 4), 0.045, 0.06 + 0.001 * (index // 4)]
+        for index in range(24)
+    ]
+
+    result = evaluate_finger_sides(obstacle_beside_long_box_end)
+
+    assert result.clear
+    assert result.positive_candidate_point_count == 0
+
+
+def test_gripper_side_clearance_excludes_selected_target_mask_leaking_outside_fit():
+    leaked_target_side = [
+        [0.001 * (index % 4), 0.045, 0.06 + 0.001 * (index // 4)]
+        for index in range(24)
+    ]
+
+    result = evaluate_finger_sides(
+        leaked_target_side,
+        target_point_mask=np.ones(len(leaked_target_side), dtype=bool),
+    )
+
+    assert result.clear
+    assert result.positive_candidate_point_count == 0
+    assert result.positive_largest_cluster_point_count == 0
+    assert result.positive_target_excluded_point_count == 24
+
+
+def test_gripper_side_clearance_still_blocks_non_target_points_after_exclusion():
+    leaked_target_side = [
+        [0.001 * (index % 4), 0.045, 0.06 + 0.001 * (index // 4)]
+        for index in range(24)
+    ]
+    negative_obstacle = [
+        [0.001 * (index % 4), -0.045, 0.06 + 0.001 * (index // 4)]
+        for index in range(24)
+    ]
+    points = leaked_target_side + negative_obstacle
+    target_mask = np.array(
+        [True] * len(leaked_target_side) + [False] * len(negative_obstacle),
+        dtype=bool,
+    )
+
+    result = evaluate_finger_sides(points, target_point_mask=target_mask)
+
+    assert not result.clear
+    assert not result.negative_side_clear
+    assert result.positive_side_clear
+    assert result.negative_candidate_point_count == 24
+    assert result.positive_candidate_point_count == 0
+    assert result.positive_target_excluded_point_count == 24
+
+
+def test_gripper_side_clearance_rejects_target_mask_with_wrong_length():
+    points = [[0.0, 0.045, 0.06]]
+
+    with np.testing.assert_raises_regex(ValueError, "target_point_mask"):
+        evaluate_finger_sides(
+            points,
+            target_point_mask=np.array([True, False], dtype=bool),
+        )
