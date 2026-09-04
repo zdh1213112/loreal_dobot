@@ -214,7 +214,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("feedback_port", 30004)
         self.declare_parameter("auto_enable", True)
         self.declare_parameter("auto_start", False)
-        self.declare_parameter("startup_joint", [14.0, 14.0, -115.0, 25.0, 83.0, 10.0])
+        self.declare_parameter("startup_joint", [14.0, 7.0, -130.0, 47.0, 83.0, 10.0]) #初始位置，关节角度
         self.declare_parameter("transfer_joint", [14.0, -29.0, -99.0, 39.0, 88.0, 15.0])
         # 101 is the left pick arm.  These parameters only read 102 feedback;
         # the left node never sends a motion command to the right/VLA arm.
@@ -232,9 +232,9 @@ class CosmeticBoxSingleArmNode(Node):
         # motion is cancelled and held.  Only if the live gap then falls below
         # 145 mm does 101 execute a monitored User-Y escape away from 102.
         # 102 remains feedback-only and never receives a command from here.
-        self.declare_parameter("secondary_y_clearance_m", 0.165)
-        self.declare_parameter("secondary_emergency_retreat_m", 0.145)
-        self.declare_parameter("secondary_emergency_recover_m", 0.200)
+        self.declare_parameter("secondary_y_clearance_m", 0.160)
+        self.declare_parameter("secondary_emergency_retreat_m", 0.142)
+        self.declare_parameter("secondary_emergency_recover_m", 0.180)
         self.declare_parameter("secondary_motion_monitor_poll_s", 0.010)
         self.declare_parameter("secondary_emergency_retreat_speed", 100)
         self.declare_parameter("secondary_emergency_retreat_timeout_s", 3.0)
@@ -536,6 +536,8 @@ class CosmeticBoxSingleArmNode(Node):
         self.latest_handoff_clear = False
         self.latest_handoff_candidate_points = 0
         self.latest_handoff_cluster_points = 0
+        self.latest_handoff_negative_side_clear = True
+        self.latest_handoff_positive_side_clear = True
 
         self.barcode_lock = threading.Lock()
         self.barcode_window_active = False
@@ -1619,6 +1621,8 @@ class CosmeticBoxSingleArmNode(Node):
             clear = payload.get("clear") is True and state == "CLEAR"
             candidate_points = int(payload.get("candidate_points", 0))
             cluster_points = int(payload.get("largest_cluster_points", 0))
+            negative_side_clear = payload.get("negative_side_clear") is True
+            positive_side_clear = payload.get("positive_side_clear") is True
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"Ignoring invalid D405 handoff state: {exc}")
             return
@@ -1627,6 +1631,8 @@ class CosmeticBoxSingleArmNode(Node):
             self.latest_handoff_clear = clear
             self.latest_handoff_candidate_points = candidate_points
             self.latest_handoff_cluster_points = cluster_points
+            self.latest_handoff_negative_side_clear = negative_side_clear
+            self.latest_handoff_positive_side_clear = positive_side_clear
             self.handoff_state_count += 1
 
     def _barcode_callback(self, msg: String) -> None:
@@ -2058,10 +2064,26 @@ class CosmeticBoxSingleArmNode(Node):
                 if fresh_handoff_state and self.latest_handoff_state != last_reported_handoff_state:
                     last_reported_handoff_state = self.latest_handoff_state
                     if self.latest_handoff_state == "BLOCKED":
+                        if (
+                            not self.latest_handoff_negative_side_clear
+                            or not self.latest_handoff_positive_side_clear
+                        ):
+                            status_update = (
+                                "D405 finger corridor BLOCKED; waiting for obstacle "
+                                "clearance "
+                                f"(points={self.latest_handoff_candidate_points}, "
+                                f"cluster={self.latest_handoff_cluster_points})"
+                            )
+                        else:
+                            status_update = (
+                                "D405 handoff zone BLOCKED; waiting for 102 to retreat "
+                                f"(points={self.latest_handoff_candidate_points}, "
+                                f"cluster={self.latest_handoff_cluster_points})"
+                            )
+                    elif self.latest_handoff_state == "VERIFYING_BLOCKED":
                         status_update = (
-                            "D405 handoff zone BLOCKED; waiting for 102 to retreat "
-                            f"(points={self.latest_handoff_candidate_points}, "
-                            f"cluster={self.latest_handoff_cluster_points})"
+                            "D405 side corridor occupied in one LIVE cloud; "
+                            "confirming spatial persistence before reacquire"
                         )
                     elif self.latest_handoff_state in ("VERIFYING_CLEAR", "WAIT_LIVE_CLOUD"):
                         status_update = "D405 handoff zone looks clear; confirming with a fresh FFS cloud"

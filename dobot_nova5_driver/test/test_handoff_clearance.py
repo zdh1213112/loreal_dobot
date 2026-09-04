@@ -4,6 +4,7 @@ from dobot_nova5_driver.handoff_clearance import (
     evaluate_camera_right_handoff_clearance,
     evaluate_gripper_side_clearance,
     evaluate_target_overhead_clearance,
+    measure_voxel_overlap,
 )
 
 
@@ -317,3 +318,73 @@ def test_gripper_side_clearance_rejects_target_mask_with_wrong_length():
             points,
             target_point_mask=np.array([True, False], dtype=bool),
         )
+
+
+def test_gripper_side_clearance_exposes_target_local_candidate_voxels():
+    obstacle = [
+        [0.001 * (index % 4), 0.045, 0.06 + 0.001 * (index // 4)]
+        for index in range(24)
+    ]
+
+    result = evaluate_finger_sides(obstacle)
+
+    assert not result.positive_side_clear
+    assert result.positive_candidate_voxel_indices.ndim == 2
+    assert result.positive_candidate_voxel_indices.shape[1] == 3
+    assert len(result.positive_candidate_voxel_indices) > 0
+
+
+def test_voxel_overlap_requires_same_spatial_region_not_just_two_hits():
+    previous = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.int64)
+    same_region = np.array([[0, 0, 0], [1, 0, 0], [9, 9, 9]], dtype=np.int64)
+    different_region = np.array([[6, 6, 6], [7, 6, 6], [8, 6, 6]], dtype=np.int64)
+
+    overlap, ratio, confirmed = measure_voxel_overlap(
+        previous,
+        same_region,
+        min_overlap_voxels=2,
+        min_overlap_ratio=0.5,
+    )
+    assert overlap == 2
+    assert ratio == 2 / 3
+    assert confirmed
+
+    overlap, ratio, confirmed = measure_voxel_overlap(
+        previous,
+        different_region,
+        min_overlap_voxels=1,
+        min_overlap_ratio=0.1,
+    )
+    assert overlap == 0
+    assert ratio == 0.0
+    assert not confirmed
+
+
+def test_voxel_overlap_first_or_empty_sample_never_confirms():
+    current = np.array([[1, 2, 3]], dtype=np.int64)
+
+    assert measure_voxel_overlap(None, current, min_overlap_voxels=0)[2] is False
+    assert measure_voxel_overlap(
+        np.empty((0, 3), dtype=np.int64),
+        current,
+        min_overlap_voxels=0,
+    )[2] is False
+
+
+def test_voxel_overlap_rejects_small_coincidental_cluster_with_runtime_thresholds():
+    previous = np.array(
+        [[index, 0, 0] for index in range(6)],
+        dtype=np.int64,
+    )
+    current = previous.copy()
+
+    overlap, ratio, confirmed = measure_voxel_overlap(
+        previous,
+        current,
+        min_overlap_voxels=8,
+        min_overlap_ratio=0.50,
+    )
+
+    assert overlap == 6
+    assert ratio == 1.0
+    assert not confirmed

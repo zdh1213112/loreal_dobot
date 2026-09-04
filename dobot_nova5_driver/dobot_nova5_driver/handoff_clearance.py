@@ -32,6 +32,11 @@ class GripperSideClearanceResult:
     negative_target_excluded_point_count: int
     positive_target_excluded_point_count: int
     candidate_mask: np.ndarray
+    # Target-local occupied voxels for each side.  These are exposed so the
+    # vision state machine can require spatial persistence across independent
+    # LIVE clouds without relying on frame-to-frame point indices.
+    negative_candidate_voxel_indices: np.ndarray
+    positive_candidate_voxel_indices: np.ndarray
 
 
 _VOXEL_NEIGHBORS = tuple(
@@ -49,8 +54,21 @@ def _largest_connected_voxel_cluster_points(
 ) -> tuple[int, int]:
     """Return occupied-voxel count and largest 26-connected cluster size."""
 
+    occupied_voxels, largest_cluster_points, _ = _connected_voxel_cluster_stats(
+        points,
+        voxel_size_m,
+    )
+    return occupied_voxels, largest_cluster_points
+
+
+def _connected_voxel_cluster_stats(
+    points: np.ndarray,
+    voxel_size_m: float,
+) -> tuple[int, int, np.ndarray]:
+    """Return occupancy, largest-cluster points, and its voxel indices."""
+
     if len(points) == 0:
-        return 0, 0
+        return 0, 0, np.empty((0, 3), dtype=np.int64)
     voxel_indices = np.floor(points / float(voxel_size_m)).astype(np.int64)
     unique_voxels, point_counts = np.unique(
         voxel_indices,
@@ -63,10 +81,12 @@ def _largest_connected_voxel_cluster_points(
     }
     unvisited = set(voxel_weights)
     largest_cluster_points = 0
+    largest_cluster_voxels: set[tuple[int, int, int]] = set()
     while unvisited:
         seed = unvisited.pop()
         stack = [seed]
         cluster_points = 0
+        cluster_voxels = {seed}
         while stack:
             voxel = stack.pop()
             cluster_points += voxel_weights[voxel]
@@ -75,8 +95,55 @@ def _largest_connected_voxel_cluster_points(
                 if neighbor in unvisited:
                     unvisited.remove(neighbor)
                     stack.append(neighbor)
-        largest_cluster_points = max(largest_cluster_points, cluster_points)
-    return len(unique_voxels), largest_cluster_points
+                    cluster_voxels.add(neighbor)
+        if cluster_points > largest_cluster_points:
+            largest_cluster_points = cluster_points
+            largest_cluster_voxels = cluster_voxels
+    return (
+        len(unique_voxels),
+        largest_cluster_points,
+        np.asarray(sorted(largest_cluster_voxels), dtype=np.int64).reshape(-1, 3),
+    )
+
+
+def measure_voxel_overlap(
+    previous_voxels: np.ndarray | None,
+    current_voxels: np.ndarray,
+    *,
+    min_overlap_voxels: int = 1,
+    min_overlap_ratio: float = 0.0,
+) -> tuple[int, float, bool]:
+    """Measure spatial overlap between two occupied-voxel sets.
+
+    The ratio is normalized by the smaller set, allowing a fixed obstacle
+    whose visible sampling changes between FFS frames to remain confirmable.
+    ``previous_voxels=None`` (or an empty set) never confirms persistence.
+    """
+
+    if int(min_overlap_voxels) < 0:
+        raise ValueError("min_overlap_voxels must be non-negative")
+    if not 0.0 <= float(min_overlap_ratio) <= 1.0:
+        raise ValueError("min_overlap_ratio must be in [0, 1]")
+    current = np.asarray(current_voxels, dtype=np.int64)
+    if current.ndim != 2 or current.shape[1:] != (3,):
+        raise ValueError("current_voxels must have shape (N, 3)")
+    if previous_voxels is None:
+        return 0, 0.0, False
+    previous = np.asarray(previous_voxels, dtype=np.int64)
+    if previous.ndim != 2 or previous.shape[1:] != (3,):
+        raise ValueError("previous_voxels must have shape (N, 3)")
+    if len(previous) == 0 or len(current) == 0:
+        return 0, 0.0, False
+    previous_set = {tuple(int(value) for value in voxel) for voxel in previous}
+    current_set = {tuple(int(value) for value in voxel) for voxel in current}
+    overlap = len(previous_set & current_set)
+    ratio = overlap / float(max(1, min(len(previous_set), len(current_set))))
+    confirmed = (
+        overlap > 0
+        and overlap >= int(min_overlap_voxels)
+        and ratio >= float(min_overlap_ratio)
+    )
+    return int(overlap), float(ratio), bool(confirmed)
 
 
 def evaluate_target_overhead_clearance(
@@ -226,6 +293,7 @@ def evaluate_gripper_side_clearance(
     candidate_counts = []
     largest_clusters = []
     target_excluded_counts = []
+    candidate_voxels = []
     side_clear = []
     for sign in (-1.0, 1.0):
         outward = sign * local_points[:, 1] - half_width
@@ -240,6 +308,20 @@ def evaluate_gripper_side_clearance(
         target_excluded_mask = raw_side_mask & target_points
         side_mask = raw_side_mask & ~target_points
         candidates = points[side_mask]
+        # Keep the existing world-frame cluster safety test, and additionally
+        # expose all side candidates in target-local voxels for persistence.
+        # The global point-cloud sampling order is not stable between FFS
+        # inferences, so persistence must not rely on point indices or on a
+        # small coincidental overlap of only one sub-cluster.
+        local_candidates = local_points[side_mask]
+        candidate_voxels.append(
+            np.unique(
+                np.floor(local_candidates / float(voxel_size_m)).astype(np.int64),
+                axis=0,
+            )
+            if len(local_candidates)
+            else np.empty((0, 3), dtype=np.int64)
+        )
         _, largest_cluster = _largest_connected_voxel_cluster_points(
             candidates,
             voxel_size_m,
@@ -265,6 +347,8 @@ def evaluate_gripper_side_clearance(
         negative_target_excluded_point_count=target_excluded_counts[0],
         positive_target_excluded_point_count=target_excluded_counts[1],
         candidate_mask=side_masks[0] | side_masks[1],
+        negative_candidate_voxel_indices=candidate_voxels[0],
+        positive_candidate_voxel_indices=candidate_voxels[1],
     )
 
 

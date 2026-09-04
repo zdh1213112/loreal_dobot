@@ -40,6 +40,7 @@ from std_msgs.msg import Bool, Float32, String
 from dobot_nova5_driver.handoff_clearance import (
     evaluate_camera_right_handoff_clearance,
     evaluate_gripper_side_clearance,
+    measure_voxel_overlap,
 )
 from dobot_nova5_driver.gripper_width_policy import select_gripper_width
 from dobot_nova5_driver.top_surface_geometry import (
@@ -141,6 +142,14 @@ GRIPPER_SIDE_GRASP_BELOW_CENTER_FRACTION = 0.25
 GRIPPER_SIDE_VERTICAL_MARGIN_ABOVE_M = 0.080
 GRIPPER_SIDE_VOXEL_SIZE_M = 0.010
 GRIPPER_SIDE_MIN_CLUSTER_POINTS = 20
+# A side corridor is confirmed as persistently occupied only when the raw
+# obstacle cluster is present in two independent LIVE clouds and their
+# target-local occupied voxels overlap.  A single frame still inhibits descent
+# (fail-safe), but is kept in VERIFYING_BLOCKED instead of forcing a target
+# reset; this filters transient reflective returns while remaining safe for
+# moving obstacles.
+GRIPPER_SIDE_CONFIRM_MIN_OVERLAP_VOXELS = 8
+GRIPPER_SIDE_CONFIRM_MIN_OVERLAP_RATIO = 0.50
 
 # Camera/panel parameters
 AUTO_EXPOSURE = True
@@ -1393,6 +1402,9 @@ last_gripper_negative_target_excluded = 0
 last_gripper_positive_target_excluded = 0
 last_gripper_negative_side_clear = False
 last_gripper_positive_side_clear = False
+# Previous side-corridor occupancy from the last independent LIVE FFS cloud.
+# Each entry is an (N, 3) int voxel array in the target-local frame.
+last_gripper_side_live_voxels = [None, None]
 handoff_reacquire_required = False
 pregrasp_tracking_deadline = 0.0
 
@@ -1441,6 +1453,7 @@ try:
             last_gripper_positive_target_excluded = 0
             last_gripper_negative_side_clear = False
             last_gripper_positive_side_clear = False
+            last_gripper_side_live_voxels = [None, None]
             handoff_reacquire_required = False
             pregrasp_tracking_deadline = 0.0
             stable_target_frames.clear()
@@ -1691,6 +1704,7 @@ try:
                 last_gripper_positive_target_excluded = 0
                 last_gripper_negative_side_clear = False
                 last_gripper_positive_side_clear = False
+                last_gripper_side_live_voxels = [None, None]
                 handoff_reacquire_required = False
                 publish_handoff_clearance("CHECKING", clear=False)
                 x1, y1 = np.min(corners, axis=0)
@@ -1706,6 +1720,7 @@ try:
         display = color_bgr.copy()
         tracked_target_points = None
         handoff_candidate_mask = None
+        side_clearance_evaluated = False
         if current_mask is not None and np.any(current_mask):
             overlay = display.copy()
             overlay[current_mask > 0] = MASK_COLOR_BGR
@@ -1986,6 +2001,7 @@ try:
                                         tracking_frames_without_height = 0
 
                                         if not handoff_clearance_passed:
+                                            side_clearance_evaluated = True
                                             clearance = evaluate_camera_right_handoff_clearance(
                                                 points_3d,
                                                 smooth_box_center,
@@ -2056,27 +2072,108 @@ try:
                                                 side_clearance.negative_largest_cluster_point_count,
                                                 side_clearance.positive_largest_cluster_point_count,
                                             )
+                                            # Side occupancy is fail-safe at the
+                                            # current frame: any raw side cluster
+                                            # inhibits descent.  Escalation to a
+                                            # persistent BLOCKED/reacquire state,
+                                            # however, requires the same side to be
+                                            # occupied in two independent LIVE
+                                            # clouds at overlapping target-local
+                                            # voxels.  LOCKED snapshots never enter
+                                            # this history (and break adjacency).
+                                            independent_live_sample = not using_locked_cloud
+                                            side_overlaps = [0, 0]
+                                            side_overlap_ratios = [0.0, 0.0]
+                                            side_confirmed_blocked = [False, False]
+                                            current_side_voxels = [
+                                                side_clearance.negative_candidate_voxel_indices,
+                                                side_clearance.positive_candidate_voxel_indices,
+                                            ]
+                                            raw_side_blocked = [
+                                                not side_clearance.negative_side_clear,
+                                                not side_clearance.positive_side_clear,
+                                            ]
+                                            if independent_live_sample:
+                                                for side_index in (0, 1):
+                                                    (
+                                                        side_overlaps[side_index],
+                                                        side_overlap_ratios[side_index],
+                                                        side_confirmed_blocked[side_index],
+                                                    ) = measure_voxel_overlap(
+                                                        last_gripper_side_live_voxels[side_index],
+                                                        current_side_voxels[side_index],
+                                                        min_overlap_voxels=(
+                                                            GRIPPER_SIDE_CONFIRM_MIN_OVERLAP_VOXELS
+                                                        ),
+                                                        min_overlap_ratio=(
+                                                            GRIPPER_SIDE_CONFIRM_MIN_OVERLAP_RATIO
+                                                        ),
+                                                    )
+                                                # Copy the arrays so later FFS/SAM
+                                                # processing cannot mutate evidence.
+                                                last_gripper_side_live_voxels = [
+                                                    (
+                                                        np.asarray(
+                                                            voxels,
+                                                            dtype=np.int64,
+                                                        ).copy()
+                                                        if raw_side_blocked[index]
+                                                        else None
+                                                    )
+                                                    for index, voxels in enumerate(
+                                                        current_side_voxels
+                                                    )
+                                                ]
+                                            else:
+                                                # Do not bridge a LIVE sample across
+                                                # a LOCKED fallback; the next LIVE
+                                                # cloud must provide both samples.
+                                                last_gripper_side_live_voxels = [None, None]
+                                            any_side_confirmed_blocked = any(
+                                                raw_side_blocked[index]
+                                                and side_confirmed_blocked[index]
+                                                for index in (0, 1)
+                                            )
                                             complete_clearance = (
                                                 clearance.clear and side_clearance.clear
                                             )
                                             # After the first snapshot (or any BLOCKED
                                             # result), a CLEAR result only counts when it
                                             # comes from a newly inferred LIVE FFS cloud.
-                                            independent_clear_sample = not (
-                                                handoff_force_live_cloud and using_locked_cloud
-                                            )
                                             if not complete_clearance:
                                                 handoff_clear_streak = 0
                                                 handoff_force_live_cloud = True
-                                                # Geometry measured while the handoff arm
-                                                # occupies the scene can follow the moving
-                                                # box or include an occluded side.  Once the
-                                                # arm leaves, require a fresh YOLO/SAM/FFS
-                                                # request instead of accepting this stale
-                                                # tracked geometry for descent.
-                                                handoff_reacquire_required = True
-                                                handoff_state = "BLOCKED"
-                                            elif not independent_clear_sample:
+                                                # Overhead/right-corridor obstacles
+                                                # retain the original immediate
+                                                # BLOCKED behavior.  A side-only raw
+                                                # hit remains a fail-safe pending
+                                                # state until spatial persistence is
+                                                # confirmed; this avoids locking onto
+                                                # a one-frame reflective return while
+                                                # still refusing descent immediately.
+                                                if (
+                                                    not clearance.clear
+                                                    or any_side_confirmed_blocked
+                                                ):
+                                                    # Geometry measured while the
+                                                    # handoff arm occupies the scene
+                                                    # can follow the moving box or
+                                                    # include an occluded side. Once
+                                                    # a real/persistent obstacle is
+                                                    # confirmed, require a fresh
+                                                    # YOLO/SAM/FFS request.
+                                                    handoff_reacquire_required = True
+                                                    handoff_state = "BLOCKED"
+                                                elif any(raw_side_blocked):
+                                                    handoff_state = "VERIFYING_BLOCKED"
+                                                else:
+                                                    # Defensive fallback; this branch
+                                                    # should only be reached when a
+                                                    # future clearance check adds a
+                                                    # non-side blocking source.
+                                                    handoff_reacquire_required = True
+                                                    handoff_state = "BLOCKED"
+                                            elif not independent_live_sample:
                                                 handoff_force_live_cloud = True
                                                 handoff_state = "WAIT_LIVE_CLOUD"
                                             elif handoff_reacquire_required:
@@ -2141,6 +2238,9 @@ try:
                                                     f"target_excluded="
                                                     f"-Y:{side_clearance.negative_target_excluded_point_count},"
                                                     f"+Y:{side_clearance.positive_target_excluded_point_count}, "
+                                                    f"overlap="
+                                                    f"-Y:{side_overlaps[0]}/{side_overlap_ratios[0]:.2f},"
+                                                    f"+Y:{side_overlaps[1]}/{side_overlap_ratios[1]:.2f}, "
                                                     f"clear_streak={handoff_clear_streak}/"
                                                     f"{HANDOFF_CLEARANCE_CLEAR_FRAMES}, "
                                                     f"cloud={'LOCKED' if using_locked_cloud else 'LIVE'}"
@@ -2272,6 +2372,13 @@ try:
                                     )
                                     last_height_warning_time = now
 
+        # A missing/invalid target frame is not an independent confirmation
+        # sample. Break spatial persistence across such gaps (and across a
+        # LOCKED fallback) so stale obstacle evidence cannot be paired with a
+        # later frame after the scene or target has changed.
+        if not handoff_clearance_passed and not side_clearance_evaluated:
+            last_gripper_side_live_voxels = [None, None]
+
         invalid_height_limit = (
             HANDOFF_FAST_REACQUIRE_INVALID_HEIGHT_FRAMES
             if handoff_reacquire_required
@@ -2378,7 +2485,11 @@ try:
             # Keep the panel responsive even when a large robot-link surface
             # contributes thousands of points to the forbidden prism.
             draw_step = max(1, len(projected_indices) // 250)
-            point_color = (255, 0, 255) if last_handoff_state == "BLOCKED" else (0, 165, 255)
+            point_color = (
+                (255, 0, 255)
+                if last_handoff_state in ("BLOCKED", "VERIFYING_BLOCKED")
+                else (0, 165, 255)
+            )
             for point_index in projected_indices[::draw_step]:
                 cv2.circle(
                     display,
@@ -2399,6 +2510,8 @@ try:
                 status = "FINGER PATH BLOCKED - REFUSING DESCENT"
             else:
                 status = "HANDOFF BLOCKED - WAITING FOR 102 RETREAT"
+        elif last_handoff_state == "VERIFYING_BLOCKED":
+            status = "FINGER PATH CHECKING - DESCENT INHIBITED"
         elif last_handoff_state == "REACQUIRE_TARGET":
             status = "HANDOFF CLEARED - REACQUIRING STATIONARY TARGET"
         elif last_handoff_state in ("VERIFYING_CLEAR", "WAIT_LIVE_CLOUD"):
