@@ -3,8 +3,9 @@
 The state machine intentionally contains only the requested path:
 
 startup -> trigger D405 -> grasp 75%-depth target -> transfer joint ->
-consume any barcode seen during transfer, otherwise rotate wrist J6 -90 degrees
-per barcode face with live scan monitoring and stop J6 as soon as one value is stable ->
+consume any barcode seen during transfer, otherwise continuously rotate wrist J6
+through the three 90-degree faces with live scan monitoring and stop J6 as soon
+as one value is stable (then snap to the nearest 90-degree face) ->
 single User-frame PTP combining XYZ=(557,200,320) mm, Ry-90 and Rz+50 ->
 place -> startup.
 
@@ -418,7 +419,10 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("barcode_flip_safe_joint_limit_deg", 355.0)
         self.declare_parameter("barcode_flip_watch_joint_index", 5)
         # J6 找码改用连续点动并实时监听扫码结果。到达目标角前一旦识别成功，
-        # 立即停止点动，保留条码正对扫码器的姿态。
+        # 立即停止点动，保留条码正对扫码器的姿态。默认把原来的 3 次 90°
+        # 点动合并为一次连续 270° 扫描；如现场扫码器在运动中识别率不足，
+        # 可关闭此开关回退到逐面停靠模式。
+        self.declare_parameter("barcode_continuous_rotation", True)
         self.declare_parameter("barcode_flip_jog_tolerance_deg", 1.0)
         self.declare_parameter("barcode_flip_jog_timeout_s", 60.0)
         # 扫码器可以在条码面斜对着它时提前解码。识别后不能直接保留任意
@@ -3414,6 +3418,7 @@ class CosmeticBoxSingleArmNode(Node):
         required_hits: int,
         previous_face_anchor_deg: float,
         next_face_anchor_deg: float,
+        face_anchor_candidates: Optional[list[float]] = None,
     ) -> str:
         """点动指定关节寻找条码，识别成功时立即停止并返回码值。"""
         current_joints = self.controller.current_joint()
@@ -3522,14 +3527,24 @@ class CosmeticBoxSingleArmNode(Node):
         # 使后续固定 User Ry -90° 能把条码面准确翻到正上方。
         snap_enabled = bool(self.get_parameter("barcode_snap_to_nearest_face").value)
         if captured_barcode and snap_enabled:
-            distance_to_previous = abs(stopped_joint_deg - float(previous_face_anchor_deg))
-            distance_to_next = abs(stopped_joint_deg - float(next_face_anchor_deg))
-            if distance_to_previous <= distance_to_next:
+            # In continuous mode the stop can occur anywhere in a 270° sweep,
+            # so the nearest face may be any of the four 90° anchors, not only
+            # the two anchors surrounding the current 90° segment.
+            anchors = [
+                float(anchor)
+                for anchor in (face_anchor_candidates or [
+                    previous_face_anchor_deg,
+                    next_face_anchor_deg,
+                ])
+            ]
+            snap_target_deg = min(anchors, key=lambda anchor: abs(stopped_joint_deg - anchor))
+            anchor_index = anchors.index(snap_target_deg)
+            if face_anchor_candidates:
+                face_anchor = f"face-{anchor_index + 1}/{len(anchors)}"
+            elif anchor_index == 0:
                 face_anchor = "previous"
-                snap_target_deg = float(previous_face_anchor_deg)
             else:
                 face_anchor = "next"
-                snap_target_deg = float(next_face_anchor_deg)
         else:
             face_anchor = "not-scanned"
             snap_target_deg = stopped_joint_deg
@@ -3589,6 +3604,138 @@ class CosmeticBoxSingleArmNode(Node):
         return ""
 
     def _rotate_until_stable_barcode(self) -> str:
+        """Acquire a barcode using continuous or per-face J6 search.
+
+        Continuous mode performs one monitored 270° sweep.  The scan window
+        remains armed for the whole sweep, so a HID decode received at any
+        intermediate angle stops J6 immediately and is then aligned to the
+        nearest 90° face.  The legacy segmented implementation remains
+        available as a field fallback when continuous motion is disabled or
+        when the full sweep would violate the configured J6 safety limit.
+        """
+        if bool(self.get_parameter("barcode_continuous_rotation").value):
+            return self._rotate_until_stable_barcode_continuous()
+        return self._rotate_until_stable_barcode_segmented()
+
+    def _rotate_until_stable_barcode_continuous(self) -> str:
+        required_hits = max(1, int(self.get_parameter("barcode_stable_hits").value))
+        max_faces = 4
+        wait_s = max(0.02, float(self.get_parameter("barcode_face_wait_s").value))
+        preferred_delta = float(self.get_parameter("barcode_flip_step_deg").value)
+        sweep_delta = preferred_delta * float(max_faces - 1)
+        try:
+            with self.barcode_lock:
+                window_active = self.barcode_window_active
+            if not window_active:
+                self._reset_barcode_window()
+
+            # Keep the existing fast path: a code received during transfer or
+            # while arriving at the scanner face avoids any J6 movement.
+            value = self._wait_for_current_barcode(
+                required_hits,
+                wait_s,
+                "checking barcode at transfer joint",
+            )
+            if value:
+                self._publish_status(f"barcode already acquired before J6 search: {value}")
+                return value
+
+            watch_index = max(
+                0,
+                min(5, int(self.get_parameter("barcode_flip_watch_joint_index").value)),
+            )
+            anchor_joints = self.controller.current_joint()
+            if len(anchor_joints) != 6:
+                raise RuntimeError(
+                    f"Current joint feedback must contain 6 values at barcode anchor, "
+                    f"got {len(anchor_joints)}"
+                )
+            first_face_anchor_deg = float(anchor_joints[watch_index])
+            face_anchors = [
+                first_face_anchor_deg + float(index) * preferred_delta
+                for index in range(max_faces)
+            ]
+
+            # Do not silently replace a 270° sweep with an equivalent 90°/630°
+            # winding: that would leave one or more faces unscanned.  If the
+            # exact sweep is outside the safe joint range, use the tested
+            # segmented fallback instead.
+            if not self._is_barcode_flip_joint_safe(anchor_joints, sweep_delta):
+                self.get_logger().warning(
+                    f"Continuous barcode sweep {sweep_delta:+.1f}deg is outside the "
+                    "configured J6 safety range; falling back to segmented face search"
+                )
+                return self._rotate_until_stable_barcode_segmented()
+
+            self._require_cycle_active("before continuous barcode face sweep")
+            self._reset_barcode_window()
+            self._publish_status(
+                f"barcode continuous J{watch_index + 1} sweep: "
+                f"{face_anchors[0]:.1f}->{face_anchors[-1]:.1f}deg "
+                f"({sweep_delta:+.1f}deg across {max_faces - 1} faces); "
+                "stop immediately on scan"
+            )
+            value = self._rotate_barcode_flip_joint(
+                sweep_delta,
+                max_faces - 1,
+                required_hits,
+                face_anchors[0],
+                face_anchors[-1],
+                face_anchor_candidates=face_anchors,
+            )
+            if value:
+                return value
+
+            # A decode can arrive during the controller's final deceleration
+            # or just after the sweep reaches the last face.  Give it the same
+            # short confirmation window as the segmented implementation and
+            # snap to whichever standard face is actually closest.
+            value = self._wait_for_current_barcode(
+                required_hits,
+                wait_s,
+                "checking barcode after continuous J6 sweep",
+            )
+            if value:
+                aligned_joints = self.controller.current_joint()
+                if len(aligned_joints) != 6:
+                    raise RuntimeError(
+                        f"Current joint feedback must contain 6 values before barcode alignment, "
+                        f"got {len(aligned_joints)}"
+                    )
+                stopped_joint_deg = float(aligned_joints[watch_index])
+                snap_target_deg = min(
+                    face_anchors,
+                    key=lambda anchor: abs(stopped_joint_deg - anchor),
+                )
+                correction_deg = snap_target_deg - stopped_joint_deg
+                if abs(correction_deg) > 0.2:
+                    self._publish_status(
+                        f"barcode acquired after continuous sweep; aligning J{watch_index + 1} "
+                        f"{stopped_joint_deg:.1f}->{snap_target_deg:.1f}deg "
+                        f"(correction {correction_deg:+.1f}deg)"
+                    )
+                    aligned_joints[watch_index] = snap_target_deg
+                    motion = self._motion_profile()
+                    self.controller.move_joint(
+                        [float(joint) for joint in aligned_joints],
+                        speed=motion["barcode_alignment_speed"],
+                        accel=motion["barcode_alignment_acc"],
+                    )
+                    self._require_cycle_active(
+                        "after final-face continuous barcode alignment"
+                    )
+                return value
+
+            self.get_logger().warning(
+                f"Barcode not stable after continuous {sweep_delta:+.1f}deg sweep; "
+                "continuing without barcode"
+            )
+            return ""
+        finally:
+            with self.barcode_lock:
+                self.barcode_window_active = False
+
+    def _rotate_until_stable_barcode_segmented(self) -> str:
         required_hits = max(1, int(self.get_parameter("barcode_stable_hits").value))
         # Inspect the face already presented at the transfer joint, then make
         # at most three monitored J6 quarter turns. Each turn stops early when
@@ -4148,6 +4295,10 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.barcode_hits = QSpinBox(); self.barcode_hits.setRange(1, 20); self.barcode_hits.setValue(int(self.node.get_parameter("barcode_stable_hits").value))
         self.barcode_rotations = QSpinBox(); self.barcode_rotations.setRange(4, 4); self.barcode_rotations.setValue(4)
         self.barcode_wait = self._new_double(float(self.node.get_parameter("barcode_face_wait_s").value), 0.02, 10.0, 2, 0.01)
+        self.barcode_continuous_rotation = QCheckBox("连续旋转 270°，扫码后吸附最近 90° 面")
+        self.barcode_continuous_rotation.setChecked(
+            bool(self.node.get_parameter("barcode_continuous_rotation").value)
+        )
         # 三段扫码相关运动分别调速，避免修改普通“关节速度”时全部一起变化。
         self.scanner_approach_speed = QSpinBox(); self.scanner_approach_speed.setRange(1, 100); self.scanner_approach_speed.setValue(int(self.node.get_parameter("scanner_approach_speed_factor").value))
         self.scanner_retreat_speed = QSpinBox(); self.scanner_retreat_speed.setRange(1, 100); self.scanner_retreat_speed.setValue(int(self.node.get_parameter("scanner_retreat_speed_factor").value))
@@ -4163,7 +4314,8 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.scanner_negative_tolerance = self._new_double(float(self.node.get_parameter("scanner_approach_negative_tolerance_m").value) * 1000.0, 0.0, 20.0, 1, 1.0)
         self.scanner_retreat_extra = self._new_double(float(self.node.get_parameter("scanner_retreat_extra_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
         form.addRow("同码稳定次数", self.barcode_hits)
-        form.addRow("检查面数（旧逻辑固定）", self.barcode_rotations)
+        form.addRow("连续找码模式", self.barcode_continuous_rotation)
+        form.addRow("检查面数（分段模式固定）", self.barcode_rotations)
         form.addRow("每面等待秒", self.barcode_wait)
         form.addRow("中转 TCP 到扫码器距离 mm", self.scanner_center_distance)
         form.addRow("盒侧面扫码间隙 mm", self.scanner_face_clearance)
@@ -4275,6 +4427,10 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("single_cycle_grasp_retry_limit", value=self.grasp_retry_limit.value()),
             Parameter("grasp_feedback_required", value=self.feedback_required.isChecked()),
             Parameter("barcode_stable_hits", value=self.barcode_hits.value()),
+            Parameter(
+                "barcode_continuous_rotation",
+                value=self.barcode_continuous_rotation.isChecked(),
+            ),
             Parameter("barcode_max_face_rotations", value=self.barcode_rotations.value()),
             Parameter("barcode_face_wait_s", value=self.barcode_wait.value()),
             Parameter("scanner_center_distance_m", value=self.scanner_center_distance.value() / 1000.0),

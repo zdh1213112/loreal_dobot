@@ -24,6 +24,14 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="400",
                 description="Unified motion scale; 100 is the legacy effective-speed baseline and 400 is the current faster default",
             ),
+            DeclareLaunchArgument(
+                "barcode_continuous_rotation",
+                default_value="true",
+                description=(
+                    "Sweep J6 continuously through 270 degrees and snap a detected "
+                    "barcode to the nearest 90-degree face; set false for segmented search"
+                ),
+            ),
             ExecuteProcess(
                 cmd=[LaunchConfiguration("vision_python"), VISION_SCRIPT],
                 output="screen",
@@ -44,7 +52,11 @@ def generate_launch_description() -> LaunchDescription:
                         "motion_speed_scale_percent": ParameterValue(
                             LaunchConfiguration("motion_speed_scale_percent"),
                             value_type=int,
-                        )
+                        ),
+                        "barcode_continuous_rotation": ParameterValue(
+                            LaunchConfiguration("barcode_continuous_rotation"),
+                            value_type=bool,
+                        ),
                     }
                 ],
             ),
