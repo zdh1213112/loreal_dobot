@@ -1,0 +1,1091 @@
+import re
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional
+
+from .TCP_IP_Python_V4.dobot_api import DobotApiDashboard, DobotApiFeedBack
+
+
+MM_PER_METER = 1000.0
+# The D405 can finish processing a frame after the robot has already moved
+# several centimetres.  Keep enough feedback samples to reconstruct the
+# flange pose at the frame-capture time instead of using the later pose.
+FEEDBACK_POSE_HISTORY_SIZE = 1000
+# Firmware variants expose ``TimeStamp`` either as a Unix clock or as a
+# controller-relative clock.  Unix values can be used directly; relative
+# clocks are mapped to host time from their 8 ms packet cadence and the
+# minimum observed receive offset.
+FEEDBACK_CONTROLLER_TIMESTAMP_MAX_CLOCK_ERROR_S = 5.0
+FEEDBACK_EXPECTED_PERIOD_S = 0.008
+FEEDBACK_RELATIVE_CLOCK_VOTES = 3
+FEEDBACK_RELATIVE_CLOCK_OFFSET_SAMPLES = 128
+ROBOT_MODE_TEXT = {
+    1: "INIT",
+    2: "BRAKE_OPEN",
+    3: "POWEROFF",
+    4: "DISABLED",
+    5: "ENABLE",
+    6: "BACKDRIVE",
+    7: "RUNNING",
+    8: "SINGLE_MOVE",
+    9: "ERROR",
+    10: "PAUSE",
+    11: "COLLISION",
+}
+
+
+@dataclass
+class TcpPose:
+    x: float
+    y: float
+    z: float
+    rx: float
+    ry: float
+    rz: float
+
+
+class DobotNova5Controller:
+    def __init__(
+        self,
+        robot_ip: str,
+        dashboard_port: int = 29999,
+        feedback_port: int = 30004,
+        startup_joint: Optional[list[float]] = None,
+        startup_speed: int = 20,
+    ) -> None:
+        self.robot_ip = robot_ip
+        self.dashboard_port = dashboard_port
+        self.feedback_port = feedback_port
+        self.startup_joint = startup_joint or [270.0, 0.0, 90.0, 0.0, -90.0, 0.0]
+        self.startup_speed = startup_speed
+
+        self.dashboard: DobotApiDashboard | None = None
+        self.feedback: DobotApiFeedBack | None = None
+        self.feedback_data = None
+        self._feedback_lock = threading.Lock()
+        # Entries are (controller/host wall-clock sample time, ToolVectorActual,
+        # User, Tool).  When firmware exposes a sane Unix-ms TimeStamp, the
+        # controller sample time is used; otherwise packet receive time is kept
+        # as a safe compatibility fallback.
+        self._feedback_pose_history: deque[tuple[float, TcpPose, int, int]] = deque(
+            maxlen=FEEDBACK_POSE_HISTORY_SIZE
+        )
+        # TCP linear speed samples share the exact same timestamp stream as
+        # the pose history.  The vision node uses them to prefer frames taken
+        # after the left arm has settled at the hover pose, without adding a
+        # blocking settle delay.
+        self._feedback_tcp_speed_history: deque[tuple[float, float, int, int]] = deque(
+            maxlen=FEEDBACK_POSE_HISTORY_SIZE
+        )
+        self._latest_feedback_received_at = 0.0
+        self._feedback_timestamp_source = "host_receive"
+        self._latest_feedback_raw_timestamp: Optional[int] = None
+        self._feedback_previous_raw_timestamp: Optional[int] = None
+        self._feedback_relative_clock_scale: Optional[float] = None
+        self._feedback_relative_clock_votes: deque[float] = deque(maxlen=8)
+        self._feedback_relative_clock_offsets: deque[float] = deque(
+            maxlen=FEEDBACK_RELATIVE_CLOCK_OFFSET_SAMPLES
+        )
+        self._feedback_thread: threading.Thread | None = None
+        self._stop_feedback = threading.Event()
+        self._command_lock = threading.Lock()
+        # Legacy callers expect ``move_joint(speed=...)`` to set both the
+        # global SpeedFactor and the MovJ-local ``v`` ratio.  The cosmetic-box
+        # cycle opts into single-command scaling instead: global/profile
+        # ratios stay at 100 and every motion receives one already-composed
+        # speed/acceleration percentage.  Keeping this opt-in avoids changing
+        # the behaviour of the other Nova5 nodes that share this controller.
+        self._single_command_motion_scaling = False
+        # Incremented by Stop(). Every blocking motion wait captures the epoch
+        # used when its command was submitted, allowing Stop to wake the old
+        # waiter immediately instead of leaving it blocked for 60 seconds on a
+        # command id that the controller has already abandoned.
+        self._motion_cancel_epoch = 0
+
+    def connect(self, go_to_start: bool = False, auto_enable: bool = False) -> None:
+        self.dashboard = DobotApiDashboard(self.robot_ip, self.dashboard_port)
+        self.feedback = DobotApiFeedBack(self.robot_ip, self.feedback_port)
+        self._stop_feedback.clear()
+        self._feedback_thread = threading.Thread(target=self._feedback_loop, daemon=True)
+        self._feedback_thread.start()
+        self._wait_for_feedback()
+
+        if auto_enable:
+            if self.robot_mode == 9:
+                self._raise_if_error(self.dashboard.ClearError(), "ClearError")
+                self._wait_until(lambda: self.robot_mode != 9, timeout_s=10.0, detail="clear robot error")
+
+            self._raise_if_enable_issue(self.dashboard.EnableRobot())
+            self._wait_until(lambda: self.robot_mode == 5, timeout_s=30.0, detail="robot enable ready")
+
+            if go_to_start:
+                self.move_joint(self.startup_joint, speed=self.startup_speed)
+
+    def connect_feedback_only(self) -> None:
+        """Open only the streaming feedback socket, without Dashboard access.
+
+        This is used when another process owns the robot's Dashboard/control
+        connection.  The feedback stream is read-only and does not send any
+        command to the robot.
+        """
+
+        self.dashboard = None
+        self.feedback = DobotApiFeedBack(self.robot_ip, self.feedback_port)
+        self._stop_feedback.clear()
+        self._feedback_thread = threading.Thread(target=self._feedback_loop, daemon=True)
+        self._feedback_thread.start()
+        self._wait_for_feedback()
+        self._wait_for_feedback_pose()
+
+    def disconnect(self) -> None:
+        self._stop_feedback.set()
+        if self.dashboard is not None:
+            self.dashboard.close()
+            self.dashboard = None
+        if self.feedback is not None:
+            self.feedback.close()
+            self.feedback = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self.dashboard is not None and self.feedback is not None
+
+    @property
+    def robot_mode(self) -> int:
+        if self.feedback_data is None:
+            return -1
+        return int(self.feedback_data["RobotMode"][0])
+
+    def _tcp_pose_from_values(self, values) -> TcpPose:
+        if len(values) < 6:
+            raise RuntimeError("Pose data did not contain 6 values")
+        return TcpPose(
+            x=float(values[0]) / MM_PER_METER,
+            y=float(values[1]) / MM_PER_METER,
+            z=float(values[2]) / MM_PER_METER,
+            rx=float(values[3]),
+            ry=float(values[4]),
+            rz=float(values[5]),
+        )
+
+    def feedback_tool_index(self) -> int:
+        if self.feedback_data is None:
+            raise RuntimeError("Feedback not ready")
+        return int(self.feedback_data["Tool"][0])
+
+    def feedback_user_index(self) -> int:
+        if self.feedback_data is None:
+            raise RuntimeError("Feedback not ready")
+        return int(self.feedback_data["User"][0])
+
+    def current_tcp_pose(self, user_index: Optional[int] = None, tool_index: Optional[int] = None) -> TcpPose:
+        if self.feedback_data is None:
+            raise RuntimeError("Feedback not ready")
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        if user_index is not None and tool_index is not None:
+            if self.feedback_user_index() == int(user_index) and self.feedback_tool_index() == int(tool_index):
+                tcp = self.feedback_data["ToolVectorActual"][0]
+                return self._tcp_pose_from_values(tcp)
+            return self.read_pose(user_index=user_index, tool_index=tool_index)
+        tcp = self.feedback_data["ToolVectorActual"][0]
+        return self._tcp_pose_from_values(tcp)
+
+    @staticmethod
+    def _interpolate_angle_deg(first: float, second: float, ratio: float) -> float:
+        """Interpolate an angle through the shortest path across +/-180 degrees."""
+
+        delta = (float(second) - float(first) + 180.0) % 360.0 - 180.0
+        return float(first) + float(ratio) * delta
+
+    @classmethod
+    def _interpolate_tcp_pose(
+        cls,
+        first: TcpPose,
+        second: TcpPose,
+        ratio: float,
+    ) -> TcpPose:
+        ratio = max(0.0, min(1.0, float(ratio)))
+        return TcpPose(
+            x=first.x + ratio * (second.x - first.x),
+            y=first.y + ratio * (second.y - first.y),
+            z=first.z + ratio * (second.z - first.z),
+            rx=cls._interpolate_angle_deg(first.rx, second.rx, ratio),
+            ry=cls._interpolate_angle_deg(first.ry, second.ry, ratio),
+            rz=cls._interpolate_angle_deg(first.rz, second.rz, ratio),
+        )
+
+    @classmethod
+    def _pose_from_history(
+        cls,
+        history: list[tuple[float, TcpPose, int, int]],
+        timestamp_s: float,
+        max_skew_s: float,
+    ) -> TcpPose:
+        """Interpolate one timestamp from an already selected feedback stream."""
+
+        if not history:
+            raise RuntimeError("No timestamped robot feedback pose is available")
+        first = history[0]
+        last = history[-1]
+        max_skew_s = max(0.0, float(max_skew_s))
+        if timestamp_s < first[0]:
+            if first[0] - timestamp_s > max_skew_s:
+                raise RuntimeError(
+                    f"Frame timestamp is {first[0] - timestamp_s:.3f}s older than "
+                    f"the available robot pose history (limit {max_skew_s:.3f}s)"
+                )
+            return first[1]
+        if timestamp_s > last[0]:
+            if timestamp_s - last[0] > max_skew_s:
+                raise RuntimeError(
+                    f"Frame timestamp is {timestamp_s - last[0]:.3f}s newer than "
+                    f"the available robot pose history (limit {max_skew_s:.3f}s)"
+                )
+            return last[1]
+
+        previous = first
+        for following in history[1:]:
+            if following[0] >= timestamp_s:
+                interval_s = following[0] - previous[0]
+                if interval_s <= 1e-9:
+                    return following[1]
+                ratio = (timestamp_s - previous[0]) / interval_s
+                return cls._interpolate_tcp_pose(previous[1], following[1], ratio)
+            previous = following
+        return last[1]
+
+    def current_feedback_tcp_pose_at(
+        self,
+        timestamp_s: float,
+        max_skew_s: float = 0.30,
+    ) -> tuple[TcpPose, int, int]:
+        """Return the active feedback pose and its User/Tool at a past time."""
+
+        try:
+            timestamp_s = float(timestamp_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid pose timestamp: {timestamp_s!r}") from exc
+        if not (timestamp_s > 0.0):
+            raise ValueError(f"Invalid pose timestamp: {timestamp_s!r}")
+
+        with self._feedback_lock:
+            history = list(self._feedback_pose_history)
+            feedback = self.feedback_data
+        if not history:
+            raise RuntimeError(
+                f"No timestamped robot feedback pose is available for frame time "
+                f"{timestamp_s:.6f}s"
+            )
+
+        # ToolVectorActual is expressed in the currently active User/Tool.
+        # Keep one continuous coordinate stream when a command changes the
+        # active pair; mixing two pairs would make interpolation invalid.
+        active_user = int(feedback["User"][0]) if feedback is not None else history[-1][2]
+        active_tool = int(feedback["Tool"][0]) if feedback is not None else history[-1][3]
+        active_history = [
+            sample
+            for sample in history
+            if sample[2] == active_user and sample[3] == active_tool
+        ]
+        if not active_history:
+            raise RuntimeError(
+                f"No timestamped robot feedback pose is available for active "
+                f"user={active_user} tool={active_tool} at frame time {timestamp_s:.6f}s"
+            )
+        return (
+            self._pose_from_history(active_history, timestamp_s, max_skew_s),
+            active_user,
+            active_tool,
+        )
+
+    def current_feedback_tcp_pose(self) -> tuple[TcpPose, int, int]:
+        """Return the latest feedback pose together with its User/Tool pair."""
+
+        with self._feedback_lock:
+            if not self._feedback_pose_history:
+                raise RuntimeError("Timestamped robot feedback pose is not ready")
+            _, pose, user_index, tool_index = self._feedback_pose_history[-1]
+        return pose, user_index, tool_index
+
+    def current_feedback_tcp_pose_with_timestamp(
+        self,
+    ) -> tuple[TcpPose, int, int, float]:
+        """Return the latest feedback TCP pose and its host receive timestamp."""
+
+        with self._feedback_lock:
+            if not self._feedback_pose_history:
+                raise RuntimeError("Timestamped robot feedback pose is not ready")
+            _, pose, user_index, tool_index = self._feedback_pose_history[-1]
+            received_at = self._latest_feedback_received_at
+            if received_at <= 0.0:
+                received_at = self._feedback_pose_history[-1][0]
+        return pose, user_index, tool_index, float(received_at)
+
+    @property
+    def feedback_timestamp_source(self) -> str:
+        """Return the clock used for temporal pose interpolation."""
+
+        with self._feedback_lock:
+            return str(self._feedback_timestamp_source)
+
+    @property
+    def feedback_raw_timestamp(self) -> Optional[int]:
+        """Return the latest unmodified 30004 TimeStamp for diagnostics."""
+
+        with self._feedback_lock:
+            return self._latest_feedback_raw_timestamp
+
+    @staticmethod
+    def _feedback_raw_timestamp(packet) -> Optional[int]:
+        try:
+            raw_timestamp = int(packet["TimeStamp"][0])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        return raw_timestamp if raw_timestamp > 0 else None
+
+    @staticmethod
+    def _feedback_packet_timestamp_s(packet, received_at: float) -> tuple[float, str]:
+        """Extract the controller Unix-ms timestamp, with a safe fallback."""
+
+        raw_timestamp = DobotNova5Controller._feedback_raw_timestamp(packet)
+        if raw_timestamp is None:
+            return float(received_at), "host_receive"
+
+        # The Dobot 30004 protocol specifies Unix milliseconds.  Try the
+        # neighbouring Unix units defensively so a firmware variant cannot
+        # silently make us use a timestamp from the wrong magnitude.
+        candidates = []
+        if raw_timestamp >= 10**17:
+            candidates.append((raw_timestamp * 1e-9, "controller_unix_ns"))
+        if raw_timestamp >= 10**14:
+            candidates.append((raw_timestamp * 1e-6, "controller_unix_us"))
+        if raw_timestamp >= 10**11:
+            candidates.append((raw_timestamp * 1e-3, "controller_unix_ms"))
+        for controller_timestamp, source in candidates:
+            if abs(controller_timestamp - float(received_at)) <= FEEDBACK_CONTROLLER_TIMESTAMP_MAX_CLOCK_ERROR_S:
+                return float(controller_timestamp), source
+        return float(received_at), "host_receive"
+
+    def _feedback_sample_timestamp_s(self, packet, received_at: float) -> tuple[float, str]:
+        """Map a Unix or controller-relative feedback stamp to host time."""
+
+        direct_time, direct_source = self._feedback_packet_timestamp_s(packet, received_at)
+        raw_timestamp = self._feedback_raw_timestamp(packet)
+        if raw_timestamp is None or direct_source != "host_receive":
+            self._feedback_previous_raw_timestamp = raw_timestamp
+            return direct_time, direct_source
+
+        previous_raw = self._feedback_previous_raw_timestamp
+        self._feedback_previous_raw_timestamp = raw_timestamp
+        if previous_raw is not None and raw_timestamp <= previous_raw:
+            # Robot reboot, wrapping clock or repeated value: learn the relative
+            # clock again rather than mixing two epochs in one pose history.
+            if raw_timestamp < previous_raw:
+                self._feedback_relative_clock_scale = None
+                self._feedback_relative_clock_votes.clear()
+                self._feedback_relative_clock_offsets.clear()
+            return float(received_at), "host_receive"
+
+        if previous_raw is not None:
+            raw_delta = raw_timestamp - previous_raw
+            candidates = []
+            for scale, source in (
+                (1e-3, "controller_relative_ms_mapped"),
+                (1e-6, "controller_relative_us_mapped"),
+                (1e-9, "controller_relative_ns_mapped"),
+            ):
+                delta_s = raw_delta * scale
+                if not 0.002 <= delta_s <= 0.50:
+                    continue
+                periods = max(1, int(round(delta_s / FEEDBACK_EXPECTED_PERIOD_S)))
+                cadence_error_s = abs(delta_s - periods * FEEDBACK_EXPECTED_PERIOD_S)
+                candidates.append((cadence_error_s, scale, source))
+            if candidates:
+                cadence_error_s, scale, _ = min(candidates, key=lambda item: item[0])
+                if cadence_error_s <= 0.003:
+                    self._feedback_relative_clock_votes.append(scale)
+                    matching_votes = sum(
+                        1
+                        for vote in self._feedback_relative_clock_votes
+                        if vote == scale
+                    )
+                    if matching_votes >= FEEDBACK_RELATIVE_CLOCK_VOTES:
+                        self._feedback_relative_clock_scale = scale
+
+        scale = self._feedback_relative_clock_scale
+        if scale is None:
+            return float(received_at), "host_receive"
+
+        controller_relative_s = raw_timestamp * scale
+        self._feedback_relative_clock_offsets.append(
+            float(received_at) - controller_relative_s
+        )
+        # Receive time equals sample time plus transport/scheduling delay.  The
+        # smallest recent offset is the least-delayed packet and gives a stable
+        # no-extra-wait mapping into the D405 host-clock domain.
+        mapped_time = controller_relative_s + min(self._feedback_relative_clock_offsets)
+        age_s = float(received_at) - mapped_time
+        if age_s < -0.010 or age_s > 0.50:
+            return float(received_at), "host_receive"
+        unit_source = {
+            1e-3: "controller_relative_ms_mapped",
+            1e-6: "controller_relative_us_mapped",
+            1e-9: "controller_relative_ns_mapped",
+        }[scale]
+        return float(mapped_time), unit_source
+
+    @staticmethod
+    def _scalar_from_history(
+        history: list[tuple[float, float, int, int]],
+        timestamp_s: float,
+        max_skew_s: float,
+    ) -> float:
+        """Interpolate a scalar from timestamped feedback samples."""
+
+        if not history:
+            raise RuntimeError("No timestamped feedback scalar is available")
+        first = history[0]
+        last = history[-1]
+        max_skew_s = max(0.0, float(max_skew_s))
+        if timestamp_s < first[0]:
+            if first[0] - timestamp_s > max_skew_s:
+                raise RuntimeError(
+                    f"Frame timestamp is {first[0] - timestamp_s:.3f}s older than "
+                    "the available feedback speed history"
+                )
+            return float(first[1])
+        if timestamp_s > last[0]:
+            if timestamp_s - last[0] > max_skew_s:
+                raise RuntimeError(
+                    f"Frame timestamp is {timestamp_s - last[0]:.3f}s newer than "
+                    "the available feedback speed history"
+                )
+            return float(last[1])
+
+        previous = first
+        for following in history[1:]:
+            if following[0] >= timestamp_s:
+                interval_s = following[0] - previous[0]
+                if interval_s <= 1e-9:
+                    return float(following[1])
+                ratio = (timestamp_s - previous[0]) / interval_s
+                return float(previous[1] + ratio * (following[1] - previous[1]))
+            previous = following
+        return float(last[1])
+
+    def current_tcp_linear_speed_at(
+        self,
+        timestamp_s: float,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+        max_skew_s: float = 0.30,
+    ) -> float:
+        """Return TCP linear speed in m/s at a historical frame timestamp."""
+
+        try:
+            timestamp_s = float(timestamp_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid speed timestamp: {timestamp_s!r}") from exc
+        if not timestamp_s > 0.0:
+            raise ValueError(f"Invalid speed timestamp: {timestamp_s!r}")
+        with self._feedback_lock:
+            history = list(self._feedback_tcp_speed_history)
+            feedback = self.feedback_data
+        if user_index is None and tool_index is None and feedback is not None:
+            active_user = int(feedback["User"][0])
+            active_tool = int(feedback["Tool"][0])
+            history = [
+                sample
+                for sample in history
+                if sample[2] == active_user and sample[3] == active_tool
+            ]
+        if user_index is not None and tool_index is not None:
+            requested_user = int(user_index)
+            requested_tool = int(tool_index)
+            history = [
+                sample
+                for sample in history
+                if sample[2] == requested_user and sample[3] == requested_tool
+            ]
+        return self._scalar_from_history(history, timestamp_s, max_skew_s)
+
+    def current_tcp_pose_at(
+        self,
+        timestamp_s: float,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+        max_skew_s: float = 0.30,
+    ) -> TcpPose:
+        """Return a requested User/Tool TCP pose at a past host-clock time."""
+
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        try:
+            timestamp_s = float(timestamp_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid pose timestamp: {timestamp_s!r}") from exc
+        if not (timestamp_s > 0.0):
+            return self.current_tcp_pose(user_index=user_index, tool_index=tool_index)
+
+        with self._feedback_lock:
+            history = list(self._feedback_pose_history)
+        if user_index is not None and tool_index is not None:
+            requested_user = int(user_index)
+            requested_tool = int(tool_index)
+            history = [
+                sample
+                for sample in history
+                if sample[2] == requested_user and sample[3] == requested_tool
+            ]
+        if not history:
+            requested = (
+                f" user={int(user_index)} tool={int(tool_index)}"
+                if user_index is not None and tool_index is not None
+                else ""
+            )
+            raise RuntimeError(
+                f"No timestamped robot feedback pose is available for frame time "
+                f"{timestamp_s:.6f}s ({requested.strip() or 'active tool'})"
+            )
+        return self._pose_from_history(history, timestamp_s, max_skew_s)
+
+    def current_joint(self) -> list[float]:
+        if self.feedback_data is None:
+            raise RuntimeError("Feedback not ready")
+        joints = self.feedback_data["QActual"][0]
+        return [float(v) for v in joints]
+
+    def current_command_id(self) -> int:
+        if self.feedback_data is None:
+            return -1
+        return int(self.feedback_data["CurrentCommandId"][0])
+
+    def robot_mode_text(self) -> str:
+        return ROBOT_MODE_TEXT.get(self.robot_mode, str(self.robot_mode))
+
+    def power_on(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.PowerOn(), "PowerOn")
+
+    def enable_robot(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_enable_issue(self.dashboard.EnableRobot())
+        self._wait_until(lambda: self.robot_mode == 5, timeout_s=30.0, detail="robot enable ready")
+
+    def disable_robot(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.DisableRobot(), "DisableRobot")
+
+    def clear_error(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.ClearError(), "ClearError")
+
+    def reset_robot(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.ResetRobot(), "ResetRobot")
+
+    def stop_motion(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            response = self.dashboard.Stop()
+            self._motion_cancel_epoch += 1
+            self._raise_if_error(response, "Stop")
+        self._wait_until(lambda: self.robot_mode != 10, timeout_s=5.0, detail="robot exit pause after stop")
+
+    def wait_until_idle(self, timeout_s: float = 5.0) -> None:
+        self._wait_until(lambda: self.robot_mode == 5, timeout_s=timeout_s, detail="robot idle")
+
+    def pause_motion(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.Pause(), "Pause")
+
+    def continue_motion(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.Continue(), "Continue")
+
+    def set_speed_factor(self, speed: int) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.SpeedFactor(int(speed)), "SpeedFactor")
+
+    def set_joint_profile(self, speed: Optional[int] = None, accel: Optional[int] = None) -> bool:
+        self._ensure_dashboard()
+        supported = True
+        with self._command_lock:
+            if accel is not None:
+                if not self._raise_if_supported(self.dashboard.AccJ(int(accel)), "AccJ"):
+                    supported = False
+            if speed is not None:
+                if not self._raise_if_supported(self.dashboard.VelJ(int(speed)), "VelJ"):
+                    supported = False
+        return supported
+
+    def set_linear_profile(self, speed: Optional[int] = None, accel: Optional[int] = None) -> bool:
+        self._ensure_dashboard()
+        supported = True
+        with self._command_lock:
+            if accel is not None:
+                if not self._raise_if_supported(self.dashboard.AccL(int(accel)), "AccL"):
+                    supported = False
+            if speed is not None:
+                if not self._raise_if_supported(self.dashboard.VelL(int(speed)), "VelL"):
+                    supported = False
+        return supported
+
+    def enable_single_command_motion_scaling(self) -> None:
+        """Use only per-command ``v/a`` ratios for replay motions.
+
+        Dobot replay motion normally multiplies the global SpeedFactor, the
+        VelJ/VelL or AccJ/AccL profile, and the optional ratio on each motion
+        command.  This mode fixes the first two layers at 100 so callers can
+        compose the desired effective ratio once and pass it to the command.
+        MoveJog remains the intentional exception because it has no per-command
+        speed argument and must temporarily use SpeedFactor.
+        """
+        self.set_speed_factor(100)
+        self.set_joint_profile(speed=100, accel=100)
+        self.set_linear_profile(speed=100, accel=100)
+        self._single_command_motion_scaling = True
+
+    def set_user_index(self, index: int) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.User(int(index)), "User")
+
+    def set_tool_index(self, index: int) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.Tool(int(index)), "Tool")
+
+    def start_drag(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.StartDrag(), "StartDrag")
+
+    def stop_drag(self) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(self.dashboard.StopDrag(), "StopDrag")
+
+    def move_jog(self, axis_id: str, coord_type: int = 1, user: int = 0, tool: int = 0) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            if axis_id == "":
+                response = self.dashboard.MoveJog("")
+            else:
+                response = self.dashboard.MoveJog(axis_id=axis_id, coordtype=coord_type, user=user, tool=tool)
+            try:
+                self._raise_if_error(response, f"MoveJog({axis_id})")
+            except RuntimeError as exc:
+                try:
+                    error_detail = str(self.dashboard.GetErrorID()).strip()
+                except Exception as error_exc:
+                    error_detail = f"GetErrorID failed: {error_exc}"
+                raise RuntimeError(f"{exc}; controller_errors={error_detail}") from exc
+
+    def read_pose(self, user_index: Optional[int] = None, tool_index: Optional[int] = None) -> TcpPose:
+        self._ensure_dashboard()
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        with self._command_lock:
+            if user_index is None and tool_index is None:
+                values = self._raise_if_error(self.dashboard.GetPose(), "GetPose")
+            else:
+                values = self._raise_if_error(
+                    self.dashboard.GetPose(user=int(user_index), tool=int(tool_index)),
+                    f"GetPose(user={int(user_index)}, tool={int(tool_index)})",
+                )
+        return self._tcp_pose_from_values(values)
+
+    def move_to_startup(self) -> None:
+        if self.robot_mode == 10:
+            self.stop_motion()
+        self.move_joint(self.startup_joint, speed=self.startup_speed)
+
+    def move_joint(
+        self,
+        joints_deg: list[float],
+        speed: int = 20,
+        accel: Optional[int] = None,
+    ) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            if not self._single_command_motion_scaling:
+                self._raise_if_error(self.dashboard.SpeedFactor(int(speed)), "SpeedFactor")
+            response = self.dashboard.MovJ(
+                float(joints_deg[0]),
+                float(joints_deg[1]),
+                float(joints_deg[2]),
+                float(joints_deg[3]),
+                float(joints_deg[4]),
+                float(joints_deg[5]),
+                1,
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+            )
+        command_id = self._require_command_id(response, "MovJ")
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
+
+    def move_joint_tcp(
+        self,
+        pose_m_deg: TcpPose,
+        speed: int = 20,
+        accel: Optional[int] = None,
+        cp: Optional[int] = None,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+    ) -> None:
+        self._ensure_dashboard()
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            response = self.dashboard.MovJ(
+                pose_m_deg.x * MM_PER_METER,
+                pose_m_deg.y * MM_PER_METER,
+                pose_m_deg.z * MM_PER_METER,
+                pose_m_deg.rx,
+                pose_m_deg.ry,
+                pose_m_deg.rz,
+                0,
+                user=-1 if user_index is None else int(user_index),
+                tool=-1 if tool_index is None else int(tool_index),
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+                cp=-1 if cp is None else int(cp),
+            )
+        command_id = self._require_command_id(response, "MovJ")
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
+
+    def move_linear_tcp(
+        self,
+        pose_m_deg: TcpPose,
+        speed: int = 10,
+        accel: Optional[int] = None,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+    ) -> None:
+        self._ensure_dashboard()
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            response = self.dashboard.MovL(
+                pose_m_deg.x * MM_PER_METER,
+                pose_m_deg.y * MM_PER_METER,
+                pose_m_deg.z * MM_PER_METER,
+                pose_m_deg.rx,
+                pose_m_deg.ry,
+                pose_m_deg.rz,
+                0,
+                user=-1 if user_index is None else int(user_index),
+                tool=-1 if tool_index is None else int(tool_index),
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+            )
+        command_id = self._require_command_id(response, "MovL")
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
+
+    def inverse_kinematics(
+        self,
+        pose_m_deg: TcpPose,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+        joint_near: Optional[list[float]] = None,
+    ) -> list[float]:
+        self._ensure_dashboard()
+        joint_near_arg = ""
+        use_joint_near = -1
+        if joint_near is not None:
+            if len(joint_near) != 6:
+                raise ValueError(f"joint_near must contain 6 values, got {len(joint_near)}")
+            joint_near_arg = "{" + ",".join(f"{float(value):.6f}" for value in joint_near) + "}"
+            use_joint_near = 1
+        with self._command_lock:
+            response = self.dashboard.InverseKin(
+                pose_m_deg.x * MM_PER_METER,
+                pose_m_deg.y * MM_PER_METER,
+                pose_m_deg.z * MM_PER_METER,
+                pose_m_deg.rx,
+                pose_m_deg.ry,
+                pose_m_deg.rz,
+                user=-1 if user_index is None else int(user_index),
+                tool=-1 if tool_index is None else int(tool_index),
+                useJointNear=use_joint_near,
+                JointNear=joint_near_arg,
+            )
+        values = self._raise_if_error(response, "InverseKin")
+        if len(values) < 6:
+            raise RuntimeError(f"InverseKin did not return 6 joint values: {response.strip()}")
+        return [float(value) for value in values[:6]]
+
+    def rel_move_tool_joint(
+        self,
+        offset_pose_m_deg: TcpPose,
+        speed: int = 20,
+        accel: Optional[int] = None,
+        cp: Optional[int] = None,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+    ) -> None:
+        self._ensure_dashboard()
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            response = self.dashboard.RelMovJTool(
+                offset_pose_m_deg.x * MM_PER_METER,
+                offset_pose_m_deg.y * MM_PER_METER,
+                offset_pose_m_deg.z * MM_PER_METER,
+                offset_pose_m_deg.rx,
+                offset_pose_m_deg.ry,
+                offset_pose_m_deg.rz,
+                user=-1 if user_index is None else int(user_index),
+                tool=-1 if tool_index is None else int(tool_index),
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+                cp=-1 if cp is None else int(cp),
+            )
+        command_id = self._require_command_id(response, "RelMovJTool")
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
+
+    def rel_move_user_joint(
+        self,
+        offset_pose_m_deg: TcpPose,
+        speed: int = 20,
+        accel: Optional[int] = None,
+        cp: Optional[int] = None,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+    ) -> None:
+        self._ensure_dashboard()
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            response = self.dashboard.RelMovJUser(
+                offset_pose_m_deg.x * MM_PER_METER,
+                offset_pose_m_deg.y * MM_PER_METER,
+                offset_pose_m_deg.z * MM_PER_METER,
+                offset_pose_m_deg.rx,
+                offset_pose_m_deg.ry,
+                offset_pose_m_deg.rz,
+                user=-1 if user_index is None else int(user_index),
+                tool=-1 if tool_index is None else int(tool_index),
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+                cp=-1 if cp is None else int(cp),
+            )
+        command_id = self._require_command_id(response, "RelMovJUser")
+        self._wait_for_command(command_id, timeout_s=60.0, command_epoch=command_epoch)
+
+    def relative_point_user(
+        self,
+        base_pose_m_deg: TcpPose,
+        offset_pose_m_deg: TcpPose,
+    ) -> TcpPose:
+        self._ensure_dashboard()
+        with self._command_lock:
+            response = self.dashboard.RelPointUser(
+                0,
+                base_pose_m_deg.x * MM_PER_METER,
+                base_pose_m_deg.y * MM_PER_METER,
+                base_pose_m_deg.z * MM_PER_METER,
+                base_pose_m_deg.rx,
+                base_pose_m_deg.ry,
+                base_pose_m_deg.rz,
+                offset_pose_m_deg.x * MM_PER_METER,
+                offset_pose_m_deg.y * MM_PER_METER,
+                offset_pose_m_deg.z * MM_PER_METER,
+                offset_pose_m_deg.rx,
+                offset_pose_m_deg.ry,
+                offset_pose_m_deg.rz,
+            )
+        values = self._raise_if_error(response, "RelPointUser")
+        if len(values) < 6:
+            raise RuntimeError(f"RelPointUser did not return 6 pose values: {response.strip()}")
+        return self._tcp_pose_from_values(values[:6])
+
+    def servo_tcp(self, pose_m_deg: TcpPose, duration_s: float = 0.1, aheadtime: float = 50.0, gain: float = 300.0) -> None:
+        self._ensure_dashboard()
+        with self._command_lock:
+            self._raise_if_error(
+                self.dashboard.ServoP(
+                    pose_m_deg.x * MM_PER_METER,
+                    pose_m_deg.y * MM_PER_METER,
+                    pose_m_deg.z * MM_PER_METER,
+                    pose_m_deg.rx,
+                    pose_m_deg.ry,
+                    pose_m_deg.rz,
+                    t=duration_s,
+                    aheadtime=aheadtime,
+                    gain=gain,
+                ),
+                "ServoP",
+            )
+
+    def _feedback_loop(self) -> None:
+        while not self._stop_feedback.is_set() and self.feedback is not None:
+            try:
+                packet = self.feedback.feedBackData()
+                if packet is not None:
+                    received_at = time.time()
+                    sample_time, timestamp_source = self._feedback_sample_timestamp_s(
+                        packet,
+                        received_at,
+                    )
+                    raw_timestamp = self._feedback_raw_timestamp(packet)
+                    with self._feedback_lock:
+                        self.feedback_data = packet
+                        self._latest_feedback_received_at = received_at
+                        self._latest_feedback_raw_timestamp = raw_timestamp
+                        try:
+                            actual_pose = self._tcp_pose_from_values(packet["ToolVectorActual"][0])
+                            actual_user = int(packet["User"][0])
+                            actual_tool = int(packet["Tool"][0])
+                        except Exception:
+                            # Keep the packet usable for the existing status
+                            # paths even if a firmware variant omits one of
+                            # the optional pose fields.
+                            pass
+                        else:
+                            # Keep the interpolation stream strictly ordered.
+                            # A repeated/out-of-order controller timestamp is
+                            # not repaired with a host timestamp: mixing clock
+                            # domains would create a much larger temporal error.
+                            # The current packet remains available through
+                            # ``feedback_data``; the stale history sample is
+                            # simply omitted.
+                            history_is_fresh = not (
+                                self._feedback_pose_history
+                                and sample_time <= self._feedback_pose_history[-1][0]
+                            )
+                            if history_is_fresh:
+                                self._feedback_pose_history.append(
+                                    (sample_time, actual_pose, actual_user, actual_tool)
+                                )
+                            try:
+                                tcp_speed_values = packet["TCPSpeedActual"][0]
+                                linear_speed_mps = (
+                                    sum(float(value) ** 2 for value in tcp_speed_values[:3])
+                                    ** 0.5
+                                ) / MM_PER_METER
+                            except (KeyError, IndexError, TypeError, ValueError):
+                                linear_speed_mps = None
+                            if linear_speed_mps is not None and history_is_fresh:
+                                self._feedback_tcp_speed_history.append(
+                                    (
+                                        sample_time,
+                                        float(linear_speed_mps),
+                                        actual_user,
+                                        actual_tool,
+                                    )
+                                )
+                            if history_is_fresh:
+                                self._feedback_timestamp_source = timestamp_source
+            except Exception:
+                time.sleep(0.05)
+
+    def _wait_for_feedback(self, timeout_s: float = 3.0) -> None:
+        self._wait_until(lambda: self.feedback_data is not None, timeout_s=timeout_s, detail="first feedback packet")
+
+    def _wait_for_feedback_pose(self, timeout_s: float = 3.0) -> None:
+        def pose_ready() -> bool:
+            with self._feedback_lock:
+                return bool(self._feedback_pose_history)
+
+        self._wait_until(pose_ready, timeout_s=timeout_s, detail="first timestamped TCP feedback pose")
+
+    def _wait_for_command(self, command_id: int, timeout_s: float, command_epoch: int) -> None:
+        def done() -> bool:
+            if command_epoch != self._motion_cancel_epoch:
+                raise RuntimeError(
+                    f"Motion command {command_id} cancelled by Stop; releasing command wait"
+                )
+            if self.feedback_data is None:
+                return False
+            current_command_id = int(self.feedback_data["CurrentCommandId"][0])
+            mode = self.robot_mode
+            if mode == 9:
+                error_detail = "GetErrorID unavailable"
+                try:
+                    with self._command_lock:
+                        error_detail = str(self.dashboard.GetErrorID()).strip()
+                except Exception as exc:
+                    error_detail = f"GetErrorID failed: {exc}"
+                raise RuntimeError(
+                    f"Robot entered error mode while waiting for motion completion; {error_detail}"
+                )
+            if mode == 10:
+                raise RuntimeError("Motion paused before command completion")
+            return mode == 5 and current_command_id == command_id
+
+        self._wait_until(done, timeout_s=timeout_s, detail=f"command {command_id} completion")
+
+    def _raise_if_enable_issue(self, response: str) -> None:
+        error_id, values = self._parse_response(response)
+        if error_id == 0:
+            return
+        if values:
+            _ = values
+        mode = self.robot_mode
+        if mode not in (5, 6, 7, 8):
+            raise RuntimeError(f"EnableRobot failed: {response.strip()} robot_mode={mode}")
+
+    def _require_command_id(self, response: str, command_name: str) -> int:
+        values = self._raise_if_error(response, command_name)
+        if not values:
+            raise RuntimeError(f"{command_name} did not return command id: {response.strip()}")
+        return int(float(values[0]))
+
+    def _raise_if_error(self, response: str, command_name: str) -> list[str]:
+        error_id, values = self._parse_response(response)
+        if error_id != 0:
+            raise RuntimeError(f"{command_name} failed: {response.strip()}")
+        return values
+
+    def _raise_if_supported(self, response: str, command_name: str) -> bool:
+        error_id, values = self._parse_response(response)
+        if error_id == 0:
+            return True
+        if error_id == -7:
+            return False
+        raise RuntimeError(f"{command_name} failed: {response.strip()}")
+
+    def _parse_response(self, raw: str) -> tuple[int, list[str]]:
+        if not isinstance(raw, str):
+            raise RuntimeError(f"Invalid response type: {type(raw).__name__}")
+        match = re.match(r"\s*(-?\d+)\s*,\s*\{([^}]*)\}", raw)
+        if match is None:
+            raise RuntimeError(f"Could not parse Dobot response: {raw!r}")
+        error_id = int(match.group(1))
+        values = [value.strip() for value in match.group(2).split(",") if value.strip()]
+        return error_id, values
+
+    def _wait_until(self, predicate, timeout_s: float, detail: str) -> None:
+        start = time.time()
+        while True:
+            result = predicate()
+            if result:
+                return
+            if time.time() - start > timeout_s:
+                raise TimeoutError(f"Timed out while waiting for {detail}")
+            # Motion completion is polled from the feedback stream; 50 ms
+            # added a visible pause between retreat and the next PTP. Keep
+            # command transitions responsive without busy-spinning.
+            time.sleep(0.01)
+
+    def _ensure_dashboard(self) -> None:
+        if self.dashboard is None:
+            raise RuntimeError("Robot dashboard not connected")
