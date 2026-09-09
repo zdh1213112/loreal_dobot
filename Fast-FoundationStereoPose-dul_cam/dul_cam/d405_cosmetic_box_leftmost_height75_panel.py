@@ -38,6 +38,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, Float32, String
 
 from dobot_nova5_driver.handoff_clearance import (
+    HandoffClearanceResult,
     evaluate_camera_right_handoff_clearance,
     evaluate_gripper_side_clearance,
     measure_voxel_overlap,
@@ -203,6 +204,27 @@ torch.autograd.set_grad_enabled(False)
 
 rclpy.init()
 ros_node = rclpy.create_node("d405_cosmetic_box_height75_node")
+# The handoff/finger-corridor check is deliberately fail-closed by default,
+# but expose it as a ROS parameter for controlled cell commissioning.  Keep
+# the module constant as the safe fallback when this script is run directly.
+ros_node.declare_parameter("handoff_clearance_enabled", HANDOFF_CLEARANCE_ENABLED)
+HANDOFF_CLEARANCE_ENABLED = bool(
+    ros_node.get_parameter("handoff_clearance_enabled").value
+)
+ros_node.declare_parameter(
+    "handoff_overhead_clearance_enabled",
+    HANDOFF_CLEARANCE_ENABLED,
+)
+HANDOFF_OVERHEAD_CLEARANCE_ENABLED = bool(
+    ros_node.get_parameter("handoff_overhead_clearance_enabled").value
+)
+logging.info(
+    "[D405] handoff/finger obstacle clearance check %s; overhead/right-corridor check %s",
+    "ENABLED" if HANDOFF_CLEARANCE_ENABLED else "DISABLED (operator override)",
+    "ENABLED"
+    if HANDOFF_OVERHEAD_CLEARANCE_ENABLED and HANDOFF_CLEARANCE_ENABLED
+    else "DISABLED (operator override)",
+)
 executor = SingleThreadedExecutor()
 executor.add_node(ros_node)
 
@@ -621,6 +643,9 @@ def build_fault_panel_info(
                 "grasp_depth_ratio": float(GRASP_DEPTH_RATIO),
                 "pregrasp_tracking_window_s": float(PREGRASP_TRACKING_WINDOW_S),
                 "handoff_clearance_enabled": bool(HANDOFF_CLEARANCE_ENABLED),
+                "handoff_overhead_clearance_enabled": bool(
+                    HANDOFF_OVERHEAD_CLEARANCE_ENABLED
+                ),
                 "gripper_side_min_cluster_points": int(
                     GRIPPER_SIDE_MIN_CLUSTER_POINTS
                 ),
@@ -1706,7 +1731,20 @@ try:
                 last_gripper_positive_side_clear = False
                 last_gripper_side_live_voxels = [None, None]
                 handoff_reacquire_required = False
-                publish_handoff_clearance("CHECKING", clear=False)
+                if HANDOFF_CLEARANCE_ENABLED:
+                    publish_handoff_clearance("CHECKING", clear=False)
+                else:
+                    # The robot driver requires a fresh CLEAR handoff state in
+                    # addition to pose/size/height samples.  When the optional
+                    # obstacle check is disabled, publish that handshake
+                    # explicitly instead of leaving the driver waiting until
+                    # its vision timeout.
+                    # Keep the wire-level state as the driver's accepted
+                    # terminal state.  The configuration snapshot/log already
+                    # records that this CLEAR was operator-forced.
+                    last_handoff_state = "CLEAR"
+                    handoff_clearance_passed = True
+                    publish_handoff_clearance("CLEAR", clear=True)
                 x1, y1 = np.min(corners, axis=0)
                 x2, y2 = np.max(corners, axis=0)
                 pending_bbox = (int(x1), int(y1), int(x2), int(y2))
@@ -2002,18 +2040,32 @@ try:
 
                                         if not handoff_clearance_passed:
                                             side_clearance_evaluated = True
-                                            clearance = evaluate_camera_right_handoff_clearance(
-                                                points_3d,
-                                                smooth_box_center,
-                                                smooth_extent,
-                                                smooth_rotation,
-                                                right_extension_m=HANDOFF_CLEARANCE_RIGHT_EXTENSION_M,
-                                                side_margin_m=HANDOFF_CLEARANCE_SIDE_MARGIN_M,
-                                                vertical_gap_m=HANDOFF_CLEARANCE_VERTICAL_GAP_M,
-                                                check_height_m=HANDOFF_CLEARANCE_CHECK_HEIGHT_M,
-                                                voxel_size_m=HANDOFF_CLEARANCE_VOXEL_SIZE_M,
-                                                min_obstacle_points=HANDOFF_CLEARANCE_MIN_CLUSTER_POINTS,
-                                            )
+                                            if HANDOFF_OVERHEAD_CLEARANCE_ENABLED:
+                                                clearance = evaluate_camera_right_handoff_clearance(
+                                                    points_3d,
+                                                    smooth_box_center,
+                                                    smooth_extent,
+                                                    smooth_rotation,
+                                                    right_extension_m=HANDOFF_CLEARANCE_RIGHT_EXTENSION_M,
+                                                    side_margin_m=HANDOFF_CLEARANCE_SIDE_MARGIN_M,
+                                                    vertical_gap_m=HANDOFF_CLEARANCE_VERTICAL_GAP_M,
+                                                    check_height_m=HANDOFF_CLEARANCE_CHECK_HEIGHT_M,
+                                                    voxel_size_m=HANDOFF_CLEARANCE_VOXEL_SIZE_M,
+                                                    min_obstacle_points=HANDOFF_CLEARANCE_MIN_CLUSTER_POINTS,
+                                                )
+                                            else:
+                                                # Keep the finger-corridor check active while
+                                                # allowing the operator to suppress only the
+                                                # magenta overhead/right-corridor overlay.
+                                                clearance = HandoffClearanceResult(
+                                                    clear=True,
+                                                    candidate_point_count=0,
+                                                    occupied_voxel_count=0,
+                                                    largest_cluster_point_count=0,
+                                                    candidate_mask=np.zeros(
+                                                        len(points_3d), dtype=bool
+                                                    ),
+                                                )
                                             side_clearance = evaluate_gripper_side_clearance(
                                                 points_3d,
                                                 smooth_box_center,

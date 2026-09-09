@@ -32,8 +32,71 @@ def generate_launch_description() -> LaunchDescription:
                     "barcode to the nearest 90-degree face; set false for segmented search"
                 ),
             ),
+            DeclareLaunchArgument(
+                "handoff_clearance_enabled",
+                default_value="true",
+                description=(
+                    "Enable all D405 handoff/finger obstacle prevention; "
+                    "set false only for controlled commissioning"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "handoff_overhead_clearance_enabled",
+                default_value="true",
+                description=(
+                    "Enable the D405 overhead/right-corridor check (purple overlay); "
+                    "set false to keep finger-path protection while hiding this check"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_speed_factor",
+                default_value="100",
+                description="Effective grasp-lift speed percentage",
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_acc_factor",
+                default_value="100",
+                description="Effective grasp-lift acceleration percentage",
+            ),
+            DeclareLaunchArgument(
+                "joint_acc",
+                default_value="65",
+                description="Joint acceleration baseline used by move-above/pregrasp PTP",
+            ),
+            DeclareLaunchArgument(
+                "linear_speed",
+                default_value="65",
+                description="Linear grasp-descent speed baseline",
+            ),
+            DeclareLaunchArgument(
+                "linear_acc",
+                default_value="65",
+                description="Linear grasp-descent acceleration baseline",
+            ),
+            DeclareLaunchArgument(
+                "scanner_approach_natural_finish_margin_m",
+                default_value="0.015",
+                description=(
+                    "Allow a safe bounded scanner approach to finish naturally when "
+                    "barcode arrives within this remaining distance"
+                ),
+            ),
             ExecuteProcess(
-                cmd=[LaunchConfiguration("vision_python"), VISION_SCRIPT],
+                cmd=[
+                    LaunchConfiguration("vision_python"),
+                    VISION_SCRIPT,
+                    "--ros-args",
+                    "-p",
+                    [
+                        "handoff_clearance_enabled:=",
+                        LaunchConfiguration("handoff_clearance_enabled"),
+                    ],
+                    "-p",
+                    [
+                        "handoff_overhead_clearance_enabled:=",
+                        LaunchConfiguration("handoff_overhead_clearance_enabled"),
+                    ],
+                ],
                 output="screen",
             ),
             Node(
@@ -56,6 +119,30 @@ def generate_launch_description() -> LaunchDescription:
                         "barcode_continuous_rotation": ParameterValue(
                             LaunchConfiguration("barcode_continuous_rotation"),
                             value_type=bool,
+                        ),
+                        "grasp_lift_speed_factor": ParameterValue(
+                            LaunchConfiguration("grasp_lift_speed_factor"),
+                            value_type=int,
+                        ),
+                        "grasp_lift_acc_factor": ParameterValue(
+                            LaunchConfiguration("grasp_lift_acc_factor"),
+                            value_type=int,
+                        ),
+                        "joint_acc": ParameterValue(
+                            LaunchConfiguration("joint_acc"),
+                            value_type=int,
+                        ),
+                        "linear_speed": ParameterValue(
+                            LaunchConfiguration("linear_speed"),
+                            value_type=int,
+                        ),
+                        "linear_acc": ParameterValue(
+                            LaunchConfiguration("linear_acc"),
+                            value_type=int,
+                        ),
+                        "scanner_approach_natural_finish_margin_m": ParameterValue(
+                            LaunchConfiguration("scanner_approach_natural_finish_margin_m"),
+                            value_type=float,
                         ),
                     }
                 ],

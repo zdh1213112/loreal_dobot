@@ -36,6 +36,22 @@ ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle.launch.py \
   motion_speed_scale_percent:=100
 ```
 
+D405 的障碍防抓取默认开启。若要在受控调试时关闭图像中紫色的“目标上方/右侧交接通道”候选点，可只关闭该子检查，夹爪两侧手指通道保护仍然保留：
+
+```bash
+ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle.launch.py \
+  handoff_overhead_clearance_enabled:=false
+```
+
+若要关闭整套 handoff/手指通道防抓取检查（包括紫色通道和两侧手指检测），使用：
+
+```bash
+ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle.launch.py \
+  handoff_clearance_enabled:=false
+```
+
+整套关闭只适合确认误检来源或低速空载调试；关闭后程序仍会发布 `DISABLED`/`clear=true` 握手状态，因此不会因等待 CLEAR 而超时，但机械臂不会再由 D405 这套点云检查阻止危险下降。
+
 启动文件默认使用 `/home/zdh/miniconda3/envs/ffs_ros/bin/python` 运行视觉节点；该环境已包含当前机器上的 CUDA、FFS、SAM2、RealSense、Open3D、Ultralytics 和 ROS 2 依赖。若环境位置变化，可传入 `vision_python:=...`。
 
 D405 本地显示使用一个组合窗口，左侧为 RGB、右侧为点云；鼠标 ROI 框选只作用于左侧 RGB。远程面板的 RGB 和点云 ROS 图像话题仍保持独立。D405 默认启用自动曝光；本地组合窗口或远程面板获得键盘焦点后，按 `a` 可以实时切换自动/手动曝光，左上角显示 `AE` 或 `M Exp:... G:...`。切换到手动模式时使用曝光 `11000`、增益 `8`，并可通过 `[`、`]` 调整曝光、`-`、`+` 调整增益。
@@ -79,6 +95,8 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `scanner_retreat_speed_factor=100`、`scanner_retreat_acc_factor=100`：扫码成功后沿 User X− 安全退让的有效速度和加速度百分比。
 - `scanner_retreat_extra_m=0.030`：退回实际靠近距离后继续远离扫码器的额外安全余量。
 - `barcode_j6_speed_factor=100`：J6 连续点动和标准面对齐的比例上限。当前使用 `MoveJog`，已经钳位到控制器允许的 100%；若实机仍慢，应提高 Dobot 控制器的 Jog 基准速度或改用可监控的 MovJ 找码方式。
+- `handoff_clearance_enabled=true`：D405 handoff 与夹爪两侧手指下探通道的总开关。默认开启；仅受控调试时可设为 `false`。
+- `handoff_overhead_clearance_enabled=true`：D405 目标上方/图像右侧交接通道检查开关。设为 `false` 时隐藏该通道的紫色候选点，但仍保留两侧手指通道检查；若 `handoff_clearance_enabled=false`，此项自动不参与。
 - `scanner_approach_monitor_period_s=0.005`：有界 X+ 扫码靠近的条码检查周期；收到条码后立即停止当前 RelMovJUser。
 - `barcode_alignment_acc_factor=100`：J6 扫到码后吸附到最近 90°标准面的加速度。
 - `vision_samples=2`：机器人仍使用两帧结果检查 SAM2 目标稳定性；眼在手相机到达初始位后只刷新 2 帧，并复用本次目标选择时的锁定 FFS 点云，避免静止场景重复计算立体深度。

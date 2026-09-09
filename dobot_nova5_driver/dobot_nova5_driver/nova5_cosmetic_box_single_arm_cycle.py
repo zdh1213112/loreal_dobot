@@ -253,18 +253,24 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("command_tool_index", 1)
         # 以下运动参数保留原 GUI 的调节语义。控制器端不再把它们同时写入
         # SpeedFactor、VelJ/VelL 和单条指令，而是先在软件中合成为一个等效
-        # 指令百分比。100 表示修改前的理论有效速度基线；当前抓取上方和
-        # 抓取下降使用 400，抓取后的各阶段则使用下方独立有效百分比。
+        # 指令百分比。100 表示修改前的理论有效速度基线；默认 400% 全局
+        # 缩放会把可安全提速的抓取上方/下降参数合成为最多 100% 的单条指令，
+        # 抓取后的各阶段则直接使用下方独立有效百分比。
         self.declare_parameter("motion_speed_scale_percent", 400)
         # 普通关节动作：初始位、抓取上方、中转位、放置位及回初始位。
         # 加速度独立可调，短行程往往由加速度而不是最高速度决定耗时。
         self.declare_parameter("joint_speed", 65)
-        self.declare_parameter("joint_acc", 55)
+        # With the default motion_speed_scale_percent=400, joint_speed=65
+        # already composes to an effective 100% command speed.  Raising the
+        # acceleration baseline to 65 makes the move-above/pregrasp PTP
+        # acceleration reach the same 100% effective ceiling without changing
+        # the nominal speed semantics.
+        self.declare_parameter("joint_acc", 65)
         # 抓取完成后的抬升、去中转位、扫码后翻转、放置和回初始位分别调速，
         # 避免为了加快后半段而把抓取上方/下降前的动作一起推得过快。
         # 后半段参数是“单条指令有效百分比”，不再与 joint_speed 重复相乘。
-        self.declare_parameter("grasp_lift_speed_factor", 90)
-        self.declare_parameter("grasp_lift_acc_factor", 85)
+        self.declare_parameter("grasp_lift_speed_factor", 100)
+        self.declare_parameter("grasp_lift_acc_factor", 100)
         self.declare_parameter("transfer_speed_factor", 100)
         self.declare_parameter("transfer_acc_factor", 100)
         self.declare_parameter("place_speed_factor", 100)
@@ -272,9 +278,10 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("post_scan_acc_factor", 100)
         self.declare_parameter("return_startup_speed_factor", 100)
         self.declare_parameter("return_startup_acc_factor", 100)
-        # 抓取下降使用的直线运动速度和加速度。
-        self.declare_parameter("linear_speed", 60)
-        self.declare_parameter("linear_acc", 50)
+        # 抓取下降使用的直线运动速度和加速度。默认 400% 全局缩放会把
+        # 65/65 合成为 100% 单条指令；下降仍保持 MovL 和全部 Z 安全检查。
+        self.declare_parameter("linear_speed", 65)
+        self.declare_parameter("linear_acc", 65)
         # 扫码成功后，XYZ 与 User Ry/Rz 姿态一起变化的组合 PTP 速度。
         self.declare_parameter("jog_speed_factor", 100.0)
         # 扫码器靠近速度：盒子到达 transfer_joint 后，沿 User 0 X+ 自适应
@@ -300,7 +307,11 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("scanner_approach_acc_factor", 100)
         # 条码已经在目标点前几毫米内出现时，让有界 RelMovJUser 自然完成，
         # 避免为极短剩余距离额外触发约 0.5s 的控制器 Stop 停机确认。
-        self.declare_parameter("scanner_approach_natural_finish_margin_m", 0.005)
+        # If a barcode arrives near the already-safe endpoint, let the bounded
+        # X+ move finish naturally instead of issuing Stop() and waiting for a
+        # second controller idle transition.  The endpoint itself still
+        # enforces the configured scanner clearance.
+        self.declare_parameter("scanner_approach_natural_finish_margin_m", 0.015)
         # 旧版“固定 XYZ、单独 Ry 点动”的备用速度。当前生产流程已经改为
         # XYZ+Ry+Rz 单条组合 PTP，不再读取该参数。
         self.declare_parameter("face_up_rotation_speed_factor", 50)
@@ -4313,6 +4324,14 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.scanner_face_clearance = self._new_double(float(self.node.get_parameter("scanner_face_clearance_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
         self.scanner_negative_tolerance = self._new_double(float(self.node.get_parameter("scanner_approach_negative_tolerance_m").value) * 1000.0, 0.0, 20.0, 1, 1.0)
         self.scanner_retreat_extra = self._new_double(float(self.node.get_parameter("scanner_retreat_extra_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
+        self.scanner_natural_finish_margin = self._new_double(
+            float(self.node.get_parameter("scanner_approach_natural_finish_margin_m").value)
+            * 1000.0,
+            0.0,
+            100.0,
+            1,
+            1.0,
+        )
         form.addRow("同码稳定次数", self.barcode_hits)
         form.addRow("连续找码模式", self.barcode_continuous_rotation)
         form.addRow("检查面数（分段模式固定）", self.barcode_rotations)
@@ -4320,6 +4339,7 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("中转 TCP 到扫码器距离 mm", self.scanner_center_distance)
         form.addRow("盒侧面扫码间隙 mm", self.scanner_face_clearance)
         form.addRow("负靠近量容差 mm", self.scanner_negative_tolerance)
+        form.addRow("扫码近端自然完成余量 mm", self.scanner_natural_finish_margin)
         form.addRow("靠近扫码器 User X+ 速度 %", self.scanner_approach_speed)
         form.addRow("扫码后安全退让 User X- 速度 %", self.scanner_retreat_speed)
         form.addRow("扫码后安全退让 User X- 加速度 %", self.scanner_retreat_acc)
@@ -4436,6 +4456,10 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("scanner_center_distance_m", value=self.scanner_center_distance.value() / 1000.0),
             Parameter("scanner_face_clearance_m", value=self.scanner_face_clearance.value() / 1000.0),
             Parameter("scanner_approach_negative_tolerance_m", value=self.scanner_negative_tolerance.value() / 1000.0),
+            Parameter(
+                "scanner_approach_natural_finish_margin_m",
+                value=self.scanner_natural_finish_margin.value() / 1000.0,
+            ),
             Parameter("scanner_approach_speed_factor", value=self.scanner_approach_speed.value()),
             Parameter("scanner_retreat_speed_factor", value=self.scanner_retreat_speed.value()),
             Parameter("scanner_retreat_acc_factor", value=self.scanner_retreat_acc.value()),
