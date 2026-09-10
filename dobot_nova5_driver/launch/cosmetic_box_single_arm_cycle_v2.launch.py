@@ -33,6 +33,42 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
+                "top_surface_barcode_enabled",
+                default_value="true",
+                description=(
+                    "Check the current target region during approach, hover and descent; "
+                    "when found, place without scanner/J6/Ry/Rz rotation"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "top_surface_barcode_stable_hits",
+                default_value="1",
+                description="Number of D405 top-surface YOLO barcode detections required",
+            ),
+            DeclareLaunchArgument(
+                "top_surface_barcode_wait_s",
+                default_value="0.50",
+                description="Maximum hover time to wait for top-surface barcode confirmation",
+            ),
+            DeclareLaunchArgument(
+                "bottom_barcode_recovery_enabled",
+                default_value="true",
+                description=(
+                    "When top and all side faces have no barcode, place on the table, "
+                    "flip User Ry- and retry the bottom face"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_user_ry_target_deg",
+                default_value="-45.0",
+                description="User-Ry target for the bottom-barcode table flip",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_table_retract_m",
+                default_value="0.050",
+                description="Extra User-X- clearance before placing the box on the table (m)",
+            ),
+            DeclareLaunchArgument(
                 "handoff_clearance_enabled",
                 default_value="true",
                 description=(
@@ -117,6 +153,16 @@ def generate_launch_description() -> LaunchDescription:
                         "handoff_overhead_clearance_enabled:=",
                         LaunchConfiguration("handoff_overhead_clearance_enabled"),
                     ],
+                    "-p",
+                    [
+                        "top_surface_barcode_stable_hits:=",
+                        LaunchConfiguration("top_surface_barcode_stable_hits"),
+                    ],
+                    "-p",
+                    [
+                        "top_surface_barcode_enabled:=",
+                        LaunchConfiguration("top_surface_barcode_enabled"),
+                    ],
                 ],
                 output="screen",
             ),
@@ -144,6 +190,26 @@ def generate_launch_description() -> LaunchDescription:
                         "barcode_continuous_rotation": ParameterValue(
                             LaunchConfiguration("barcode_continuous_rotation"),
                             value_type=bool,
+                        ),
+                        "top_surface_barcode_enabled": ParameterValue(
+                            LaunchConfiguration("top_surface_barcode_enabled"),
+                            value_type=bool,
+                        ),
+                        "top_surface_barcode_wait_s": ParameterValue(
+                            LaunchConfiguration("top_surface_barcode_wait_s"),
+                            value_type=float,
+                        ),
+                        "bottom_barcode_recovery_enabled": ParameterValue(
+                            LaunchConfiguration("bottom_barcode_recovery_enabled"),
+                            value_type=bool,
+                        ),
+                        "bottom_flip_user_ry_target_deg": ParameterValue(
+                            LaunchConfiguration("bottom_flip_user_ry_target_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_table_retract_m": ParameterValue(
+                            LaunchConfiguration("bottom_flip_table_retract_m"),
+                            value_type=float,
                         ),
                         "grasp_lift_speed_factor": ParameterValue(
                             LaunchConfiguration("grasp_lift_speed_factor"),

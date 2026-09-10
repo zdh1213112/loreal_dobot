@@ -248,6 +248,9 @@ class CosmeticBoxSingleArmNode(Node):
         # 按 User 0 表达，单位为米。随后沿 User Z 垂直下降；最终放置 Z
         # 由放置面高度、物料长度的一半和安全余量动态计算。
         self.declare_parameter("scan_exit_user_xyz", [0.560, 0.375, 0.320])
+        # 顶面条码分支沿用 v1 的最终放置 XYZ。该分支保持抓取时的姿态，
+        # 直接 PTP 到固定 XYZ，不执行动态 Z 下降。
+        self.declare_parameter("top_surface_barcode_place_xyz", [0.531, 0.328, 0.215])
         self.declare_parameter("placement_surface_z_m", 0.060)
         self.declare_parameter(
             "placement_safety_margin_m",
@@ -422,6 +425,12 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("grasp_offset_rxyz_deg", [180.0, 0.0, -90.0])
 
         self.declare_parameter("barcode_topic", "/detected_barcodes")
+        self.declare_parameter("top_surface_barcode_enabled", True)
+        self.declare_parameter("top_surface_barcode_wait_s", 0.50)
+        self.declare_parameter("top_surface_barcode_topic", "/trigger_top_surface_barcode")
+        self.declare_parameter(
+            "top_surface_barcode_result_topic", "/top_surface_barcode_result"
+        )
         # A HID scanner emits one complete decoded string per successful scan;
         # unlike frame-by-frame vision detections it need not be seen 3 times.
         self.declare_parameter("barcode_stable_hits", 1)
@@ -445,6 +454,19 @@ class CosmeticBoxSingleArmNode(Node):
         # 中间角度，否则后续 User Ry -90° 会让条码面斜着朝上。停止 J6 后
         # 自动吸附到最近的 90° 标准面：前半程回上一面，后半程补到下一面。
         self.declare_parameter("barcode_snap_to_nearest_face", True)
+        # 顶面和四个侧面均未发现条码时，按“条码在底面”执行桌面翻转。
+        # 第一次 User Ry- 目标为 45deg；若固定 TCP 位姿没有逆解，则每次
+        # 减少 5deg，最低允许 45deg。当前现场要求固定使用 -45deg。
+        self.declare_parameter("bottom_barcode_recovery_enabled", True)
+        self.declare_parameter("bottom_flip_user_ry_target_deg", -45.0)
+        self.declare_parameter("bottom_flip_user_ry_min_abs_deg", 45.0)
+        self.declare_parameter("bottom_flip_user_ry_step_deg", 5.0)
+        # 临时放回桌面时复用本轮实际抓取 TCP Z；该参数仅用于现场毫米级微调。
+        self.declare_parameter("bottom_flip_table_z_offset_m", 0.0)
+        # 扫码失败后先沿 User X- 再把盒子放回桌面，给 User-Ry 翻转留出
+        # 夹爪和盒体的安全空间。数值是额外退回量，单位为米。
+        self.declare_parameter("bottom_flip_table_retract_m", 0.050)
+        self.declare_parameter("bottom_flip_stall_timeout_s", 0.50)
         # 到达 transfer_joint 后，夹爪 TCP 中心沿 User 0 的 X+ 方向面对扫码器。
         # scanner_center_distance_m：此时 TCP 夹持中心到扫码器识读面的实测距离，
         # 默认 0.120 m（120 mm）。如果中转点或扫码器位置改变，需要重新实测此值。
@@ -564,6 +586,14 @@ class CosmeticBoxSingleArmNode(Node):
         self.barcode_value = ""
         self.barcode_hits = 0
         self.barcode_last_time = 0.0
+        # Net J6 travel used by the most recent four-face search.  The bottom
+        # barcode recovery path reverses this exact accumulated travel after
+        # releasing/regrasping the box on the temporary table position.
+        self.barcode_search_net_delta_deg = 0.0
+        self.top_surface_barcode_lock = threading.Lock()
+        self.top_surface_barcode_window_active = False
+        self.top_surface_barcode_value = ""
+        self.top_surface_barcode_result_count = 0
 
         self.running = True
         self.cycle_enabled = False
@@ -594,8 +624,19 @@ class CosmeticBoxSingleArmNode(Node):
         self.create_subscription(String, str(self.get_parameter("vision_result_topic").value), self._vision_result_callback, 10)
         self.create_subscription(String, str(self.get_parameter("handoff_state_topic").value), self._handoff_state_callback, 10)
         self.create_subscription(String, str(self.get_parameter("barcode_topic").value), self._barcode_callback, 20)
+        self.create_subscription(
+            String,
+            str(self.get_parameter("top_surface_barcode_result_topic").value),
+            self._top_surface_barcode_callback,
+            10,
+        )
         self.create_subscription(Bool, "/cosmetic_pick_cycle_enable", self._cycle_enable_callback, 10)
         self.trigger_publisher = self.create_publisher(Bool, str(self.get_parameter("vision_trigger_topic").value), 10)
+        self.top_surface_barcode_trigger_publisher = self.create_publisher(
+            Bool,
+            str(self.get_parameter("top_surface_barcode_topic").value),
+            10,
+        )
         self.status_publisher = self.create_publisher(String, "/cosmetic_pick_cycle_status", 10)
         self.timing_publisher = self.create_publisher(
             String,
@@ -673,6 +714,142 @@ class CosmeticBoxSingleArmNode(Node):
             f"safety={safety_margin_m * 1000.0:.1f}mm"
         )
         return [values[0], values[1], placement_z_m]
+
+    def _top_surface_barcode_place_xyz(self) -> list[float]:
+        """Return the fixed v1 XYZ used by the top-barcode placement branch."""
+
+        values = [
+            float(value)
+            for value in self.get_parameter("top_surface_barcode_place_xyz").value
+        ]
+        if len(values) != 3:
+            raise ValueError("top_surface_barcode_place_xyz must contain 3 values")
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(
+                "top_surface_barcode_place_xyz must contain finite XYZ values"
+            )
+        return values
+
+    def _bottom_flip_table_pose(
+        self,
+        grasp_target: TcpPose,
+        height_m: float,
+    ) -> TcpPose:
+        """Build a temporary table pose from the measured box height.
+
+        The vision TCP target is 75% down from the top face, so the box bottom
+        is approximately another 25% of its measured height below that TCP Z.
+        ``bottom_flip_table_z_offset_m`` remains available for a small现场
+        correction when the gripper tip/table datum differs from the vision
+        model.
+        """
+
+        current = self._current_command_pose()
+        offset_m = float(self.get_parameter("bottom_flip_table_z_offset_m").value)
+        height_m = float(height_m)
+        if height_m <= 0.0:
+            raise ValueError(f"material height must be positive for table flip, got {height_m:.4f}m")
+        return TcpPose(
+            float(current.x),
+            float(current.y),
+            float(grasp_target.z - 0.25 * height_m + offset_m),
+            float(current.rx),
+            float(current.ry),
+            float(current.rz),
+        )
+
+    def _bottom_flip_ry_target_candidates(self) -> list[float]:
+        target = float(self.get_parameter("bottom_flip_user_ry_target_deg").value)
+        minimum = abs(float(self.get_parameter("bottom_flip_user_ry_min_abs_deg").value))
+        step = max(0.1, abs(float(self.get_parameter("bottom_flip_user_ry_step_deg").value)))
+        if target >= 0.0:
+            raise ValueError("bottom_flip_user_ry_target_deg must be negative")
+        minimum = min(abs(target), minimum)
+        values = []
+        angle = abs(target)
+        while angle >= minimum - 1e-6:
+            values.append(-angle)
+            angle -= step
+        return values
+
+    def _try_bottom_flip_ry_at_table(
+        self,
+        table_pose: TcpPose,
+    ) -> tuple[float, TcpPose]:
+        """Try the configured User-Ry- angle while the box rests on the table.
+
+        The returned angle is the measured signed User-Y rotation, rather than
+        the requested command.  This lets the recovery stage compensate a few
+        degrees of shortfall after the J6 return.
+        """
+
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        last_error = None
+        for candidate in self._bottom_flip_ry_target_candidates():
+            before = self._current_command_pose()
+            rotation = SciPyRot.from_euler(
+                "xyz", [before.rx, before.ry, before.rz], degrees=True
+            ).as_matrix()
+            # Use the candidate selected by the configured target/minimum
+            # policy.  In the current field setting the candidate list is
+            # exactly [-45.0], so no smaller fallback is attempted.
+            requested_delta = float(candidate)
+            ry = SciPyRot.from_euler("y", requested_delta, degrees=True).as_matrix()
+            target_rotation = ry @ rotation
+            rx, final_ry, rz = SciPyRot.from_matrix(target_rotation).as_euler(
+                "xyz", degrees=True
+            )
+            target = TcpPose(
+                table_pose.x, table_pose.y, table_pose.z, float(rx), float(final_ry), float(rz)
+            )
+            try:
+                self.controller.inverse_kinematics(
+                    target,
+                    user_index=user_index,
+                    tool_index=tool_index,
+                    joint_near=self.controller.current_joint(),
+                )
+            except Exception as exc:
+                last_error = exc
+                self.get_logger().warning(
+                    f"Bottom-barcode User Ry target {candidate:+.1f}deg unavailable; "
+                    f"trying a smaller angle: {exc}"
+                )
+                continue
+            self._publish_status(
+                f"bottom-barcode table flip: User Ry target {candidate:+.1f}deg"
+            )
+            # Once IK has accepted a candidate, any motion/feedback failure is
+            # a real recovery fault.  Do not issue another candidate after a
+            # potentially partial robot move.
+            self.controller.move_joint_tcp(
+                target,
+                speed=self._motion_profile()["post_scan_speed"],
+                accel=self._motion_profile()["post_scan_acc"],
+                user_index=user_index,
+                tool_index=tool_index,
+            )
+            self._require_cycle_active("at bottom-barcode table flip pose")
+            after = self._current_command_pose()
+            before_rotation = SciPyRot.from_euler(
+                "xyz", [before.rx, before.ry, before.rz], degrees=True
+            ).as_matrix()
+            after_rotation = SciPyRot.from_euler(
+                "xyz", [after.rx, after.ry, after.rz], degrees=True
+            ).as_matrix()
+            relative_rotation = after_rotation @ before_rotation.T
+            actual_delta = math.degrees(
+                math.atan2(relative_rotation[0, 2], relative_rotation[0, 0])
+            )
+            self._publish_status(
+                f"bottom-barcode table flip User Ry requested {requested_delta:+.1f}deg, "
+                f"measured {actual_delta:+.1f}deg"
+            )
+            return float(actual_delta), target
+        raise RuntimeError(
+            "No reachable User Ry- bottom-flip angle was found down to the configured minimum"
+        ) from last_error
 
     def _lower_to_dynamic_placement_z(
         self,
@@ -1786,12 +1963,71 @@ class CosmeticBoxSingleArmNode(Node):
             hits = self.barcode_hits
         self.get_logger().info(f"Barcode stability: value={value!r}, hits={hits}")
 
+    def _top_surface_barcode_callback(self, msg: String) -> None:
+        """Accept only confirmed top-surface results during the active cycle."""
+
+        encoded = msg.data.strip()
+        if not encoded.startswith("success:"):
+            return
+        value = encoded.split(":", 1)[1].strip()
+        if not value:
+            return
+        with self.top_surface_barcode_lock:
+            if not self.top_surface_barcode_window_active:
+                return
+            self.top_surface_barcode_value = value
+            self.top_surface_barcode_result_count += 1
+        self.get_logger().info(
+            f"Top-surface barcode confirmed for current target: {value!r}"
+        )
+
+    def _set_top_surface_barcode_window(self, active: bool) -> None:
+        """Open/close the v2 vision barcode ROI observation window."""
+
+        enabled = bool(self.get_parameter("top_surface_barcode_enabled").value)
+        active = bool(active and enabled)
+        with self.top_surface_barcode_lock:
+            self.top_surface_barcode_window_active = active
+            if active:
+                self.top_surface_barcode_value = ""
+                self.top_surface_barcode_result_count = 0
+        message = Bool()
+        message.data = active
+        self.top_surface_barcode_trigger_publisher.publish(message)
+        self._publish_status(
+            "top-surface barcode detection " + ("armed" if active else "disarmed")
+        )
+
+    def _current_top_surface_barcode(self) -> str:
+        with self.top_surface_barcode_lock:
+            return str(self.top_surface_barcode_value)
+
+    def _wait_for_top_surface_barcode(self) -> str:
+        """Allow a short hover window for the D405 detector to confirm the top label."""
+
+        if not bool(self.get_parameter("top_surface_barcode_enabled").value):
+            return ""
+        with self.top_surface_barcode_lock:
+            if not self.top_surface_barcode_window_active:
+                return ""
+        timeout_s = max(
+            0.0, float(self.get_parameter("top_surface_barcode_wait_s").value)
+        )
+        deadline = time.monotonic() + timeout_s
+        while self.running and self.cycle_enabled and time.monotonic() < deadline:
+            value = self._current_top_surface_barcode()
+            if value:
+                return value
+            time.sleep(0.01)
+        return self._current_top_surface_barcode()
+
     def _cycle_enable_callback(self, msg: Bool) -> None:
         requested = bool(msg.data)
         if not requested:
             with self.secondary_safety_lock:
                 self.secondary_auto_resume_requested.clear()
                 self.cycle_enabled = False
+            self._set_top_surface_barcode_window(False)
             self._publish_status("cycle will stop after current blocking motion")
             return
         with self.secondary_safety_lock:
@@ -1910,6 +2146,7 @@ class CosmeticBoxSingleArmNode(Node):
                     self._finish_cycle_timing("success")
             self._publish_status("cycle stopped")
         except Exception as exc:
+            self._set_top_surface_barcode_window(False)
             self._finish_cycle_timing("fault")
             self.cycle_enabled = False
             self._publish_status(f"FAULT: {exc}")
@@ -2159,6 +2396,7 @@ class CosmeticBoxSingleArmNode(Node):
                 self._finish_cycle_timing("success")
                 self._publish_status("single cycle completed")
         except Exception:
+            self._set_top_surface_barcode_window(False)
             self._finish_cycle_timing("fault")
             raise
         finally:
@@ -2905,6 +3143,10 @@ class CosmeticBoxSingleArmNode(Node):
         with self._timed_stage("secondary_y_clearance"):
             self._wait_for_secondary_y_clearance("move-above")
         self._require_cycle_active("immediately before move-above")
+        # The D405 node reuses its existing RGB stream and restricts decoding
+        # to the current YOLO-selected/SAM-tracked target box.  Arm this window
+        # before the move so frames captured during the approach are eligible.
+        self._set_top_surface_barcode_window(True)
         self._publish_status("moving above selected box")
         with self.data_lock:
             pregrasp_reference_count = self.pregrasp_pose_count
@@ -2938,6 +3180,9 @@ class CosmeticBoxSingleArmNode(Node):
                 pregrasp_reference_count,
                 hover_reached_at_s,
             )
+        self._publish_status("top-barcode hover observation")
+        with self._timed_stage("top_barcode_hover_observation"):
+            self._wait_for_top_surface_barcode()
         self._publish_status("descending TCP tip to 75% box height")
         self._require_cycle_active("immediately before grasp descent")
         with self._timed_stage("grasp_descend"):
@@ -2949,6 +3194,18 @@ class CosmeticBoxSingleArmNode(Node):
                 tool_index=int(self.get_parameter("command_tool_index").value),
             )
         self._require_cycle_active("at grasp depth")
+        # Keep the D405 top-surface ROI detector armed through the descent. At
+        # the distant hover pose a portrait label can be only a few pixels wide;
+        # the closer grasp-depth frames provide the resolution needed by YOLO.
+        top_surface_barcode = self._current_top_surface_barcode()
+        self._set_top_surface_barcode_window(False)
+        if not top_surface_barcode and bool(
+            self.get_parameter("top_surface_barcode_enabled").value
+        ):
+            self._publish_status(
+                "no top-surface barcode confirmed during approach/descent in YOLO/SAM target region; "
+                "continuing legacy scanner flow"
+            )
         self._publish_status("at grasp depth; closing gripper now")
         with self._timed_stage("gripper_close"):
             self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
@@ -2971,6 +3228,53 @@ class CosmeticBoxSingleArmNode(Node):
         self._require_cycle_active("after grasp lift")
         with self._timed_stage("post_lift_grasp_check"):
             self._validate_grasp_feedback("after lift", max_opening)
+
+        if top_surface_barcode:
+            self._publish_status(
+                f"top-surface barcode {top_surface_barcode!r} detected; "
+                "skipping scanner approach, J6 rotation, Ry/Rz flip and dynamic Z descent"
+            )
+            fixed_place_xyz = self._top_surface_barcode_place_xyz()
+            # Keep the grasp orientation unchanged and use the same fixed XYZ
+            # as v1's final place_pose: (531, 328, 215) mm.  This branch does
+            # not perform the dynamic length-based User-Z descent.
+            with self._timed_stage("top_barcode_fixed_place_ptp"):
+                self._move_to_user_xyz_with_rotation(
+                    fixed_place_xyz,
+                    ry_delta_deg=0.0,
+                    rz_delta_deg=0.0,
+                )
+            self._require_cycle_active("at top-barcode fixed placement pose")
+            with self._timed_stage("top_barcode_placement_grasp_check"):
+                self._validate_grasp_feedback(
+                    "at top-barcode fixed placement pose",
+                    float(self.get_parameter("dh_max_opening_m").value),
+                )
+            with self._timed_stage("top_barcode_gripper_open_place"):
+                max_opening = float(self.get_parameter("dh_max_opening_m").value)
+                release_clearance = max(
+                    0.0,
+                    float(self.get_parameter("place_release_clearance_m").value),
+                )
+                current_position = self.gripper.read_position()
+                current_opening = current_position * max_opening
+                release_opening = min(max_opening, current_opening + release_clearance)
+                release_position = release_opening / max_opening
+                self._publish_status(
+                    f"releasing top-barcode box at fixed v1 XYZ placement pose: opening "
+                    f"{current_opening*1000:.1f}->{release_opening*1000:.1f}mm"
+                )
+                self.gripper.set_position(release_position, wait=False)
+                self.gripper.wait_until_stopped(
+                    timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                    target_position=release_position,
+                    initial_position=current_position,
+                    cancel_check=self._cycle_cancel_requested,
+                )
+            self._publish_status(
+                "top-barcode box placed with original orientation; returning to startup"
+            )
+            return
 
         # 扫码器可能在机械臂前往 transfer_joint 的途中就读到条码。必须在
         # 运动前开启窗口，否则这条比“到达中转点”早几十毫秒的消息会被回调丢弃。
@@ -3020,6 +3324,17 @@ class CosmeticBoxSingleArmNode(Node):
             self._retreat_box_from_scanner(scanner_approach_m)
         self._require_cycle_active("after scanner safety retreat")
 
+        if not barcode and bool(
+            self.get_parameter("bottom_barcode_recovery_enabled").value
+        ):
+            with self._timed_stage("bottom_barcode_recovery"):
+                self._execute_bottom_barcode_recovery(
+                    target,
+                    pre_shape_position,
+                    height_m,
+                )
+            return
+
         # First move above the placement area at the previous safe height while
         # applying the barcode-up orientation.  Do not send the dynamic low Z
         # in this PTP: that would cut directly through the placement-area base.
@@ -3067,6 +3382,309 @@ class CosmeticBoxSingleArmNode(Node):
                 cancel_check=self._cycle_cancel_requested,
             )
         self._publish_status("placed box at dynamic barcode-up pose; returning to startup")
+
+    @staticmethod
+    def _signed_user_y_delta_deg(before: TcpPose, after: TcpPose) -> float:
+        """Return the signed User-Y component of an orientation change."""
+
+        before_rotation = SciPyRot.from_euler(
+            "xyz", [before.rx, before.ry, before.rz], degrees=True
+        ).as_matrix()
+        after_rotation = SciPyRot.from_euler(
+            "xyz", [after.rx, after.ry, after.rz], degrees=True
+        ).as_matrix()
+        relative_rotation = after_rotation @ before_rotation.T
+        return float(
+            math.degrees(
+                math.atan2(relative_rotation[0, 2], relative_rotation[0, 0])
+            )
+        )
+
+    def _reverse_barcode_search_j6(self) -> float:
+        """Undo the exact J6 travel used by this cycle's unsuccessful search."""
+
+        reverse_delta = -float(self.barcode_search_net_delta_deg)
+        if abs(reverse_delta) <= 0.2:
+            self._publish_status("bottom-barcode recovery: no J6 search travel to reverse")
+            return 0.0
+
+        watch_index = max(
+            0,
+            min(5, int(self.get_parameter("barcode_flip_watch_joint_index").value)),
+        )
+        before_joints = self.controller.current_joint()
+        if len(before_joints) != 6:
+            raise RuntimeError(
+                f"Current joint feedback must contain 6 values before J6 recovery, "
+                f"got {len(before_joints)}"
+            )
+        if not self._is_barcode_flip_joint_safe(before_joints, reverse_delta):
+            raise RuntimeError(
+                f"Unsafe reverse J6 travel during bottom-barcode recovery: "
+                f"current={before_joints[watch_index]:.1f}deg, "
+                f"delta={reverse_delta:+.1f}deg"
+            )
+        target_joints = [float(value) for value in before_joints]
+        target_joints[watch_index] += reverse_delta
+        motion = self._motion_profile()
+        self._publish_status(
+            f"bottom-barcode recovery: reversing J{watch_index + 1} search travel "
+            f"{reverse_delta:+.1f}deg (net search={self.barcode_search_net_delta_deg:+.1f}deg)"
+        )
+        self._require_cycle_active("before reverse barcode J6 travel")
+        self.controller.move_joint(
+            target_joints,
+            speed=motion["barcode_alignment_speed"],
+            accel=motion["barcode_alignment_acc"],
+        )
+        self._require_cycle_active("after reverse barcode J6 travel")
+        after_joints = self.controller.current_joint()
+        if len(after_joints) != 6:
+            raise RuntimeError(
+                f"Current joint feedback must contain 6 values after J6 recovery, "
+                f"got {len(after_joints)}"
+            )
+        actual_delta = float(after_joints[watch_index]) - float(before_joints[watch_index])
+        tolerance_deg = max(
+            3.0,
+            abs(float(self.get_parameter("barcode_flip_jog_tolerance_deg").value)) * 2.0,
+        )
+        if abs(actual_delta - reverse_delta) > tolerance_deg:
+            raise RuntimeError(
+                f"Reverse J6 travel mismatch: requested={reverse_delta:+.1f}deg, "
+                f"actual={actual_delta:+.1f}deg"
+            )
+        self._publish_status(
+            f"bottom-barcode recovery: J{watch_index + 1} returned "
+            f"{actual_delta:+.1f}deg"
+        )
+        return actual_delta
+
+    def _execute_bottom_barcode_recovery(
+        self,
+        grasp_target: TcpPose,
+        pre_shape_position: float,
+        height_m: float,
+    ) -> None:
+        """Recover a box whose barcode is presumed to be on its bottom face.
+
+        The box is returned to the table while still held, released to the
+        original pre-shape width, flipped by User Ry=-45 degrees, and gripped
+        again.  J6 is then returned by the exact amount used by the failed
+        face search.  A small measured Ry shortfall is compensated before the
+        fixed placement PTP; the final placement adds only User Rz=+50 degrees.
+        """
+
+        if not bool(self.get_parameter("bottom_barcode_recovery_enabled").value):
+            raise RuntimeError(
+                "No barcode found and bottom-barcode recovery is disabled; "
+                "the held box was not released"
+            )
+        max_opening = float(self.get_parameter("dh_max_opening_m").value)
+        if max_opening <= 0.0:
+            raise RuntimeError(f"dh_max_opening_m must be positive, got {max_opening}")
+        pre_shape_position = max(0.0, min(1.0, float(pre_shape_position)))
+        target_ry_deg = float(
+            self.get_parameter("bottom_flip_user_ry_target_deg").value
+        )
+        if target_ry_deg >= 0.0:
+            raise RuntimeError(
+                f"bottom_flip_user_ry_target_deg must be negative, got {target_ry_deg:+.1f}deg"
+            )
+
+        retract_m = float(self.get_parameter("bottom_flip_table_retract_m").value)
+        if retract_m < 0.0 or retract_m > 0.200:
+            raise RuntimeError(
+                f"bottom_flip_table_retract_m must be in [0, 0.200]m, got {retract_m:.4f}m"
+            )
+        motion = self._motion_profile()
+        self._publish_status(
+            "no barcode on top or four side faces; entering bottom-barcode recovery "
+            f"with User Ry target {target_ry_deg:+.1f}deg"
+        )
+
+        if retract_m > 0.0005:
+            with self._timed_stage("bottom_flip_x_retract"):
+                self._relative_user_move(
+                    x=-retract_m,
+                    label=(
+                        "bottom-barcode recovery: User X- table clearance "
+                        f"{retract_m * 1000.0:.1f}mm"
+                    ),
+                    speed_factor=motion["scanner_retreat_speed"],
+                    accel_factor=motion["scanner_retreat_acc"],
+                )
+                self._require_cycle_active("after bottom-barcode X- clearance")
+
+        # The grasp target's Z is the measured object support height.  Move
+        # straight down from the lifted pose while keeping the current TCP
+        # orientation and the X/Y reached after the explicit X- retreat.
+        table_pose = self._bottom_flip_table_pose(grasp_target, height_m)
+        current_pose = self._current_command_pose()
+        table_z_delta = float(table_pose.z) - float(current_pose.z)
+        if abs(table_z_delta) > 0.0005:
+            with self._timed_stage("bottom_flip_table_descent"):
+                self._relative_user_move(
+                    z=table_z_delta,
+                    label=(
+                        "bottom-barcode recovery: lowering box to table Z "
+                        f"{table_pose.z * 1000.0:.1f}mm"
+                    ),
+                    speed_factor=motion["place_speed"],
+                    accel_factor=motion["place_acc"],
+                )
+                self._require_cycle_active("at bottom-barcode table pose")
+
+        with self._timed_stage("bottom_flip_open_preshape"):
+            current_position = self.gripper.read_position()
+            self.gripper.set_position(pre_shape_position, wait=False)
+            self.gripper.wait_until_stopped(
+                timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                target_position=pre_shape_position,
+                initial_position=current_position,
+                cancel_check=self._cycle_cancel_requested,
+            )
+            self._publish_status(
+                "bottom-barcode recovery: released box on table at the original "
+                f"pre-shape opening {pre_shape_position * max_opening * 1000.0:.1f}mm"
+            )
+
+        with self._timed_stage("bottom_flip_user_ry"):
+            before_flip = self._current_command_pose()
+            measured_ry_deg, _ = self._try_bottom_flip_ry_at_table(
+                table_pose,
+            )
+            after_flip = self._current_command_pose()
+            xyz_error_m = max(
+                abs(after_flip.x - table_pose.x),
+                abs(after_flip.y - table_pose.y),
+                abs(after_flip.z - table_pose.z),
+            )
+            xyz_tolerance_m = max(
+                0.001,
+                float(self.get_parameter("face_up_fixed_xyz_tolerance_m").value),
+            )
+            if xyz_error_m > xyz_tolerance_m:
+                raise RuntimeError(
+                    "Bottom-barcode table flip changed TCP XYZ by too much: "
+                    f"error={xyz_error_m * 1000.0:.1f}mm"
+                )
+            # Prefer the measured value returned by the motion helper, but keep
+            # this local pose pair as a diagnostic if the controller reports a
+            # wrapped Euler representation.
+            measured_pose_delta = self._signed_user_y_delta_deg(before_flip, after_flip)
+            if abs(measured_pose_delta - measured_ry_deg) > 5.0:
+                self.get_logger().warning(
+                    "Bottom-barcode User Ry feedback differs between command and "
+                    f"pose samples: helper={measured_ry_deg:+.1f}deg, "
+                    f"pose_delta={measured_pose_delta:+.1f}deg"
+                )
+                measured_ry_deg = measured_pose_delta
+
+        with self._timed_stage("bottom_flip_close_preshape"):
+            self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
+            # The fingers were already opened to the original pre-shape width
+            # before the table rotation.  Close from that same starting width;
+            # issuing set_position(pre_shape_position) here would merely open
+            # the fingers again and could never regrip the box.
+            self.gripper.close(
+                wait=True,
+                cancel_check=self._cycle_cancel_requested,
+            )
+            self._validate_grasp_feedback(
+                "after bottom-barcode table regrasp",
+                max_opening,
+            )
+
+        with self._timed_stage("bottom_flip_lift"):
+            self._relative_user_move(
+                z=float(self.get_parameter("grasp_lift_m").value),
+                label="bottom-barcode recovery: lifting regrasped box from table",
+                speed_factor=motion["grasp_lift_speed"],
+                accel_factor=motion["grasp_lift_acc"],
+            )
+            self._require_cycle_active("after bottom-barcode table lift")
+
+        with self._timed_stage("bottom_flip_j6_reverse"):
+            self._reverse_barcode_search_j6()
+
+        # The table flip is commanded as -45 degrees.  If feedback shows a
+        # shortfall, add only the missing User-Y amount after J6 has returned;
+        # this keeps the bottom face as close to perfectly upward as the robot
+        # can reach without trying another large table rotation.
+        remaining_ry_deg = target_ry_deg - measured_ry_deg
+        ry_tolerance_deg = max(
+            1.0,
+            abs(float(self.get_parameter("face_up_jog_tolerance_deg").value)),
+        )
+        for attempt in range(2):
+            if abs(remaining_ry_deg) <= ry_tolerance_deg:
+                break
+            current = self._current_command_pose()
+            before_compensation = current
+            self._publish_status(
+                f"bottom-barcode recovery: compensating remaining User Ry "
+                f"{remaining_ry_deg:+.1f}deg (attempt {attempt + 1}/2)"
+            )
+            self._move_to_user_xyz_with_rotation(
+                [current.x, current.y, current.z],
+                ry_delta_deg=remaining_ry_deg,
+                rz_delta_deg=0.0,
+            )
+            after_compensation = self._current_command_pose()
+            applied_ry_deg = self._signed_user_y_delta_deg(
+                before_compensation,
+                after_compensation,
+            )
+            measured_ry_deg += applied_ry_deg
+            remaining_ry_deg = target_ry_deg - measured_ry_deg
+        if abs(remaining_ry_deg) > ry_tolerance_deg:
+            raise RuntimeError(
+                "Bottom-barcode User Ry compensation incomplete: "
+                f"target={target_ry_deg:+.1f}deg, measured={measured_ry_deg:+.1f}deg"
+            )
+        self._publish_status(
+            f"bottom-barcode recovery orientation ready: total User Ry "
+            f"{measured_ry_deg:+.1f}deg"
+        )
+
+        fixed_place_xyz = self._top_surface_barcode_place_xyz()
+        with self._timed_stage("bottom_barcode_fixed_place_ptp"):
+            self._move_to_user_xyz_with_rotation(
+                fixed_place_xyz,
+                ry_delta_deg=0.0,
+                rz_delta_deg=float(self.get_parameter("post_scan_user_rz_deg").value),
+            )
+            self._require_cycle_active("at bottom-barcode fixed placement pose")
+            self._validate_grasp_feedback(
+                "at bottom-barcode fixed placement pose",
+                max_opening,
+            )
+
+        with self._timed_stage("bottom_barcode_gripper_open_place"):
+            current_position = self.gripper.read_position()
+            current_opening = current_position * max_opening
+            release_clearance = max(
+                0.0,
+                float(self.get_parameter("place_release_clearance_m").value),
+            )
+            release_opening = min(max_opening, current_opening + release_clearance)
+            release_position = release_opening / max_opening
+            self._publish_status(
+                "bottom-barcode box placed with User Ry preserved and User Rz "
+                f"+{float(self.get_parameter('post_scan_user_rz_deg').value):.1f}deg; "
+                f"opening {current_opening * 1000.0:.1f}->{release_opening * 1000.0:.1f}mm"
+            )
+            self.gripper.set_position(release_position, wait=False)
+            self.gripper.wait_until_stopped(
+                timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                target_position=release_position,
+                initial_position=current_position,
+                cancel_check=self._cycle_cancel_requested,
+            )
+        self._publish_status(
+            "bottom-barcode box placed at fixed XYZ; returning to startup"
+        )
 
     def _require_cycle_active(self, stage: str) -> None:
         if not self.running or not self.cycle_enabled:
@@ -3495,6 +4113,12 @@ class CosmeticBoxSingleArmNode(Node):
             self.barcode_hits = 0
             self.barcode_last_time = 0.0
 
+    def _reset_barcode_search_travel(self) -> None:
+        self.barcode_search_net_delta_deg = 0.0
+
+    def _record_barcode_search_travel(self, delta_deg: float) -> None:
+        self.barcode_search_net_delta_deg += float(delta_deg)
+
     def _current_stable_barcode(self) -> str:
         """无等待读取当前扫码窗口；用于决定是否跳过靠近和 J6 找码。"""
         required_hits = max(1, int(self.get_parameter("barcode_stable_hits").value))
@@ -3740,6 +4364,7 @@ class CosmeticBoxSingleArmNode(Node):
         available as a field fallback when continuous motion is disabled or
         when the full sweep would violate the configured J6 safety limit.
         """
+        self._reset_barcode_search_travel()
         if bool(self.get_parameter("barcode_continuous_rotation").value):
             return self._rotate_until_stable_barcode_continuous()
         return self._rotate_until_stable_barcode_segmented()
@@ -3802,6 +4427,7 @@ class CosmeticBoxSingleArmNode(Node):
                 f"({sweep_delta:+.1f}deg across {max_faces - 1} faces); "
                 "stop immediately on scan"
             )
+            self._record_barcode_search_travel(sweep_delta)
             value = self._rotate_barcode_flip_joint(
                 sweep_delta,
                 max_faces - 1,
@@ -3917,6 +4543,7 @@ class CosmeticBoxSingleArmNode(Node):
                 selected_delta = self._select_safe_barcode_flip_delta(required_delta)
                 if selected_delta is None:
                     raise RuntimeError("No safe equivalent J6 barcode rotation is available")
+                self._record_barcode_search_travel(selected_delta)
                 value = self._rotate_barcode_flip_joint(
                     selected_delta,
                     flip_index + 1,
@@ -4065,9 +4692,15 @@ class CosmeticBoxSingleArmNode(Node):
             f"RPY=({final.rx:.1f},{final.ry:.1f},{final.rz:.1f})deg"
         )
 
-    def _rotate_face_up_about_user_y_jog(self, total_delta_deg: float) -> None:
+    def _rotate_face_up_about_user_y_jog(
+        self,
+        total_delta_deg: float,
+        *,
+        allow_shortfall: bool = False,
+        minimum_progress_deg: float = 45.0,
+    ) -> float:
         if abs(total_delta_deg) <= 1e-6:
-            return
+            return 0.0
         # Restore the previous production mechanism: continuously jog the
         # rotational axis in the selected user frame. With User 0 this is Ry-
         # about the base frame and the controller itself keeps TCP XYZ fixed.
@@ -4111,6 +4744,15 @@ class CosmeticBoxSingleArmNode(Node):
             while True:
                 self._require_cycle_active("during user-frame Ry face-up jog")
                 if time.monotonic() - start_time > timeout_s:
+                    if allow_shortfall and directed_progress_deg >= max(
+                        0.0, min(target_deg, float(minimum_progress_deg))
+                    ):
+                        self.get_logger().warning(
+                            f"User-frame {axis_name} MoveJog timed out after a "
+                            f"usable partial rotation: progress={directed_progress_deg:.1f}/"
+                            f"{target_deg:.1f}deg"
+                        )
+                        break
                     raise RuntimeError(
                         f"User-frame {axis_name} MoveJog timed out: "
                         f"progress={directed_progress_deg:.1f}/{target_deg:.1f}deg"
@@ -4166,10 +4808,19 @@ class CosmeticBoxSingleArmNode(Node):
         )
         final_progress_deg = direction * final_signed_y_deg
         if final_progress_deg < target_deg - max(5.0, angle_tolerance_deg):
-            raise RuntimeError(
-                f"User-frame {axis_name} rotation insufficient: "
-                f"progress={final_progress_deg:.1f}/{target_deg:.1f}deg"
-            )
+            if allow_shortfall and final_progress_deg >= max(
+                0.0, min(target_deg, float(minimum_progress_deg))
+            ):
+                self.get_logger().warning(
+                    f"User-frame {axis_name} rotation reached only "
+                    f"{final_progress_deg:.1f}/{target_deg:.1f}deg; accepting a "
+                    "partial turn and compensating later"
+                )
+            else:
+                raise RuntimeError(
+                    f"User-frame {axis_name} rotation insufficient: "
+                    f"progress={final_progress_deg:.1f}/{target_deg:.1f}deg"
+                )
         if drift_m > tolerance_m:
             raise RuntimeError(
                 f"User-frame {axis_name} rotation exceeded fixed-TCP tolerance: "
@@ -4179,6 +4830,7 @@ class CosmeticBoxSingleArmNode(Node):
             f"user-frame {axis_name} face-up jog completed: "
             f"progress={final_progress_deg:.1f}deg, TCP XYZ drift={drift_m*1000:.2f}mm"
         )
+        return float(direction * final_progress_deg)
 
     def destroy_node(self):
         self.shutting_down = True
@@ -4367,6 +5019,12 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.secondary_collision_check.setChecked(
             bool(self.node.get_parameter("secondary_collision_check_enabled").value)
         )
+        self.top_surface_barcode_enabled = QCheckBox(
+            "启用目标顶面条形码检测（命中后跳过扫码器/J6/Ry/Rz）"
+        )
+        self.top_surface_barcode_enabled.setChecked(
+            bool(self.node.get_parameter("top_surface_barcode_enabled").value)
+        )
         self.grasp_z_offset = self._new_double(float(self.node.get_parameter("grasp_z_offset_m").value) * 1000.0, -20.0, 20.0, 1, 0.5)
         self.minimum_safe_tcp_z = self._new_double(float(self.node.get_parameter("minimum_safe_tcp_z_m").value) * 1000.0, -50.0, 100.0, 1, 0.5)
         self.grasp_lift = self._new_double(float(self.node.get_parameter("grasp_lift_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
@@ -4414,6 +5072,7 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("运动状态反馈等待秒", self.grasp_feedback_wait)
         form.addRow("单轮空抓重试次数", self.grasp_retry_limit)
         form.addRow("夹爪反馈保护", self.feedback_required)
+        form.addRow("顶面条码分支", self.top_surface_barcode_enabled)
         self.apply_button = QPushButton("应用以上全部参数")
         self.apply_button.clicked.connect(self.apply_parameters)
         form.addRow(self.apply_button)
@@ -4438,6 +5097,13 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.barcode_hits = QSpinBox(); self.barcode_hits.setRange(1, 20); self.barcode_hits.setValue(int(self.node.get_parameter("barcode_stable_hits").value))
         self.barcode_rotations = QSpinBox(); self.barcode_rotations.setRange(4, 4); self.barcode_rotations.setValue(4)
         self.barcode_wait = self._new_double(float(self.node.get_parameter("barcode_face_wait_s").value), 0.02, 10.0, 2, 0.01)
+        self.top_surface_barcode_wait = self._new_double(
+            float(self.node.get_parameter("top_surface_barcode_wait_s").value),
+            0.0,
+            5.0,
+            2,
+            0.05,
+        )
         self.barcode_continuous_rotation = QCheckBox("连续旋转 270°，扫码后吸附最近 90° 面")
         self.barcode_continuous_rotation.setChecked(
             bool(self.node.get_parameter("barcode_continuous_rotation").value)
@@ -4452,6 +5118,26 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.face_up_user_ry = self._new_double(float(self.node.get_parameter("face_up_user_ry_deg").value), -180.0, 180.0, 1, 5.0)
         self.post_scan_user_rz = self._new_double(float(self.node.get_parameter("post_scan_user_rz_deg").value), -180.0, 180.0, 1, 5.0)
         self.face_up_jog_tolerance = self._new_double(float(self.node.get_parameter("face_up_jog_tolerance_deg").value), 0.2, 10.0, 1, 0.2)
+        self.bottom_barcode_recovery_enabled = QCheckBox(
+            "无顶面/侧面条码时启用底面翻转恢复"
+        )
+        self.bottom_barcode_recovery_enabled.setChecked(
+            bool(self.node.get_parameter("bottom_barcode_recovery_enabled").value)
+        )
+        self.bottom_flip_user_ry = self._new_double(
+            float(self.node.get_parameter("bottom_flip_user_ry_target_deg").value),
+            -180.0,
+            -1.0,
+            1,
+            5.0,
+        )
+        self.bottom_flip_table_retract = self._new_double(
+            float(self.node.get_parameter("bottom_flip_table_retract_m").value) * 1000.0,
+            0.0,
+            200.0,
+            1,
+            1.0,
+        )
         self.scanner_center_distance = self._new_double(float(self.node.get_parameter("scanner_center_distance_m").value) * 1000.0, 1.0, 500.0, 1, 1.0)
         self.scanner_face_clearance = self._new_double(float(self.node.get_parameter("scanner_face_clearance_m").value) * 1000.0, 0.0, 200.0, 1, 1.0)
         self.scanner_negative_tolerance = self._new_double(float(self.node.get_parameter("scanner_approach_negative_tolerance_m").value) * 1000.0, 0.0, 20.0, 1, 1.0)
@@ -4468,6 +5154,7 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("连续找码模式", self.barcode_continuous_rotation)
         form.addRow("检查面数（分段模式固定）", self.barcode_rotations)
         form.addRow("每面等待秒", self.barcode_wait)
+        form.addRow("顶面条码悬停检测等待秒", self.top_surface_barcode_wait)
         form.addRow("中转 TCP 到扫码器距离 mm", self.scanner_center_distance)
         form.addRow("盒侧面扫码间隙 mm", self.scanner_face_clearance)
         form.addRow("负靠近量容差 mm", self.scanner_negative_tolerance)
@@ -4482,6 +5169,9 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("组合目标 User Ry 增量 deg", self.face_up_user_ry)
         form.addRow("组合目标 User Rz 增量 deg", self.post_scan_user_rz)
         form.addRow("组合目标姿态到位容差 deg", self.face_up_jog_tolerance)
+        form.addRow("底面条码翻转恢复", self.bottom_barcode_recovery_enabled)
+        form.addRow("底面恢复 User Ry 目标 deg", self.bottom_flip_user_ry)
+        form.addRow("底面恢复 User X- 额外退让 mm", self.bottom_flip_table_retract)
         layout.addWidget(box)
 
     def _build_actions(self, layout: QVBoxLayout) -> None:
@@ -4575,6 +5265,10 @@ class CosmeticBoxControlWindow(QMainWindow):
                 "secondary_collision_check_enabled",
                 value=self.secondary_collision_check.isChecked(),
             ),
+            Parameter(
+                "top_surface_barcode_enabled",
+                value=self.top_surface_barcode_enabled.isChecked(),
+            ),
             Parameter("grasp_z_offset_m", value=self.grasp_z_offset.value() / 1000.0),
             Parameter("minimum_safe_tcp_z_m", value=self.minimum_safe_tcp_z.value() / 1000.0),
             Parameter("grasp_lift_m", value=self.grasp_lift.value() / 1000.0),
@@ -4594,6 +5288,9 @@ class CosmeticBoxControlWindow(QMainWindow):
             ),
             Parameter("barcode_max_face_rotations", value=self.barcode_rotations.value()),
             Parameter("barcode_face_wait_s", value=self.barcode_wait.value()),
+            Parameter(
+                "top_surface_barcode_wait_s", value=self.top_surface_barcode_wait.value()
+            ),
             Parameter("scanner_center_distance_m", value=self.scanner_center_distance.value() / 1000.0),
             Parameter("scanner_face_clearance_m", value=self.scanner_face_clearance.value() / 1000.0),
             Parameter("scanner_approach_negative_tolerance_m", value=self.scanner_negative_tolerance.value() / 1000.0),
@@ -4611,6 +5308,18 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("face_up_user_ry_deg", value=self.face_up_user_ry.value()),
             Parameter("post_scan_user_rz_deg", value=self.post_scan_user_rz.value()),
             Parameter("face_up_jog_tolerance_deg", value=self.face_up_jog_tolerance.value()),
+            Parameter(
+                "bottom_barcode_recovery_enabled",
+                value=self.bottom_barcode_recovery_enabled.isChecked(),
+            ),
+            Parameter(
+                "bottom_flip_user_ry_target_deg",
+                value=self.bottom_flip_user_ry.value(),
+            ),
+            Parameter(
+                "bottom_flip_table_retract_m",
+                value=self.bottom_flip_table_retract.value() / 1000.0,
+            ),
         ]
         results = self.node.set_parameters(parameters)
         failures = [result.reason for result in results if not result.successful]

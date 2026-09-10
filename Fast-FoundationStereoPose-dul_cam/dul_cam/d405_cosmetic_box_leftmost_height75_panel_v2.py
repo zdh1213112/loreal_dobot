@@ -11,6 +11,8 @@ Differences from ``d405_local_ransac_coarse_lock_wait_lock_manual_roi_exposure_p
   height from it, and places the published grasp point 75% down from the top;
 * publishes a short burst of stable poses, then keeps SAM2 display tracking
   active until the next ``/trigger_d405_vision`` request.
+* while the robot approaches the grasp hover, optionally decodes a barcode only
+  inside the selected YOLO/SAM target region and reports it on the v2 topic.
 """
 
 import json
@@ -49,6 +51,7 @@ from dobot_nova5_driver.top_surface_geometry_v2 import (
     normalized_plane,
     select_top_plane_candidate,
 )
+from top_surface_barcode_detector_v2 import TopSurfaceBarcodeDetector
 
 SAM2_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "SAM2_streaming")
 sys.path.insert(0, SAM2_DIR)
@@ -83,6 +86,8 @@ CAPTURE_FLUSH_FRAMES = 2
 # 抓取上方后读取最新目标位姿。该跟踪不增加单独等待步骤。
 PREGRASP_POSE_TOPIC = "/target_pose_cam_pregrasp"
 PREGRASP_TRACKING_WINDOW_S = 5.0
+TOP_SURFACE_BARCODE_TOPIC = "/trigger_top_surface_barcode"
+TOP_SURFACE_BARCODE_RESULT_TOPIC = "/top_surface_barcode_result"
 
 # Cosmetic-box geometry parameters
 MAX_PLANES = 3
@@ -176,6 +181,15 @@ SAVE_FAULT_SNAPSHOTS = True
 FAULT_SNAPSHOT_OUTPUT_DIR = os.path.join(
     os.path.dirname(D405_OUTPUT_DIR), "d405_fault_snapshots_v2"
 )
+# The latest top-barcode attempt is kept as a standalone annotated image so it
+# can be inspected even when the OpenCV local window is not visible.  It is a
+# runtime artifact, not source data.
+TOP_BARCODE_DEBUG_OUTPUT_DIR = os.path.join(
+    os.path.dirname(D405_OUTPUT_DIR), "d405_top_barcode_debug_v2"
+)
+TOP_BARCODE_DEBUG_IMAGE = "top_barcode_latest.png"
+TOP_BARCODE_DEBUG_RAW_IMAGE = "top_barcode_latest_raw.png"
+TOP_BARCODE_DEBUG_WRITE_PERIOD_S = 0.50
 FAULT_SNAPSHOT_STATUS_TOPIC = "/cosmetic_pick_cycle_status"
 FAULT_SNAPSHOT_TIMING_TOPIC = "/cosmetic_pick_cycle_timing"
 FAULT_SNAPSHOT_IMAGE_SUFFIX = ".png"
@@ -218,6 +232,14 @@ ros_node.declare_parameter(
 HANDOFF_OVERHEAD_CLEARANCE_ENABLED = bool(
     ros_node.get_parameter("handoff_overhead_clearance_enabled").value
 )
+ros_node.declare_parameter("top_surface_barcode_stable_hits", 1)
+TOP_SURFACE_BARCODE_STABLE_HITS = max(
+    1, int(ros_node.get_parameter("top_surface_barcode_stable_hits").value)
+)
+ros_node.declare_parameter("top_surface_barcode_enabled", True)
+TOP_SURFACE_BARCODE_ENABLED = bool(
+    ros_node.get_parameter("top_surface_barcode_enabled").value
+)
 logging.info(
     "[D405] handoff/finger obstacle clearance check %s; overhead/right-corridor check %s",
     "ENABLED" if HANDOFF_CLEARANCE_ENABLED else "DISABLED (operator override)",
@@ -256,6 +278,9 @@ cloud_pub = ros_node.create_publisher(CompressedImage, "/vision_panel/d405_local
 # 稳定目标后的后台预抓取跟踪位姿；与初始稳定采样话题分开，避免污染
 # 机器人端下一次视觉请求的 2 帧稳定性计数。
 pregrasp_pose_pub = ros_node.create_publisher(PoseStamped, PREGRASP_POSE_TOPIC, 10)
+top_surface_barcode_result_pub = ros_node.create_publisher(
+    String, TOP_SURFACE_BARCODE_RESULT_TOPIC, 10
+)
 
 # RealSense timestamps are milliseconds.  SYSTEM/GLOBAL timestamps are already
 # Unix-like; HARDWARE timestamps are mapped to the host Unix clock using a
@@ -507,8 +532,14 @@ def queue_fault_snapshot(*, status: str = "", timing_payload=None, source: str =
 def cycle_status_callback(msg: String) -> None:
     """Receive robot status and arm snapshots for all grasp failures."""
 
-    global latest_cycle_status
+    global latest_cycle_status, top_barcode_capture_phase
     status = str(msg.data)
+    if "moving above selected box" in status:
+        top_barcode_capture_phase = "approach"
+    elif "top-barcode hover observation" in status:
+        top_barcode_capture_phase = "hover"
+    elif "descending TCP tip" in status:
+        top_barcode_capture_phase = "descent"
     with fault_snapshot_lock:
         latest_cycle_status = status
         timing_payload = (
@@ -950,6 +981,130 @@ def trigger_callback(msg: Bool) -> None:
         logging.info("[D405] New cosmetic-box detection requested.")
 
 
+def top_surface_barcode_trigger_callback(msg: Bool) -> None:
+    """Arm/disarm one top-surface barcode observation window."""
+
+    global top_surface_barcode_requested, top_surface_barcode_reported
+    global top_barcode_capture_session, top_barcode_capture_phase
+    global top_surface_barcode_candidate, top_surface_barcode_hits
+    global top_surface_barcode_last_hit_at
+    global top_surface_barcode_last_attempt_at, top_surface_barcode_last_debug_write_at
+    top_surface_barcode_requested = bool(msg.data) and TOP_SURFACE_BARCODE_ENABLED
+    if top_surface_barcode_requested:
+        top_barcode_capture_session = str(time.time_ns())
+        top_barcode_capture_phase = "approach"
+        logging.info("[top-barcode] per-attempt images: %s", os.path.join(TOP_BARCODE_DEBUG_OUTPUT_DIR, top_barcode_capture_session))
+        top_surface_barcode_reported = False
+        top_surface_barcode_candidate = ""
+        top_surface_barcode_hits = 0
+        top_surface_barcode_last_hit_at = 0.0
+        top_surface_barcode_last_attempt_at = 0.0
+        top_surface_barcode_last_debug_write_at = 0.0
+        logging.info("[D405] Top-surface barcode observation armed.")
+    else:
+        logging.info("[D405] Top-surface barcode observation disarmed.")
+
+
+def publish_top_surface_barcode(value: str) -> None:
+    result = String()
+    result.data = f"success:{value}"
+    top_surface_barcode_result_pub.publish(result)
+
+
+def save_top_barcode_debug_frame(
+    image: np.ndarray,
+    mask: np.ndarray | None,
+    target_corners: np.ndarray | None,
+    debug: dict,
+    hit,
+    *,
+    force: bool = False,
+    capture: dict | None = None,
+) -> None:
+    """Write an annotated top-barcode frame and expose its decoder evidence."""
+
+    global top_surface_barcode_last_debug_write_at
+    now = time.monotonic()
+    if capture is None and not force and now - top_surface_barcode_last_debug_write_at < TOP_BARCODE_DEBUG_WRITE_PERIOD_S:
+        return
+    top_surface_barcode_last_debug_write_at = now
+    if image is None or np.asarray(image).size == 0:
+        return
+    annotated = np.asarray(image).copy()
+    if annotated.ndim != 3:
+        annotated = cv2.cvtColor(annotated, cv2.COLOR_GRAY2BGR)
+    if mask is not None and np.asarray(mask).shape[:2] == annotated.shape[:2]:
+        mask_u8 = (np.asarray(mask) > 0).astype(np.uint8)
+        overlay = annotated.copy()
+        overlay[mask_u8 > 0] = (70, 100, 220)
+        annotated = cv2.addWeighted(annotated, 0.72, overlay, 0.28, 0.0)
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(annotated, contours, -1, (0, 255, 0), 2, cv2.LINE_AA)
+    if target_corners is not None:
+        corners = np.int32(np.round(np.asarray(target_corners).reshape(-1, 2)))
+        if len(corners) >= 3:
+            cv2.polylines(annotated, [corners], True, (0, 0, 255), 3, cv2.LINE_AA)
+    interior_bbox = debug.get("interior_bbox")
+    if interior_bbox is not None and len(interior_bbox) == 4:
+        x0, y0, x1, y1 = [int(v) for v in interior_bbox]
+        cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 180, 0), 2, cv2.LINE_AA)
+    for candidate in debug.get("candidate_boxes", []):
+        rect = candidate.get("rect")
+        if rect is None or len(rect) != 4:
+            continue
+        x0, y0, x1, y1 = [int(v) for v in rect]
+        accepted = bool(candidate.get("center_inside"))
+        color = (0, 255, 255) if accepted else (160, 160, 160)
+        cv2.rectangle(annotated, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+        label = f"barcode c{candidate.get('class_id', '?')}"
+        confidence = candidate.get("confidence")
+        if confidence is not None:
+            label += f" {float(confidence):.2f}"
+        label += " IN" if accepted else " OUT"
+        cv2.putText(annotated, label, (x0, max(16, y0 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    accepted = debug.get("accepted_candidate")
+    if accepted is not None and len(accepted) == 4:
+        x, y, w, h = [int(v) for v in accepted]
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 3, cv2.LINE_AA)
+    state = "ARMED" if top_surface_barcode_requested else "DISARMED"
+    result_text = f"TOP BARCODE {state} | {debug.get('message', 'unknown')}"
+    cv2.rectangle(annotated, (4, 4), (min(annotated.shape[1] - 4, 1000), 42), (0, 0, 0), -1)
+    cv2.putText(annotated, result_text[:150], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0) if hit else (0, 220, 255), 1, cv2.LINE_AA)
+    try:
+        os.makedirs(TOP_BARCODE_DEBUG_OUTPUT_DIR, exist_ok=True)
+        output_path = os.path.join(TOP_BARCODE_DEBUG_OUTPUT_DIR, TOP_BARCODE_DEBUG_IMAGE)
+        cv2.imwrite(output_path, np.ascontiguousarray(annotated))
+        raw_path = os.path.join(TOP_BARCODE_DEBUG_OUTPUT_DIR, TOP_BARCODE_DEBUG_RAW_IMAGE)
+        cv2.imwrite(raw_path, np.ascontiguousarray(image))
+        if capture is not None:
+            folder = os.path.join(TOP_BARCODE_DEBUG_OUTPUT_DIR, capture["session"])
+            os.makedirs(folder, exist_ok=True)
+            stem = f'{capture["attempt_ns"]}_{capture["phase"]}'
+            def write_image(suffix, pixels):
+                path = os.path.join(folder, stem + suffix + ".png")
+                if not cv2.imwrite(path, np.ascontiguousarray(pixels)):
+                    raise OSError(f"failed to save {path}")
+            write_image("_raw", image)
+            write_image("_annotated", annotated)
+            interior = top_surface_barcode_detector._interior_mask(mask) if mask is not None else None
+            if interior is not None:
+                write_image("_mask", interior.astype(np.uint8) * 255)
+                cropped = top_surface_barcode_detector._crop_target_roi(image, interior)
+                if cropped is not None:
+                    write_image("_roi", cropped[0])
+                    capture["roi_origin"] = list(cropped[1])
+            metadata = dict(capture, debug=debug,
+                            detected=hit is not None,
+                            value=None if hit is None else hit.value,
+                            model_path=top_surface_barcode_detector.model_path,
+                            confidence_threshold=top_surface_barcode_detector.model_confidence)
+            with open(os.path.join(folder, stem + ".json"), "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    except (OSError, cv2.error) as exc:
+        logging.warning(f"[top-barcode] debug frame save failed: {exc}")
+
+
 def clamp_image_point(x: int, y: int) -> tuple[int, int]:
     return (
         max(0, min(IMG_WIDTH - 1, int(x))),
@@ -1119,6 +1274,9 @@ def panel_event_callback(msg: String) -> None:
 
 
 ros_node.create_subscription(Bool, "/trigger_d405_vision", trigger_callback, 10)
+ros_node.create_subscription(
+    Bool, TOP_SURFACE_BARCODE_TOPIC, top_surface_barcode_trigger_callback, 10
+)
 ros_node.create_subscription(String, "/vision_panel/d405_local_rgb/event", panel_event_callback, 10)
 ros_node.create_subscription(String, FAULT_SNAPSHOT_STATUS_TOPIC, cycle_status_callback, 10)
 ros_node.create_subscription(String, FAULT_SNAPSHOT_TIMING_TOPIC, cycle_timing_callback, 20)
@@ -1432,6 +1590,33 @@ last_gripper_positive_side_clear = False
 last_gripper_side_live_voxels = [None, None]
 handoff_reacquire_required = False
 pregrasp_tracking_deadline = 0.0
+top_barcode_capture_session = "unarmed"
+top_barcode_capture_phase = "approach"
+top_surface_barcode_requested = False
+top_surface_barcode_reported = False
+top_surface_barcode_detector = TopSurfaceBarcodeDetector()
+if TOP_SURFACE_BARCODE_ENABLED and top_surface_barcode_detector.load_model():
+    logging.info("[top-barcode] YOLO model=%s confidence=%.2f classes=%s", top_surface_barcode_detector.model_path, top_surface_barcode_detector.model_confidence, top_surface_barcode_detector._yolo_model.names)
+elif TOP_SURFACE_BARCODE_ENABLED:
+    logging.warning(
+        "[top-barcode] YOLO barcode model unavailable; using ZBar/OpenCV fallback."
+    )
+top_surface_barcode_candidate = ""
+top_surface_barcode_hits = 0
+top_surface_barcode_last_hit_at = 0.0
+top_surface_barcode_last_value = ""
+top_surface_barcode_last_attempt_at = 0.0
+top_surface_barcode_last_debug = {
+    "interior_bbox": None,
+    "interior_pixels": 0,
+    "candidate_boxes": [],
+    "accepted_candidate": None,
+    "decoder": "none",
+    "message": "not attempted",
+}
+top_surface_barcode_last_hit = None
+top_surface_barcode_last_debug_at = 0.0
+top_surface_barcode_last_debug_write_at = 0.0
 
 if ENABLE_LOCAL_WINDOWS:
     local_window_width = IMG_WIDTH + LOCAL_DIVIDER_WIDTH_PX + int(
@@ -1608,6 +1793,104 @@ try:
             object_ids, mask_logits = sam2_predictor.track(color_bgr)
             current_mask = (mask_logits[0] > 0.0).permute(1, 2, 0).byte().cpu().numpy().squeeze() if len(object_ids) else None
             tracking_frames_without_height += 1
+
+        # During the robot's move-above window, decode only inside the current
+        # YOLO-selected/SAM-tracked target region.  This runs on the already
+        # acquired D405 RGB frame and does not start another camera pipeline.
+        if (
+            top_surface_barcode_requested
+            and not top_surface_barcode_reported
+            and current_mask is not None
+            and locked_target_corners is not None
+            and time.monotonic() - top_surface_barcode_last_attempt_at >= 0.20
+        ):
+            top_surface_barcode_last_attempt_at = time.monotonic()
+            capture = {"session": top_barcode_capture_session,
+                       "attempt_ns": time.time_ns(), "phase": top_barcode_capture_phase,
+                       "robot_status": latest_cycle_status}
+            try:
+                top_hit = top_surface_barcode_detector.detect(
+                    color_bgr,
+                    current_mask,
+                    # This frame's SAM mask already identifies the selected
+                    # target. The display corners update later in the loop
+                    # and can clip the expanding face during descent.
+                    None,
+                )
+                top_surface_barcode_last_debug = dict(
+                    top_surface_barcode_detector.last_debug
+                )
+                top_surface_barcode_last_hit = top_hit
+                top_surface_barcode_last_debug_at = time.monotonic()
+                if (
+                    top_surface_barcode_last_debug_at
+                    - getattr(save_top_barcode_debug_frame, "_last_log_at", 0.0)
+                    >= 1.0
+                ):
+                    save_top_barcode_debug_frame._last_log_at = top_surface_barcode_last_debug_at
+                    logging.info(
+                        "[top-barcode] attempt: %s; interior_pixels=%s; "
+                        "candidates=%s; decoder=%s",
+                        top_surface_barcode_last_debug.get("message", "unknown"),
+                        top_surface_barcode_last_debug.get("interior_pixels", 0),
+                        len(top_surface_barcode_last_debug.get("candidate_boxes", [])),
+                        top_surface_barcode_last_debug.get("decoder", "none"),
+                    )
+                save_top_barcode_debug_frame(
+                    color_bgr,
+                    current_mask,
+                    locked_target_corners,
+                    top_surface_barcode_last_debug,
+                    top_hit,
+                    force=top_hit is not None,
+                    capture=capture,
+                )
+            except Exception as exc:
+                top_hit = None
+                top_surface_barcode_last_debug = {
+                    "interior_bbox": None,
+                    "interior_pixels": 0,
+                    "candidate_boxes": [],
+                    "accepted_candidate": None,
+                    "decoder": "exception",
+                    "message": str(exc),
+                }
+                top_surface_barcode_last_hit = None
+                top_surface_barcode_last_debug_at = time.monotonic()
+                save_top_barcode_debug_frame(
+                    color_bgr,
+                    current_mask,
+                    locked_target_corners,
+                    top_surface_barcode_last_debug,
+                    None,
+                    capture=capture,
+                )
+                now = time.monotonic()
+                if now - top_surface_barcode_last_hit_at > 2.0:
+                    logging.warning(f"[top-barcode] detection failed: {exc}")
+                    top_surface_barcode_last_hit_at = now
+            if top_hit is not None:
+                now = time.monotonic()
+                if (
+                    top_hit.value == top_surface_barcode_candidate
+                    and now - top_surface_barcode_last_hit_at <= 0.8
+                ):
+                    top_surface_barcode_hits += 1
+                else:
+                    top_surface_barcode_candidate = top_hit.value
+                    top_surface_barcode_hits = 1
+                top_surface_barcode_last_hit_at = now
+                logging.info(
+                    f"[top-barcode] candidate={top_hit.value!r}, "
+                    f"hits={top_surface_barcode_hits}/{TOP_SURFACE_BARCODE_STABLE_HITS}"
+                )
+                if top_surface_barcode_hits >= TOP_SURFACE_BARCODE_STABLE_HITS:
+                    top_surface_barcode_reported = True
+                    publish_top_surface_barcode(top_hit.value)
+                    logging.info(
+                        f"[top-barcode] confirmed on YOLO/SAM target top surface: "
+                        f"{top_hit.value}"
+                    )
 
         # YOLO 的相机 X 排序必须使用本次触发刚计算出的 FFS 点云。选中目标后，
         # 相机和场景在机械臂开始抓取前保持静止，因此 SAM2 的后续稳定帧直接复用
@@ -2585,6 +2868,72 @@ try:
         active_roi = get_manual_roi()
         roi_status = "ROI:FULL" if active_roi is None else f"ROI:{active_roi[0]},{active_roi[1]}-{active_roi[2]},{active_roi[3]}"
         cv2.putText(display, f"{status} | FPS {fps:.1f} | {exposure_status} | {roi_status}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0) if sam_initialized else (0, 165, 255), 2)
+        if top_surface_barcode_requested:
+            debug_bbox = top_surface_barcode_last_debug.get("interior_bbox")
+            if debug_bbox is not None and len(debug_bbox) == 4:
+                x0, y0, x1, y1 = [int(v) for v in debug_bbox]
+                cv2.rectangle(display, (x0, y0), (x1, y1), (255, 180, 0), 2, cv2.LINE_AA)
+                cv2.putText(
+                    display,
+                    "barcode ROI (SAM interior)",
+                    (x0, max(16, y0 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.40,
+                    (255, 180, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+            for candidate in top_surface_barcode_last_debug.get("candidate_boxes", []):
+                rect = candidate.get("rect")
+                if rect is None or len(rect) != 4:
+                    continue
+                x0, y0, x1, y1 = [int(v) for v in rect]
+                inside = bool(candidate.get("center_inside"))
+                color = (0, 255, 255) if inside else (160, 160, 160)
+                cv2.rectangle(display, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+                confidence = candidate.get("confidence")
+                label = "BARCODE" + (f" {float(confidence):.2f}" if confidence is not None else "")
+                cv2.putText(
+                    display,
+                    label,
+                    (x0, min(IMG_HEIGHT - 4, y1 + 16)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+            accepted_rect = top_surface_barcode_last_debug.get("accepted_candidate")
+            if accepted_rect is not None and len(accepted_rect) == 4:
+                x, y, w, h = [int(v) for v in accepted_rect]
+                cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 3, cv2.LINE_AA)
+            top_barcode_text = (
+                f"TOP BARCODE: {top_surface_barcode_candidate or 'checking'} "
+                f"({top_surface_barcode_hits}/{TOP_SURFACE_BARCODE_STABLE_HITS})"
+            )
+            cv2.putText(
+                display,
+                top_barcode_text,
+                (10, 108),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (0, 255, 0) if top_surface_barcode_reported else (0, 220, 255),
+                2,
+            )
+            debug_text = (
+                f"ROI pixels={int(top_surface_barcode_last_debug.get('interior_pixels', 0))} "
+                f"decoder={top_surface_barcode_last_debug.get('decoder', 'none')}"
+            )
+            cv2.putText(
+                display,
+                debug_text[:140],
+                (10, 128),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (180, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
         cv2.putText(display, "drag mouse=lock ROI | select=min camera X inside ROI | r=clear ROI/reset | a=AE | q=quit", (10, 47), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 220, 255), 1)
         if last_handoff_state not in ("IDLE", "WAIT_TARGET"):
             clearance_color = (0, 255, 0) if handoff_clearance_passed else (0, 0, 255)
