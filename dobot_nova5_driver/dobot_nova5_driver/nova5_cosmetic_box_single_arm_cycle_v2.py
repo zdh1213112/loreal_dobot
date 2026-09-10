@@ -51,6 +51,8 @@ except ImportError:
         QSpinBox, QVBoxLayout, QWidget,
     )
 
+from .offset_grasp_geometry_v2 import plan_offset
+
 from .controller_v2 import DobotNova5Controller, TcpPose
 from .dobot_dh_api_v2 import (
     GRIP_DROPPED,
@@ -325,6 +327,10 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("face_up_rotation_speed_factor", 50)
         self.declare_parameter("jog_tolerance_m", 0.002)
         self.declare_parameter("jog_axis_timeout_s", 20.0)
+        self.declare_parameter("offset_grasp_enabled", True)
+        self.declare_parameter("offset_grasp_clearance_m", 0.020)
+        self.declare_parameter("offset_finger_span_m", 0.060)
+        self.declare_parameter("offset_grasp_speed_percent", 10)
         self.declare_parameter("grasp_lift_m", 0.060)
         # Current real-cell trials show an approximately 10 mm vertical bias
         # between the transformed vision pose and the physical gripper tip.
@@ -575,6 +581,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.latest_vision_result = ""
         self.handoff_state_count = 0
         self.latest_handoff_state = "IDLE"
+        self.rgb_to_ir_rotation = None
         self.latest_handoff_clear = False
         self.latest_handoff_candidate_points = 0
         self.latest_handoff_cluster_points = 0
@@ -1933,10 +1940,18 @@ class CosmeticBoxSingleArmNode(Node):
             cluster_points = int(payload.get("largest_cluster_points", 0))
             negative_side_clear = payload.get("negative_side_clear") is True
             positive_side_clear = payload.get("positive_side_clear") is True
+            rgb_rotation = payload.get("rgb_to_ir_rotation")
+            if rgb_rotation is not None:
+                rgb_rotation = np.asarray(rgb_rotation, dtype=float).reshape(3,3)
+                if (not np.all(np.isfinite(rgb_rotation)) or
+                        not np.allclose(rgb_rotation.T @ rgb_rotation, np.eye(3), atol=1e-4) or
+                        np.linalg.det(rgb_rotation) < 0.99):
+                    raise ValueError("invalid RGB-to-IR calibration")
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"Ignoring invalid D405 handoff state: {exc}")
             return
         with self.data_lock:
+            self.rgb_to_ir_rotation = rgb_rotation
             self.latest_handoff_state = state
             self.latest_handoff_clear = clear
             self.latest_handoff_candidate_points = candidate_points
@@ -3095,6 +3110,48 @@ class CosmeticBoxSingleArmNode(Node):
         )
         return corrected_target
 
+    def _execute_offset_entry(self, target: TcpPose, length_m: float) -> None:
+        """Move image-down, descend beside the box, then insert to its centre."""
+        user = int(self.get_parameter("user_index").value)
+        tool = int(self.get_parameter("command_tool_index").value)
+        current = self._current_command_pose()
+        flange = self.controller.current_tcp_pose(
+            user_index=user, tool_index=int(self.get_parameter("flange_tool_index").value))
+        user_camera = pose_to_transform(flange) @ self.handeye_flange_to_cam
+        span = float(self.get_parameter("offset_finger_span_m").value)
+        xyz = np.array([target.x, target.y, target.z])
+        with self.data_lock:
+            rgb_rotation = self.rgb_to_ir_rotation
+        if rgb_rotation is None:
+            raise RuntimeError("D405 RGB-to-IR calibration missing for image-down approach")
+        low_xyz = plan_offset(
+            xyz, user_camera[:3, :3] @ rgb_rotation, length_m, span,
+            float(self.get_parameter("offset_grasp_clearance_m").value))
+        high_xyz = low_xyz.copy(); high_xyz[2] = current.z
+        waypoints = [TcpPose(*v, target.rx, target.ry, target.rz) for v in (high_xyz, low_xyz, xyz)]
+        for pose in waypoints:
+            self.controller.inverse_kinematics(pose, user_index=user, tool_index=tool,
+                                              joint_near=self.controller.current_joint())
+        self._publish_status(
+            f"offset plan: low XYZ=({low_xyz[0]:.3f},{low_xyz[1]:.3f},{low_xyz[2]:.3f})m; "
+            f"offset={np.linalg.norm(low_xyz-xyz)*1000:.1f}mm")
+        speed = max(1, min(25, int(self.get_parameter("offset_grasp_speed_percent").value)))
+        for index, (stage, pose) in enumerate(zip(
+                ("offset_high", "offset_descent", "offset_insert"), waypoints)):
+            self._require_cycle_active(stage)
+            self._publish_status(stage)
+            with self._timed_stage(stage):
+                self.controller.move_linear_tcp(pose, speed=speed, accel=speed,
+                                                user_index=user, tool_index=tool)
+            self._require_cycle_active("after " + stage)
+            actual = self._current_command_pose()
+            if np.linalg.norm(np.array([actual.x-pose.x, actual.y-pose.y, actual.z-pose.z])) > 0.003:
+                raise RuntimeError("Offset waypoint position not reached: " + stage)
+            if index == 1:
+                self._publish_status("top-barcode low offset observation")
+                with self._timed_stage("top_barcode_low_observation"):
+                    self._wait_for_top_surface_barcode()
+
     def _execute_one_cycle(self, target: TcpPose, width_m: float, height_m: float, length_m: float) -> None:
         motion = self._motion_profile()
         z_offset_m = float(self.get_parameter("grasp_z_offset_m").value)
@@ -3180,19 +3237,22 @@ class CosmeticBoxSingleArmNode(Node):
                 pregrasp_reference_count,
                 hover_reached_at_s,
             )
-        self._publish_status("top-barcode hover observation")
-        with self._timed_stage("top_barcode_hover_observation"):
-            self._wait_for_top_surface_barcode()
-        self._publish_status("descending TCP tip to 75% box height")
-        self._require_cycle_active("immediately before grasp descent")
-        with self._timed_stage("grasp_descend"):
-            self.controller.move_linear_tcp(
-                target,
-                speed=motion["linear_speed"],
-                accel=motion["linear_acc"],
-                user_index=int(self.get_parameter("user_index").value),
-                tool_index=int(self.get_parameter("command_tool_index").value),
-            )
+        if bool(self.get_parameter("offset_grasp_enabled").value):
+            self._execute_offset_entry(target, length_m)
+        else:
+            self._publish_status("top-barcode hover observation")
+            with self._timed_stage("top_barcode_hover_observation"):
+                self._wait_for_top_surface_barcode()
+            self._publish_status("descending TCP tip to 75% box height")
+            self._require_cycle_active("immediately before grasp descent")
+            with self._timed_stage("grasp_descend"):
+                self.controller.move_linear_tcp(
+                    target,
+                    speed=motion["linear_speed"],
+                    accel=motion["linear_acc"],
+                    user_index=int(self.get_parameter("user_index").value),
+                    tool_index=int(self.get_parameter("command_tool_index").value),
+                )
         self._require_cycle_active("at grasp depth")
         # Keep the D405 top-surface ROI detector armed through the descent. At
         # the distant hover pose a portrait label can be only a few pixels wide;

@@ -32,6 +32,12 @@ def generate_launch_description() -> LaunchDescription:
                     "barcode to the nearest 90-degree face; set false for segmented search"
                 ),
             ),
+            DeclareLaunchArgument("offset_grasp_enabled", default_value="true",
+                                  description="Descend beside the box and insert after fresh sweep clearance"),
+            DeclareLaunchArgument("offset_grasp_speed_percent", default_value="10",
+                                  description="Offset path linear speed percent (capped at 25)"),
+            DeclareLaunchArgument("offset_grasp_clearance_m", default_value="0.020"),
+            DeclareLaunchArgument("offset_finger_span_m", default_value="0.060"),
             DeclareLaunchArgument(
                 "top_surface_barcode_enabled",
                 default_value="true",
@@ -191,6 +197,10 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration("barcode_continuous_rotation"),
                             value_type=bool,
                         ),
+                        "offset_grasp_enabled": ParameterValue(LaunchConfiguration("offset_grasp_enabled"), value_type=bool),
+                        "offset_grasp_speed_percent": ParameterValue(LaunchConfiguration("offset_grasp_speed_percent"), value_type=int),
+                        "offset_grasp_clearance_m": ParameterValue(LaunchConfiguration("offset_grasp_clearance_m"), value_type=float),
+                        "offset_finger_span_m": ParameterValue(LaunchConfiguration("offset_finger_span_m"), value_type=float),
                         "top_surface_barcode_enabled": ParameterValue(
                             LaunchConfiguration("top_surface_barcode_enabled"),
                             value_type=bool,

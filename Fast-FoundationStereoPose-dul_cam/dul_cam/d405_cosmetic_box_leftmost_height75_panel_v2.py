@@ -538,6 +538,10 @@ def cycle_status_callback(msg: String) -> None:
         top_barcode_capture_phase = "approach"
     elif "top-barcode hover observation" in status:
         top_barcode_capture_phase = "hover"
+    elif "top-barcode low offset observation" in status:
+        top_barcode_capture_phase = "low_observation"
+    elif status in ("offset_high", "offset_descent", "offset_insert"):
+        top_barcode_capture_phase = status
     elif "descending TCP tip" in status:
         top_barcode_capture_phase = "descent"
     with fault_snapshot_lock:
@@ -865,6 +869,7 @@ def publish_handoff_clearance(
             "largest_cluster_points": int(largest_cluster_points),
             "clear_streak": int(clear_streak),
             "required_clear_frames": int(HANDOFF_CLEARANCE_CLEAR_FRAMES),
+            "rgb_to_ir_rotation": (R_ir_to_color.T.tolist() if "R_ir_to_color" in globals() else None),
             "negative_side_points": int(negative_side_points),
             "positive_side_points": int(positive_side_points),
             "negative_side_cluster": int(negative_side_cluster),
