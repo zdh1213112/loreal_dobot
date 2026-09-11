@@ -332,7 +332,6 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("offset_grasp_enabled", True)
         self.declare_parameter("offset_grasp_clearance_m", 0.020)
         self.declare_parameter("offset_finger_span_m", 0.060)
-        self.declare_parameter("offset_grasp_speed_percent", 10)
         self.declare_parameter("grasp_lift_m", 0.060)
         # Current real-cell trials show an approximately 10 mm vertical bias
         # between the transformed vision pose and the physical gripper tip.
@@ -434,7 +433,11 @@ class CosmeticBoxSingleArmNode(Node):
 
         self.declare_parameter("barcode_topic", "/detected_barcodes")
         self.declare_parameter("top_surface_barcode_enabled", True)
-        self.declare_parameter("top_surface_barcode_wait_s", 0.50)
+        # Detection remains armed throughout offset-high, descent and insert.
+        # Keep only a short dedicated low-pose observation hold between the
+        # descent and insert so top-barcode scanning is retained without a
+        # fixed half-second stop on every side-barcode cycle.
+        self.declare_parameter("top_surface_barcode_wait_s", 0.30)
         self.declare_parameter("top_surface_barcode_topic", "/trigger_top_surface_barcode")
         self.declare_parameter(
             "top_surface_barcode_result_topic", "/top_surface_barcode_result"
@@ -444,6 +447,9 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("barcode_stable_hits", 1)
         self.declare_parameter("barcode_hit_gap_s", 0.7)
         self.declare_parameter("barcode_face_wait_s", 0.05)  # 每个标准面最多等待 0.05 秒
+        # HID 条码常在 transfer_joint 到位后的几十毫秒内才进入 ROS 回调。
+        # 先短暂保留当前姿态，可避免刚启动 X+ 靠近就因扫码成功而 Stop。
+        self.declare_parameter("scanner_transfer_barcode_grace_s", 0.06)
         self.declare_parameter("barcode_max_face_rotations", 4)
         # Each next-face search may rotate wrist J6 by as much as -90 degrees,
         # with a joint-limit guard. Live monitoring below stops it earlier when
@@ -3188,11 +3194,13 @@ class CosmeticBoxSingleArmNode(Node):
         for pose in waypoints:
             self.controller.inverse_kinematics(pose, user_index=user, tool_index=tool,
                                               joint_near=self.controller.current_joint())
+        motion = self._motion_profile()
         self._publish_status(
             f"offset plan: low XYZ=({low_xyz[0]:.3f},{low_xyz[1]:.3f},{low_xyz[2]:.3f})m; "
-            f"offset={np.linalg.norm(low_xyz-xyz)*1000:.1f}mm")
-        speed = max(1, min(25, int(self.get_parameter("offset_grasp_speed_percent").value)))
-        motion = self._motion_profile()
+            f"offset={np.linalg.norm(low_xyz-xyz)*1000:.1f}mm; "
+            f"descent/insert speed={motion['linear_speed']}%, "
+            f"accel={motion['linear_acc']}%"
+        )
         for index, (stage, pose) in enumerate(zip(
                 ("offset_high", "offset_descent", "offset_insert"), waypoints)):
             self._require_cycle_active(stage)
@@ -3212,8 +3220,8 @@ class CosmeticBoxSingleArmNode(Node):
                 else:
                     self.controller.move_linear_tcp(
                         pose,
-                        speed=speed,
-                        accel=speed,
+                        speed=motion["linear_speed"],
+                        accel=motion["linear_acc"],
                         user_index=user,
                         tool_index=tool,
                     )
@@ -3463,7 +3471,8 @@ class CosmeticBoxSingleArmNode(Node):
         # 到达中转点后先检查“运动途中”捕获的码。已经扫到时无需再靠近
         # 扫码器，也无需转 J6；保留 scanner_approach_m=0，让后面的安全
         # 退让只执行额外 X- 余量。
-        early_barcode = self._current_stable_barcode()
+        with self._timed_stage("transfer_barcode_grace"):
+            early_barcode = self._barcode_after_transfer_grace()
         if early_barcode:
             scanner_approach_m = 0.0
             self._publish_status(
@@ -4421,6 +4430,34 @@ class CosmeticBoxSingleArmNode(Node):
             if self.barcode_window_active and self.barcode_hits >= required_hits:
                 return self.barcode_value
         return ""
+
+    def _barcode_after_transfer_grace(self) -> str:
+        """Catch a decode that arrives just after the transfer motion completes."""
+        value = self._current_stable_barcode()
+        if value:
+            return value
+
+        grace_s = max(
+            0.0,
+            float(self.get_parameter("scanner_transfer_barcode_grace_s").value),
+        )
+        if grace_s <= 0.0:
+            return ""
+
+        required_hits = max(1, int(self.get_parameter("barcode_stable_hits").value))
+        self._publish_status(
+            f"waiting up to {grace_s * 1000.0:.0f}ms at transfer joint for barcode callback"
+        )
+        value = self._wait_for_current_barcode(
+            required_hits,
+            grace_s,
+            "waiting for transfer-joint barcode callback",
+        )
+        if value:
+            self._publish_status(
+                f"barcode acquired during transfer grace window: {value}"
+            )
+        return value
 
     def _is_barcode_flip_joint_safe(self, joints_deg: Optional[list[float]], delta_deg: float) -> bool:
         if joints_deg is None or len(joints_deg) != 6:
@@ -5414,6 +5451,13 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.barcode_hits = QSpinBox(); self.barcode_hits.setRange(1, 20); self.barcode_hits.setValue(int(self.node.get_parameter("barcode_stable_hits").value))
         self.barcode_rotations = QSpinBox(); self.barcode_rotations.setRange(4, 4); self.barcode_rotations.setValue(4)
         self.barcode_wait = self._new_double(float(self.node.get_parameter("barcode_face_wait_s").value), 0.02, 10.0, 2, 0.01)
+        self.scanner_transfer_barcode_grace = self._new_double(
+            float(self.node.get_parameter("scanner_transfer_barcode_grace_s").value),
+            0.0,
+            0.5,
+            2,
+            0.01,
+        )
         self.top_surface_barcode_wait = self._new_double(
             float(self.node.get_parameter("top_surface_barcode_wait_s").value),
             0.0,
@@ -5478,6 +5522,7 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("连续找码模式", self.barcode_continuous_rotation)
         form.addRow("检查面数（分段模式固定）", self.barcode_rotations)
         form.addRow("每面等待秒", self.barcode_wait)
+        form.addRow("中转位扫码回调宽限秒", self.scanner_transfer_barcode_grace)
         form.addRow("顶面条码悬停检测等待秒", self.top_surface_barcode_wait)
         form.addRow("中转 TCP 到扫码器距离 mm", self.scanner_center_distance)
         form.addRow("盒侧面扫码间隙 mm", self.scanner_face_clearance)
@@ -5613,6 +5658,10 @@ class CosmeticBoxControlWindow(QMainWindow):
             ),
             Parameter("barcode_max_face_rotations", value=self.barcode_rotations.value()),
             Parameter("barcode_face_wait_s", value=self.barcode_wait.value()),
+            Parameter(
+                "scanner_transfer_barcode_grace_s",
+                value=self.scanner_transfer_barcode_grace.value(),
+            ),
             Parameter(
                 "top_surface_barcode_wait_s", value=self.top_surface_barcode_wait.value()
             ),

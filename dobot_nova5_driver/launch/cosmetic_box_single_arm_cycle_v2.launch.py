@@ -32,10 +32,16 @@ def generate_launch_description() -> LaunchDescription:
                     "barcode to the nearest 90-degree face; set false for segmented search"
                 ),
             ),
+            DeclareLaunchArgument(
+                "scanner_transfer_barcode_grace_s",
+                default_value="0.06",
+                description=(
+                    "Wait briefly at transfer_joint for a late HID callback before "
+                    "starting the monitored scanner approach"
+                ),
+            ),
             DeclareLaunchArgument("offset_grasp_enabled", default_value="true",
                                   description="Reach offset-high while aligning grasp attitude, then descend and insert"),
-            DeclareLaunchArgument("offset_grasp_speed_percent", default_value="10",
-                                  description="Offset path linear speed percent (capped at 25)"),
             DeclareLaunchArgument("offset_grasp_clearance_m", default_value="0.020"),
             DeclareLaunchArgument("offset_finger_span_m", default_value="0.060"),
             DeclareLaunchArgument(
@@ -53,7 +59,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "top_surface_barcode_wait_s",
-                default_value="0.50",
+                default_value="0.30",
                 description="Maximum hover time to wait for top-surface barcode confirmation",
             ),
             DeclareLaunchArgument(
@@ -226,8 +232,11 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration("barcode_continuous_rotation"),
                             value_type=bool,
                         ),
+                        "scanner_transfer_barcode_grace_s": ParameterValue(
+                            LaunchConfiguration("scanner_transfer_barcode_grace_s"),
+                            value_type=float,
+                        ),
                         "offset_grasp_enabled": ParameterValue(LaunchConfiguration("offset_grasp_enabled"), value_type=bool),
-                        "offset_grasp_speed_percent": ParameterValue(LaunchConfiguration("offset_grasp_speed_percent"), value_type=int),
                         "offset_grasp_clearance_m": ParameterValue(LaunchConfiguration("offset_grasp_clearance_m"), value_type=float),
                         "offset_finger_span_m": ParameterValue(LaunchConfiguration("offset_finger_span_m"), value_type=float),
                         "top_surface_barcode_enabled": ParameterValue(

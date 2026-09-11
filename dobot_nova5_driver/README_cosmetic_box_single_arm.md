@@ -86,6 +86,7 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `motion_speed_scale_percent=400`：抓取上方和抓取下降等兼容动作的统一提速比例。`100` 表示修改前多层速度比例相乘后的理论有效速度基线；当前默认使用 GUI 上限 400%。按当前兼容基准，抓取上方钳位到 100%，抓取下降约为 94%；后半段独立阶段参数直接表示单条指令有效百分比，不再被 `joint_speed` 二次压低。
 - `joint_speed=65`、`joint_acc=55`：保留原界面的兼容基准值。程序会在软件中把旧版 `SpeedFactor × VelJ/AccJ × 指令 v/a` 合成为单条指令百分比，控制器的全局回放比例固定为 100，避免重复相乘。
 - `linear_speed=60`、`linear_acc=50`：抓取下降的兼容基准值，同样只合成为一组单条 `MovL v/a`。
+- 偏置抓取的 `offset_descent` 和 `offset_insert` 使用同一组归一化 `linear_speed/linear_acc`，不再受独立的 10% 速度和 25% 上限限制。
 - 后半段阶段默认单条指令有效值为：抓取后抬升 90%、中转位 100%、扫码后组合 PTP 100%、放置 100%、回初始位 100%、扫码靠近/退让 100%、J6 MoveJog 100%（已达到控制器 Jog 比例上限）。抓取抬升仍保持 90%/85% 的速度/加速度，避免改变已验证的抓取动作。
 - `grasp_lift_speed_factor`、`transfer_speed_factor`、`place_speed_factor`、`return_startup_speed_factor` 分别控制抓取后抬升、中转、放置和回初始位；`jog_speed_factor` 控制扫码后的 XYZ+Ry/Rz 组合 PTP；对应的 `*_acc_factor` 控制阶段加速度。
 - `scan_exit_user_xyz=[0.557,0.200,0.320]`：扫码后组合 PTP 的 User XYZ 目标，单位为米。
@@ -120,6 +121,7 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `vision_retry_delay_s=0.1`：连续模式一次检测明确失败后，到发起下一次检测之间的等待时间。
 - `place_release_clearance_m=0.015`：放置点位保持不变；夹爪到达放置点后，从实际夹持宽度额外张开 15 mm 并确认到位，不再等待完全张到 95 mm。
 - `barcode_face_wait_s=0.05`：每个 J6 标准面等待扫码的最长时间。
+- `scanner_transfer_barcode_grace_s=0.06`：到达扫码中转位后给 HID 回调保留 60 ms；在窗口内读到条码时直接跳过 User X+ 靠近及其 Stop 等待。
 - `grasp_close_settle_s=0.05`：夹爪闭合命令完成后、第一次反馈确认前的原位稳定时间；仍保留两次夹持反馈确认。
 - `grasp_min_closure_from_preshape_m=0.005`：即使 DH 返回 `state=2`，相对预张开至少闭合 5 mm 才允许抬升；闭合量不足表示手指可能顶在盒顶/边缘，程序会先开爪、垂直退出并重新检测。
 - `barcode_max_face_rotations=4`：界面固定检查四个面（当前面加三次 J6 旋转）；仍未扫码时记录告警，并继续安全退让、姿态运动和放置，不在中转点停机。

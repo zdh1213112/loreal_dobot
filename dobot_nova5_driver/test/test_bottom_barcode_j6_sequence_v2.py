@@ -35,6 +35,7 @@ def load_method(name):
 
 RETURN_ONE_FACE = load_method("_return_j6_before_bottom_recovery")
 REVERSE_REMAINDER = load_method("_reverse_barcode_search_j6")
+TRANSFER_BARCODE_GRACE = load_method("_barcode_after_transfer_grace")
 
 
 @dataclass
@@ -209,3 +210,33 @@ def test_side_barcode_path_combines_safe_fixed_place_and_rx_tilt():
     assert '"placement_vertical_descent"' not in section
     assert "rx_delta_deg=side_rx_delta_deg" in section
     assert "linear_tcp=True" not in section
+
+
+def test_transfer_barcode_grace_catches_late_hid_callback_before_approach():
+    waited = []
+    statuses = []
+    parameters = {
+        "scanner_transfer_barcode_grace_s": 0.06,
+        "barcode_stable_hits": 1,
+    }
+    node = SimpleNamespace(
+        get_parameter=lambda name: SimpleNamespace(value=parameters[name]),
+        _current_stable_barcode=lambda: "",
+        _publish_status=statuses.append,
+        _wait_for_current_barcode=lambda hits, timeout, stage: (
+            waited.append((hits, timeout, stage)) or "6941594520755"
+        ),
+    )
+
+    assert TRANSFER_BARCODE_GRACE(node) == "6941594520755"
+    assert waited == [(1, 0.06, "waiting for transfer-joint barcode callback")]
+    assert any("transfer grace window" in status for status in statuses)
+
+
+def test_transfer_barcode_grace_does_not_wait_when_barcode_is_already_stable():
+    node = SimpleNamespace(
+        _current_stable_barcode=lambda: "already-read",
+        _wait_for_current_barcode=lambda *_args: pytest.fail("unexpected wait"),
+    )
+
+    assert TRANSFER_BARCODE_GRACE(node) == "already-read"

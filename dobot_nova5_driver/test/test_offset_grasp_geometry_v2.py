@@ -67,7 +67,7 @@ def make_motion_node(cancel_after_low=False):
     moves=[]; events=[]
     params = dict(user_index=0, command_tool_index=1, flange_tool_index=0,
                   offset_finger_span_m=.06, offset_grasp_clearance_m=.02,
-                  offset_grasp_speed_percent=10, grasp_z_offset_m=.010)
+                  grasp_z_offset_m=.010)
     def move(p, **kw):
         nonlocal pose
         pose=p; moves.append(p)
@@ -81,7 +81,8 @@ def make_motion_node(cancel_after_low=False):
         handeye_flange_to_cam=transform(Pose(0,0,0,0,0,90)),
         data_lock=threading.Lock(), rgb_to_ir_rotation=np.eye(3),
         _require_cycle_active=active,_publish_status=events.append,
-        _motion_profile=lambda:{'joint_speed':100,'joint_pose_acc':100},
+        _motion_profile=lambda:{'joint_speed':100,'joint_pose_acc':100,
+                                'linear_speed':100,'linear_acc':100},
         _timed_stage=lambda s:nullcontext(),_wait_for_top_surface_barcode=lambda:events.append('wait'),
         controller=SimpleNamespace(current_tcp_pose=lambda **kw:Pose(0,0,0,0,0,0),
                                    inverse_kinematics=lambda *a,**kw:None,current_joint=lambda:[0]*6,
@@ -121,6 +122,27 @@ def test_offset_high_callback_runs_before_descent():
 
     assert ('validated', 1) in events
     assert events.index(('validated', 1)) < events.index('offset_descent')
+
+
+def test_offset_descent_and_insert_use_normalized_linear_speed():
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).parents[1] / 'dobot_nova5_driver/nova5_cosmetic_box_single_arm_cycle_v2.py'
+    module = ast.parse(source.read_text())
+    node_class = next(
+        node for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == 'CosmeticBoxSingleArmNode'
+    )
+    method = next(
+        node for node in node_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == '_execute_offset_entry'
+    )
+    section = ast.get_source_segment(source.read_text(), method)
+
+    assert 'speed=motion["linear_speed"]' in section
+    assert 'accel=motion["linear_acc"]' in section
+    assert 'offset_grasp_speed_percent' not in section
 
 
 def test_enabled_offset_branch_combines_orientation_with_offset_high():
