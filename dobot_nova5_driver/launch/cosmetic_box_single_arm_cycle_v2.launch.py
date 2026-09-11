@@ -70,9 +70,38 @@ def generate_launch_description() -> LaunchDescription:
                 description="User-Ry target for the bottom-barcode table flip",
             ),
             DeclareLaunchArgument(
+                "bottom_flip_j6_pre_return_deg",
+                default_value="90.0",
+                description="J6 positive return after an unsuccessful -270deg face sweep",
+            ),
+            DeclareLaunchArgument(
                 "bottom_flip_table_retract_m",
                 default_value="0.050",
                 description="Extra User-X- clearance before placing the box on the table (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_table_z_offset_m",
+                default_value="0.010",
+                description="Clearance retained when reversing the first grasp lift (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_lift_m",
+                default_value="0.160",
+                description="Vertical lift after bottom-face table regrasp (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_barcode_place_ry_delta_deg",
+                default_value="-45.0",
+                description=(
+                    "Additional User-Ry rotation at fixed bottom-barcode place pose"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "side_barcode_place_rx_delta_deg",
+                default_value="-20.0",
+                description=(
+                    "User-Rx tilt for side-barcode fixed placement"
+                ),
             ),
             DeclareLaunchArgument(
                 "handoff_clearance_enabled",
@@ -217,8 +246,28 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration("bottom_flip_user_ry_target_deg"),
                             value_type=float,
                         ),
+                        "bottom_flip_j6_pre_return_deg": ParameterValue(
+                            LaunchConfiguration("bottom_flip_j6_pre_return_deg"),
+                            value_type=float,
+                        ),
                         "bottom_flip_table_retract_m": ParameterValue(
                             LaunchConfiguration("bottom_flip_table_retract_m"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_table_z_offset_m": ParameterValue(
+                            LaunchConfiguration("bottom_flip_table_z_offset_m"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_lift_m": ParameterValue(
+                            LaunchConfiguration("bottom_flip_lift_m"),
+                            value_type=float,
+                        ),
+                        "bottom_barcode_place_ry_delta_deg": ParameterValue(
+                            LaunchConfiguration("bottom_barcode_place_ry_delta_deg"),
+                            value_type=float,
+                        ),
+                        "side_barcode_place_rx_delta_deg": ParameterValue(
+                            LaunchConfiguration("side_barcode_place_rx_delta_deg"),
                             value_type=float,
                         ),
                         "grasp_lift_speed_factor": ParameterValue(
