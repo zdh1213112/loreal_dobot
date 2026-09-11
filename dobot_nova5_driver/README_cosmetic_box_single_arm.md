@@ -91,7 +91,7 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `scan_exit_user_xyz=[0.557,0.200,0.320]`：扫码后组合 PTP 的 User XYZ 目标，单位为米。
 - `face_up_user_ry_deg=-90`、`post_scan_user_rz_deg=50`：组合目标相对扫码姿态的固定 User 轴旋转；先 Ry，后 Rz。
 - `side_barcode_place_xyz=[0.531,0.328,0.180]`：四周侧面条码分支使用的独立固定放置位，单位为米；不改动顶面条码和底面恢复分支的 `Z=215 mm`。
-- `side_barcode_place_rx_delta_deg=-20`：四周侧面条码分支到达固定放置位后执行的 User Rx 负向倾斜角；避免下降到动态低位时 J4/J5 接近桌面。
+- `side_barcode_place_rx_delta_deg=-20`：四周侧面条码分支移动到固定放置 XYZ 时，在同一条 PTP 中完成的 User Rx 负向倾斜角；避免下降到动态低位时 J4/J5 接近桌面。
 - `bottom_barcode_place_ry_delta_deg=-45`：底面恢复分支到固定放置位时，在桌面翻转得到的 User Ry 基础上再绕 User Y 负向旋转 45°；配合 `post_scan_user_rz_deg=50`，最终累计 User Ry 通常约为 -90°。
 - `jog_speed_factor=100`：扫码后 XYZ+Ry+Rz 单条组合 PTP 的有效速度百分比。
 - `scanner_approach_speed_factor=100`、`scanner_approach_acc_factor=100`：中转点后沿 User X+ 靠近扫码器的有效速度和加速度百分比。当前采用有界 `RelMovJUser`；没有扫码时精确到达目标距离，扫码消息到达时主动停止当前运动并立即跳过 J6。
@@ -126,7 +126,7 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `grasp_z_offset_m=0.010`：根据当前实机日志默认将视觉抓取 Z 上移 10 mm，用于补偿手眼高度偏差；界面中正值表示抓得更浅。
 - `minimum_safe_tcp_z_m=0.010`：抓取命令不会低于 10 mm；低于该值时自动钳位并打印警告。
 
-界面中可以修改统一提速比例、抓取后抬升/中转/扫码后组合/放置/回初始位的阶段速度和加速度、初始关节、中转关节、扫码后用户 XYZ、组合 User Ry/Rz 增量、最终放置位姿、抓取下降速度、扫码器靠近速度、J6 找码速度、夹爪力、抓取 Z 修正、TCP 最低安全 Z、抬升高度及扫码稳定参数。接受视觉目标后，夹爪预张开会与机械臂移动到目标上方并行，到达上方后仍会确认夹爪已停止才允许下降。下降到位后，程序会在原位等待夹爪完成闭合并检查 `state=2`，确认夹持后才允许抬升；抬升后会再次检查是否掉落。建议先“只采样视觉”，确认结果后再执行完整一轮。
+界面中可以修改统一提速比例、抓取后抬升/中转/扫码后组合/放置/回初始位的阶段速度和加速度、初始关节、中转关节、扫码后用户 XYZ、组合 User Ry/Rz 增量、最终放置位姿、抓取下降速度、扫码器靠近速度、J6 找码速度、夹爪力、抓取 Z 修正、TCP 最低安全 Z、抬升高度及扫码稳定参数。接受视觉目标后，启用偏置抓取时，顶面条码检测窗口先开启；程序根据目标抓取姿态预先推算调姿后的相机方向，并用一条 PTP 同时完成抓取姿态调整和到达 `offset_high`，不经过物料中心上方。夹爪预张开与这段运动并行，并在 `offset_high` 确认停止和复检目标后执行 `offset_descent`、低位顶面观察及 `offset_insert`。关闭偏置抓取时仍使用中心上方悬停和垂直下降路径。下降到位后，程序会在原位等待夹爪完成闭合并检查 `state=2`，确认夹持后才允许抬升；抬升后会再次检查是否掉落。建议先“只采样视觉”，确认结果后再执行完整一轮。
 
 观察状态：
 

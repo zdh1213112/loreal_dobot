@@ -51,7 +51,7 @@ except ImportError:
         QSpinBox, QVBoxLayout, QWidget,
     )
 
-from .offset_grasp_geometry_v2 import plan_offset
+from .offset_grasp_geometry_v2 import camera_rotation_at_target_tcp, plan_offset
 
 from .controller_v2 import DobotNova5Controller, TcpPose
 from .dobot_dh_api_v2 import (
@@ -503,8 +503,8 @@ class CosmeticBoxSingleArmNode(Node):
         # 再叠加 User Rz +50°；两种旋转与 XYZ 在同一条 PTP 中同时完成。
         self.declare_parameter("face_up_user_ry_deg", -90.0)
         self.declare_parameter("post_scan_user_rz_deg", 50.0)
-        # 侧面条码分支不再下降到按长度计算的低 Z；先移动到固定放置位，
-        # 再在该位置绕 User X 轴负向倾斜，避开动态低位的 J4/J5 风险。
+        # 侧面条码分支不再下降到按长度计算的低 Z；固定放置 XYZ 和
+        # User-X 轴负向倾斜由同一条 PTP 完成。
         self.declare_parameter("side_barcode_place_rx_delta_deg", -20.0)
         self.declare_parameter("face_up_jog_tolerance_deg", 2.0)
         self.declare_parameter("face_up_jog_timeout_s", 60.0)
@@ -2953,6 +2953,7 @@ class CosmeticBoxSingleArmNode(Node):
         minimum_safe_z: float,
         previous_count: int,
         hover_reached_at_s: float,
+        allow_hover_correction: bool = True,
     ) -> TcpPose:
         """Use synchronized, consensus-filtered tracking before descent."""
 
@@ -3095,6 +3096,17 @@ class CosmeticBoxSingleArmNode(Node):
             selected_target = self._keep_reference_orientation(selected_target, target)
             position_delta, _ = self._pose_delta(target, selected_target)
 
+        if not allow_hover_correction:
+            # In offset-grasp mode the safe hover is beside the box.  Keep the
+            # accepted target after validating identity and correction bounds;
+            # moving to a corrected centre hover here would reintroduce the
+            # redundant centre waypoint that the offset path is meant to skip.
+            self._publish_status(
+                "pregrasp target validated at offset-high; keeping the accepted "
+                "target for direct offset descent"
+            )
+            return target
+
         self._publish_status(
             f"pregrasp target corrected by {position_delta*1000:.1f}mm; "
             f"source={estimate['position_mode']}, "
@@ -3144,7 +3156,12 @@ class CosmeticBoxSingleArmNode(Node):
         )
         return corrected_target
 
-    def _execute_offset_entry(self, target: TcpPose, length_m: float) -> None:
+    def _execute_offset_entry(
+        self,
+        target: TcpPose,
+        length_m: float,
+        after_offset_high=None,
+    ) -> None:
         """Move image-down, descend beside the box, then insert to its centre."""
         user = int(self.get_parameter("user_index").value)
         tool = int(self.get_parameter("command_tool_index").value)
@@ -3152,6 +3169,11 @@ class CosmeticBoxSingleArmNode(Node):
         flange = self.controller.current_tcp_pose(
             user_index=user, tool_index=int(self.get_parameter("flange_tool_index").value))
         user_camera = pose_to_transform(flange) @ self.handeye_flange_to_cam
+        planned_camera_rotation = camera_rotation_at_target_tcp(
+            pose_to_transform(current)[:3, :3],
+            user_camera[:3, :3],
+            pose_to_transform(target)[:3, :3],
+        )
         span = float(self.get_parameter("offset_finger_span_m").value)
         xyz = np.array([target.x, target.y, target.z])
         with self.data_lock:
@@ -3159,7 +3181,7 @@ class CosmeticBoxSingleArmNode(Node):
         if rgb_rotation is None:
             raise RuntimeError("D405 RGB-to-IR calibration missing for image-down approach")
         low_xyz = plan_offset(
-            xyz, user_camera[:3, :3] @ rgb_rotation, length_m, span,
+            xyz, planned_camera_rotation @ rgb_rotation, length_m, span,
             float(self.get_parameter("offset_grasp_clearance_m").value))
         high_xyz = low_xyz.copy(); high_xyz[2] = current.z
         waypoints = [TcpPose(*v, target.rx, target.ry, target.rz) for v in (high_xyz, low_xyz, xyz)]
@@ -3170,17 +3192,37 @@ class CosmeticBoxSingleArmNode(Node):
             f"offset plan: low XYZ=({low_xyz[0]:.3f},{low_xyz[1]:.3f},{low_xyz[2]:.3f})m; "
             f"offset={np.linalg.norm(low_xyz-xyz)*1000:.1f}mm")
         speed = max(1, min(25, int(self.get_parameter("offset_grasp_speed_percent").value)))
+        motion = self._motion_profile()
         for index, (stage, pose) in enumerate(zip(
                 ("offset_high", "offset_descent", "offset_insert"), waypoints)):
             self._require_cycle_active(stage)
             self._publish_status(stage)
             with self._timed_stage(stage):
-                self.controller.move_linear_tcp(pose, speed=speed, accel=speed,
-                                                user_index=user, tool_index=tool)
+                if index == 0:
+                    # The high waypoint is clear of the table.  One joint PTP
+                    # can set the grasp attitude and reach the offset position
+                    # together, avoiding the orientation-only stop.
+                    self.controller.move_joint_tcp(
+                        pose,
+                        speed=motion["joint_speed"],
+                        accel=motion["joint_pose_acc"],
+                        user_index=user,
+                        tool_index=tool,
+                    )
+                else:
+                    self.controller.move_linear_tcp(
+                        pose,
+                        speed=speed,
+                        accel=speed,
+                        user_index=user,
+                        tool_index=tool,
+                    )
             self._require_cycle_active("after " + stage)
             actual = self._current_command_pose()
             if np.linalg.norm(np.array([actual.x-pose.x, actual.y-pose.y, actual.z-pose.z])) > 0.003:
                 raise RuntimeError("Offset waypoint position not reached: " + stage)
+            if index == 0 and after_offset_high is not None:
+                after_offset_high()
             if index == 1:
                 self._publish_status("top-barcode low offset observation")
                 with self._timed_stage("top_barcode_low_observation"):
@@ -3188,6 +3230,7 @@ class CosmeticBoxSingleArmNode(Node):
 
     def _execute_one_cycle(self, target: TcpPose, width_m: float, height_m: float, length_m: float) -> None:
         motion = self._motion_profile()
+        offset_grasp_enabled = bool(self.get_parameter("offset_grasp_enabled").value)
         z_offset_m = float(self.get_parameter("grasp_z_offset_m").value)
         z_offset_limit_m = abs(float(self.get_parameter("grasp_z_offset_limit_m").value))
         if abs(z_offset_m) > z_offset_limit_m:
@@ -3208,13 +3251,20 @@ class CosmeticBoxSingleArmNode(Node):
             f"box_height={height_m*1000:.1f}mm"
         )
         with self._timed_stage("grasp_prepare"):
-            self._publish_status("commanding measured gripper width; pre-shaping during move-above")
+            if offset_grasp_enabled:
+                self._publish_status(
+                    "commanding measured gripper width; pre-shaping during direct offset approach"
+                )
+            else:
+                self._publish_status(
+                    "commanding measured gripper width; pre-shaping during move-above"
+                )
             max_opening = float(self.get_parameter("dh_max_opening_m").value)
             width_m = max(0.0, min(max_opening, width_m))
             pre_shape_position = width_m / max_opening
             pre_shape_initial = self.gripper.read_position()
-            # 夹爪预张开和机械臂前往目标上方互不冲突。先下发非阻塞命令，
-            # 到达目标上方后再确认夹爪已经停止，从串行流程中隐藏约 0.6 秒。
+            # 夹爪预张开和机械臂接近目标互不冲突。先下发非阻塞命令，
+            # 到达中心上方或偏置上方后再确认夹爪已经停止。
             self.gripper.set_position(pre_shape_position, wait=False)
             self._require_cycle_active("after commanding gripper pre-shape")
 
@@ -3224,56 +3274,83 @@ class CosmeticBoxSingleArmNode(Node):
                 tool_index=int(self.get_parameter("command_tool_index").value),
                 joint_near=self.controller.current_joint(),
             )
-            current = self._current_command_pose()
-            planar = TcpPose(target.x, target.y, current.z, target.rx, target.ry, target.rz)
+            planar = None
+            if not offset_grasp_enabled:
+                current = self._current_command_pose()
+                planar = TcpPose(
+                    target.x, target.y, current.z, target.rx, target.ry, target.rz
+                )
         # The point-cloud handoff check is not enough when 102's TCP is not
         # visible in the D405 cloud.  Check the actual 102 feedback immediately
         # before issuing 101's approach command.  A blocked check leaves 101
         # at startup; once 102 retreats past the threshold, this same cycle
         # continues without manual intervention.
         with self._timed_stage("secondary_y_clearance"):
-            self._wait_for_secondary_y_clearance("move-above")
-        self._require_cycle_active("immediately before move-above")
+            self._wait_for_secondary_y_clearance(
+                "offset-high" if offset_grasp_enabled else "move-above"
+            )
+        self._require_cycle_active(
+            "immediately before offset-high"
+            if offset_grasp_enabled
+            else "immediately before move-above"
+        )
         # The D405 node reuses its existing RGB stream and restricts decoding
         # to the current YOLO-selected/SAM-tracked target box.  Arm this window
         # before the move so frames captured during the approach are eligible.
         self._set_top_surface_barcode_window(True)
-        self._publish_status("moving above selected box")
         with self.data_lock:
             pregrasp_reference_count = self.pregrasp_pose_count
-        with self._timed_stage("move_above"):
-            self.controller.move_joint_tcp(
-                planar,
-                speed=motion["joint_speed"],
-                accel=motion["joint_pose_acc"],
-                user_index=int(self.get_parameter("user_index").value),
-                tool_index=int(self.get_parameter("command_tool_index").value),
+
+        def confirm_preshape_and_revalidate(allow_hover_correction: bool) -> TcpPose:
+            # Keep the same host-wall-clock domain as the D405 frame stamps.
+            # The offset-high waypoint replaces the old centre hover when the
+            # offset path is enabled, so its arrival time anchors revalidation.
+            hover_reached_at_s = time.time()
+            with self._timed_stage("gripper_preshape_wait"):
+                self.gripper.wait_until_stopped(
+                    timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                    target_position=pre_shape_position,
+                    initial_position=pre_shape_initial,
+                    cancel_check=self._cycle_cancel_requested,
+                )
+            self._require_cycle_active("after confirming gripper pre-shape")
+            with self._timed_stage("pregrasp_revalidation"):
+                return self._revalidate_target_at_hover(
+                    target,
+                    motion,
+                    z_offset_m,
+                    minimum_safe_z,
+                    pregrasp_reference_count,
+                    hover_reached_at_s,
+                    allow_hover_correction=allow_hover_correction,
+                )
+
+        if offset_grasp_enabled:
+            self._publish_status(
+                "moving to offset-high while aligning grasp orientation; "
+                "center translation remains skipped"
             )
-        self._require_cycle_active("after move-above")
-        # Keep the same host-wall-clock domain as the D405 frame stamps.  The
-        # revalidation stage does not sleep for a settle period; it simply
-        # prefers any already-arrived frames captured after this instant.
-        hover_reached_at_s = time.time()
-        with self._timed_stage("gripper_preshape_wait"):
-            self.gripper.wait_until_stopped(
-                timeout_s=float(self.get_parameter("dh_timeout_s").value),
-                target_position=pre_shape_position,
-                initial_position=pre_shape_initial,
-                cancel_check=self._cycle_cancel_requested,
-            )
-        self._require_cycle_active("after confirming gripper pre-shape")
-        with self._timed_stage("pregrasp_revalidation"):
-            target = self._revalidate_target_at_hover(
+
+            def validate_at_offset_high() -> None:
+                confirm_preshape_and_revalidate(allow_hover_correction=False)
+
+            self._execute_offset_entry(
                 target,
-                motion,
-                z_offset_m,
-                minimum_safe_z,
-                pregrasp_reference_count,
-                hover_reached_at_s,
+                length_m,
+                after_offset_high=validate_at_offset_high,
             )
-        if bool(self.get_parameter("offset_grasp_enabled").value):
-            self._execute_offset_entry(target, length_m)
         else:
+            self._publish_status("moving above selected box")
+            with self._timed_stage("move_above"):
+                self.controller.move_joint_tcp(
+                    planar,
+                    speed=motion["joint_speed"],
+                    accel=motion["joint_pose_acc"],
+                    user_index=int(self.get_parameter("user_index").value),
+                    tool_index=int(self.get_parameter("command_tool_index").value),
+                )
+            self._require_cycle_active("after move-above")
+            target = confirm_preshape_and_revalidate(allow_hover_correction=True)
             self._publish_status("top-barcode hover observation")
             with self._timed_stage("top_barcode_hover_observation"):
                 self._wait_for_top_surface_barcode()
@@ -3439,8 +3516,8 @@ class CosmeticBoxSingleArmNode(Node):
 
         # First move above the placement area at the previous safe height while
         # applying the barcode-up orientation.  The side-barcode branch then
-        # moves to the known fixed place Z and tilts there; it does not descend
-        # to the length-based low Z, which can put J4/J5 into the table.
+        # combines its fixed XYZ and final User-Rx tilt in one PTP; it does not
+        # descend to the length-based low Z, which can put J4/J5 into the table.
         approach_xyz = [
             float(value)
             for value in self.get_parameter("scan_exit_user_xyz").value
@@ -3453,25 +3530,19 @@ class CosmeticBoxSingleArmNode(Node):
             )
         self._require_cycle_active("at safe height above placement area")
         fixed_place_xyz = self._side_barcode_place_xyz()
+        side_rx_delta_deg = float(
+            self.get_parameter("side_barcode_place_rx_delta_deg").value
+        )
         with self._timed_stage("side_barcode_fixed_place_ptp"):
             self._move_to_user_xyz_with_rotation(
                 fixed_place_xyz,
                 ry_delta_deg=0.0,
                 rz_delta_deg=0.0,
-            )
-        self._require_cycle_active("at side-barcode fixed placement pose")
-        side_rx_delta_deg = float(
-            self.get_parameter("side_barcode_place_rx_delta_deg").value
-        )
-        with self._timed_stage("side_barcode_rx_tilt"):
-            self._move_to_user_xyz_with_rotation(
-                fixed_place_xyz,
-                ry_delta_deg=0.0,
-                rz_delta_deg=0.0,
                 rx_delta_deg=side_rx_delta_deg,
-                linear_tcp=True,
             )
-        self._require_cycle_active("after side-barcode User Rx tilt")
+        self._require_cycle_active(
+            "at side-barcode fixed placement pose with User Rx tilt"
+        )
         with self._timed_stage("placement_grasp_check"):
             self._validate_grasp_feedback(
                 "at side-barcode fixed placement pose",

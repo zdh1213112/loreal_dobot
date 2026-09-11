@@ -2,6 +2,32 @@
 import numpy as np
 
 
+def camera_rotation_at_target_tcp(
+    current_tcp_rotation,
+    current_camera_rotation,
+    target_tcp_rotation,
+):
+    """Predict camera attitude after rotating the TCP to its target attitude."""
+
+    current_tcp = np.asarray(current_tcp_rotation, dtype=float)
+    current_camera = np.asarray(current_camera_rotation, dtype=float)
+    target_tcp = np.asarray(target_tcp_rotation, dtype=float)
+    if any(rotation.shape != (3, 3) for rotation in (
+        current_tcp, current_camera, target_tcp
+    )):
+        raise ValueError("TCP and camera rotations must be 3x3 matrices")
+    if not all(np.all(np.isfinite(rotation)) for rotation in (
+        current_tcp, current_camera, target_tcp
+    )):
+        raise ValueError("TCP and camera rotations must be finite")
+
+    # R_tcp_to_camera is fixed by the mounted tool/camera geometry. Applying
+    # the target TCP attitude predicts the camera attitude without physically
+    # stopping for a separate orientation-only motion first.
+    tcp_to_camera = current_tcp.T @ current_camera
+    return target_tcp @ tcp_to_camera
+
+
 def plan_offset(target, camera_rotation, length, finger_span=0.060, clearance=0.020):
     values = np.array([length, finger_span, clearance])
     if not np.all(np.isfinite(values)) or np.any(values <= 0):

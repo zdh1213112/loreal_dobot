@@ -33,7 +33,7 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument("offset_grasp_enabled", default_value="true",
-                                  description="Descend beside the box and insert after fresh sweep clearance"),
+                                  description="Reach offset-high while aligning grasp attitude, then descend and insert"),
             DeclareLaunchArgument("offset_grasp_speed_percent", default_value="10",
                                   description="Offset path linear speed percent (capped at 25)"),
             DeclareLaunchArgument("offset_grasp_clearance_m", default_value="0.020"),

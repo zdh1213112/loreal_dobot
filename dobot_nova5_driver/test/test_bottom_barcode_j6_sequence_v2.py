@@ -197,17 +197,15 @@ def test_bottom_fixed_place_applies_additional_user_ry_rotation():
     assert "ry_delta_deg=place_ry_delta_deg" in section
 
 
-def test_side_barcode_path_uses_safe_fixed_place_and_rx_tilt():
+def test_side_barcode_path_combines_safe_fixed_place_and_rx_tilt():
     source = SOURCE.read_text()
     start = source.index('with self._timed_stage("post_scan_safe_height_ptp")')
     end = source.index('with self._timed_stage("placement_grasp_check")', start)
     section = source[start:end]
     assert 'get_parameter("side_barcode_place_rx_delta_deg")' in section
-    assert '"side_barcode_rx_tilt"' in section
+    assert '"side_barcode_rx_tilt"' not in section
     assert '"side_barcode_fixed_place_ptp"' in section
     assert "_side_barcode_place_xyz()" in section
     assert '"placement_vertical_descent"' not in section
-    assert section.index('"side_barcode_fixed_place_ptp"') < section.index(
-        '"side_barcode_rx_tilt"'
-    )
-    assert "linear_tcp=True" in section
+    assert "rx_delta_deg=side_rx_delta_deg" in section
+    assert "linear_tcp=True" not in section
