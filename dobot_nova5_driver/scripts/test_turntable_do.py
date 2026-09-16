@@ -9,6 +9,7 @@ import argparse
 import re
 import socket
 import sys
+import time
 
 
 DEFAULT_ROBOT_IP = "192.168.111.101"
@@ -48,8 +49,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="测试 101 控制器 DO 开/关/读取")
     parser.add_argument("--do", type=int, required=True, choices=range(1, 9),
                         metavar="1..8", help="控制器 DO 编号，现场核对接线后填写")
-    parser.add_argument("--state", choices=("read", "on", "off"), default="read",
-                        help="read 只读取（默认），on 输出 1，off 输出 0")
+    parser.add_argument("--state", choices=("read", "on", "off", "pulse"), default="read",
+                        help="read 只读取（默认），on 输出1，off 输出0，pulse 发一次0→1→0触发脉冲")
+    parser.add_argument("--pulse-ms", type=int, default=300,
+                        help="pulse 模式下复位和输出1各保持的毫秒数（默认300）")
     parser.add_argument("--ip", default=DEFAULT_ROBOT_IP, help="101 控制器 IP")
     parser.add_argument("--timeout", type=float, default=3.0, help="TCP 超时秒数")
     parser.add_argument("--dry-run", action="store_true", help="只显示命令，不连接机械臂")
@@ -57,9 +60,18 @@ def main() -> int:
 
     if args.timeout <= 0:
         parser.error("--timeout 必须大于 0")
+    if not 50 <= args.pulse_ms <= 5000:
+        parser.error("--pulse-ms 必须在 50..5000 范围内")
 
-    command = (f"DOInstant({args.do},{1 if args.state == 'on' else 0})"
-               if args.state != "read" else f"GetDO({args.do})")
+    if args.state == "pulse":
+        command = (
+            f"DOInstant({args.do},0) -> 等待 {args.pulse_ms}ms -> "
+            f"DOInstant({args.do},1) -> 等待 {args.pulse_ms}ms -> "
+            f"DOInstant({args.do},0)"
+        )
+    else:
+        command = (f"DOInstant({args.do},{1 if args.state == 'on' else 0})"
+                   if args.state != "read" else f"GetDO({args.do})")
     if args.dry_run:
         print(f"仅预览: {args.ip}:{DASHBOARD_PORT}  {command}")
         if args.state != "read":
@@ -71,7 +83,14 @@ def main() -> int:
     try:
         with socket.create_connection((args.ip, DASHBOARD_PORT), timeout=args.timeout) as connection:
             connection.settimeout(args.timeout)
-            if args.state != "read":
+            if args.state == "pulse":
+                delay_s = args.pulse_ms / 1000.0
+                exchange(connection, f"DOInstant({args.do},0)")
+                time.sleep(delay_s)
+                exchange(connection, f"DOInstant({args.do},1)")
+                time.sleep(delay_s)
+                exchange(connection, f"DOInstant({args.do},0)")
+            elif args.state != "read":
                 exchange(connection, command)
             actual = read_do(connection, args.do)
     except (OSError, RuntimeError) as exc:
@@ -79,9 +98,12 @@ def main() -> int:
         return 1
 
     print(f"DO {args.do} 当前状态: {'ON (1)' if actual else 'OFF (0)'}")
-    if args.state != "read" and actual != (1 if args.state == "on" else 0):
+    expected = 1 if args.state == "on" else 0
+    if args.state != "read" and actual != expected:
         print("警告：读回状态与请求不一致；不要据此判断转盘已经启动或停止。", file=sys.stderr)
         return 1
+    if args.state == "pulse":
+        print("触发脉冲已发送；转盘实际处于运行还是停止，需要现场观察或反馈信号确认。")
     return 0
 
 
