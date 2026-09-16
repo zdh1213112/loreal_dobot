@@ -21,6 +21,10 @@ FEEDBACK_CONTROLLER_TIMESTAMP_MAX_CLOCK_ERROR_S = 5.0
 FEEDBACK_EXPECTED_PERIOD_S = 0.008
 FEEDBACK_RELATIVE_CLOCK_VOTES = 3
 FEEDBACK_RELATIVE_CLOCK_OFFSET_SAMPLES = 128
+# Feedback packets arrive at roughly 8 ms intervals.  Polling command
+# completion more frequently than that keeps the next queued command from
+# waiting on an avoidable scheduler tick without busy-spinning.
+MOTION_COMPLETION_POLL_S = 0.002
 ROBOT_MODE_TEXT = {
     1: "INIT",
     2: "BRAKE_OPEN",
@@ -44,6 +48,21 @@ class TcpPose:
     rx: float
     ry: float
     rz: float
+
+
+@dataclass(frozen=True)
+class MotionCommandHandle:
+    """Identifier and cancellation epoch for a submitted motion command.
+
+    Blocking motion helpers continue to be the default API.  The cosmetic-box
+    cycle also needs a narrowly-scoped look-ahead path, where the next command
+    is submitted while the current command is still finishing.  Keeping the
+    cancellation epoch with the command prevents a Stop() from allowing an
+    old queued command to be mistaken for a completed motion.
+    """
+
+    command_id: int
+    command_epoch: int
 
 
 class DobotNova5Controller:
@@ -107,6 +126,11 @@ class DobotNova5Controller:
     def connect(self, go_to_start: bool = False, auto_enable: bool = False) -> None:
         self.dashboard = DobotApiDashboard(self.robot_ip, self.dashboard_port)
         self.feedback = DobotApiFeedBack(self.robot_ip, self.feedback_port)
+        # A new Dashboard session may inherit global speed/profile values from
+        # another client or a previous process.  Force the first
+        # enable_single_command_motion_scaling() call after reconnect to write
+        # the known 100% baseline; subsequent GUI clicks can use the cache.
+        self._single_command_motion_scaling = False
         self._stop_feedback.clear()
         self._feedback_thread = threading.Thread(target=self._feedback_loop, daemon=True)
         self._feedback_thread.start()
@@ -652,6 +676,14 @@ class DobotNova5Controller:
         MoveJog remains the intentional exception because it has no per-command
         speed argument and must temporarily use SpeedFactor.
         """
+        # The cycle calls this once during node startup and again when the GUI
+        # applies parameters.  These are controller-global dashboard writes;
+        # repeating them on every click adds a visible pre-motion pause even
+        # though the effective per-command profile has not changed.  Keep the
+        # opt-in state as the cache because all normal cycle motions use the
+        # composed ``v``/``a`` values below.
+        if self._single_command_motion_scaling:
+            return
         self.set_speed_factor(100)
         self.set_joint_profile(speed=100, accel=100)
         self.set_linear_profile(speed=100, accel=100)
@@ -711,6 +743,192 @@ class DobotNova5Controller:
         if self.robot_mode == 10:
             self.stop_motion()
         self.move_joint(self.startup_joint, speed=self.startup_speed)
+
+    def submit_move_joint(
+        self,
+        joints_deg: list[float],
+        speed: int = 20,
+        accel: Optional[int] = None,
+        cp: Optional[int] = None,
+    ) -> MotionCommandHandle:
+        """Submit a joint move without waiting for its terminal feedback.
+
+        This is intentionally separate from :meth:`move_joint`: almost every
+        caller needs the blocking behavior, while the one look-ahead path in
+        the cosmetic-box cycle must submit its next waypoint before the first
+        waypoint reaches zero speed.  The returned handle can be passed to
+        :meth:`wait_for_command` later.
+        """
+
+        self._ensure_dashboard()
+        if len(joints_deg) != 6:
+            raise ValueError(f"joints_deg must contain 6 values, got {len(joints_deg)}")
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            if not self._single_command_motion_scaling:
+                self._raise_if_error(self.dashboard.SpeedFactor(int(speed)), "SpeedFactor")
+            response = self.dashboard.MovJ(
+                float(joints_deg[0]),
+                float(joints_deg[1]),
+                float(joints_deg[2]),
+                float(joints_deg[3]),
+                float(joints_deg[4]),
+                float(joints_deg[5]),
+                1,
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+                cp=-1 if cp is None else int(cp),
+            )
+        command_id = self._require_command_id(response, "MovJ")
+        return MotionCommandHandle(command_id, command_epoch)
+
+    def submit_move_joint_tcp(
+        self,
+        pose_m_deg: TcpPose,
+        speed: int = 20,
+        accel: Optional[int] = None,
+        cp: Optional[int] = None,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+    ) -> MotionCommandHandle:
+        """Submit a Cartesian ``MovJ`` without waiting for completion.
+
+        This is the Cartesian counterpart to :meth:`submit_move_joint`.  It is
+        intentionally kept separate from :meth:`move_joint_tcp` so callers
+        that need a narrow CP look-ahead window can queue one known-safe target
+        while retaining the normal blocking API everywhere else.
+        """
+
+        self._ensure_dashboard()
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            response = self.dashboard.MovJ(
+                pose_m_deg.x * MM_PER_METER,
+                pose_m_deg.y * MM_PER_METER,
+                pose_m_deg.z * MM_PER_METER,
+                pose_m_deg.rx,
+                pose_m_deg.ry,
+                pose_m_deg.rz,
+                0,
+                user=-1 if user_index is None else int(user_index),
+                tool=-1 if tool_index is None else int(tool_index),
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+                cp=-1 if cp is None else int(cp),
+            )
+        command_id = self._require_command_id(response, "MovJ")
+        return MotionCommandHandle(command_id, command_epoch)
+
+    def submit_rel_move_user_joint(
+        self,
+        offset_pose_m_deg: TcpPose,
+        speed: int = 20,
+        accel: Optional[int] = None,
+        cp: Optional[int] = None,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+    ) -> MotionCommandHandle:
+        """Submit a User-frame relative joint move without waiting."""
+
+        self._ensure_dashboard()
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            response = self.dashboard.RelMovJUser(
+                offset_pose_m_deg.x * MM_PER_METER,
+                offset_pose_m_deg.y * MM_PER_METER,
+                offset_pose_m_deg.z * MM_PER_METER,
+                offset_pose_m_deg.rx,
+                offset_pose_m_deg.ry,
+                offset_pose_m_deg.rz,
+                user=-1 if user_index is None else int(user_index),
+                tool=-1 if tool_index is None else int(tool_index),
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+                cp=-1 if cp is None else int(cp),
+            )
+        command_id = self._require_command_id(response, "RelMovJUser")
+        return MotionCommandHandle(command_id, command_epoch)
+
+    def submit_move_linear_tcp(
+        self,
+        pose_m_deg: TcpPose,
+        speed: int = 10,
+        accel: Optional[int] = None,
+        cp: Optional[int] = None,
+        user_index: Optional[int] = None,
+        tool_index: Optional[int] = None,
+    ) -> MotionCommandHandle:
+        """Submit a Cartesian ``MovL`` without waiting for completion.
+
+        ``MovL`` supports the same controller-side CP queue parameter as
+        ``MovJ``.  Keeping this asynchronous counterpart separate from
+        :meth:`move_linear_tcp` lets a caller queue a verified vertical
+        descent while the preceding safe-hover PTP is still finishing.
+        """
+
+        self._ensure_dashboard()
+        if (user_index is None) != (tool_index is None):
+            raise ValueError("user_index and tool_index must be provided together")
+        with self._command_lock:
+            command_epoch = self._motion_cancel_epoch
+            response = self.dashboard.MovL(
+                pose_m_deg.x * MM_PER_METER,
+                pose_m_deg.y * MM_PER_METER,
+                pose_m_deg.z * MM_PER_METER,
+                pose_m_deg.rx,
+                pose_m_deg.ry,
+                pose_m_deg.rz,
+                0,
+                user=-1 if user_index is None else int(user_index),
+                tool=-1 if tool_index is None else int(tool_index),
+                a=-1 if accel is None else int(accel),
+                v=int(speed),
+                cp=-1 if cp is None else int(cp),
+            )
+        command_id = self._require_command_id(response, "MovL")
+        return MotionCommandHandle(command_id, command_epoch)
+
+    def wait_for_command(
+        self,
+        command: MotionCommandHandle,
+        timeout_s: float = 60.0,
+    ) -> None:
+        """Wait for a command previously returned by a submit_* method."""
+
+        if not isinstance(command, MotionCommandHandle):
+            raise TypeError(
+                "command must be a MotionCommandHandle returned by submit_*"
+            )
+        self._wait_for_command(
+            command.command_id,
+            timeout_s=float(timeout_s),
+            command_epoch=command.command_epoch,
+        )
+
+    def motion_command_is_active(self, command: MotionCommandHandle) -> bool:
+        """Return whether a submitted command is still the active motion.
+
+        A paused, stopped, or superseded command is not considered active.  A
+        caller using this for a look-ahead gate must fall back to the normal
+        blocking wait when it returns ``False``.
+        """
+
+        if not isinstance(command, MotionCommandHandle):
+            raise TypeError(
+                "command must be a MotionCommandHandle returned by submit_*"
+            )
+        if command.command_epoch != self._motion_cancel_epoch:
+            return False
+        if self.feedback_data is None:
+            return False
+        return (
+            self.robot_mode in (7, 8)
+            and self.current_command_id() == command.command_id
+        )
 
     def move_joint(
         self,
@@ -1081,10 +1299,10 @@ class DobotNova5Controller:
                 return
             if time.time() - start > timeout_s:
                 raise TimeoutError(f"Timed out while waiting for {detail}")
-            # Motion completion is polled from the feedback stream; 50 ms
-            # added a visible pause between retreat and the next PTP. Keep
-            # command transitions responsive without busy-spinning.
-            time.sleep(0.01)
+            # Motion completion is polled from the feedback stream; a short
+            # interval keeps command transitions responsive without adding a
+            # visible stop between consecutive blocking moves.
+            time.sleep(MOTION_COMPLETION_POLL_S)
 
     def _ensure_dashboard(self) -> None:
         if self.dashboard is None:

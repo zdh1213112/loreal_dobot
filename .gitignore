@@ -24,3 +24,15 @@ __pycache__/
 *.avi
 *.npy
 *.npz
+
+# ROS/colcon generated artifacts
+**/build/
+**/install/
+**/log/
+**/.pytest_cache/
+
+# Runtime/debug outputs
+**/d405_output_v2/
+**/d405_fault_snapshots/
+**/d405_fault_snapshots_v2/
+**/d405_top_barcode_debug_v2/

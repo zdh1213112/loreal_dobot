@@ -67,6 +67,14 @@ def make_motion_node(cancel_after_low=False):
     moves=[]; events=[]
     params = dict(user_index=0, command_tool_index=1, flange_tool_index=0,
                   offset_finger_span_m=.06, offset_grasp_clearance_m=.02,
+                  offset_high_clearance_m=.12,
+                  # Keep these orchestration tests on the original blocking
+                  # path; the asynchronous CP helper has dedicated tests.
+                  offset_high_descent_blend_enabled=False,
+                  offset_high_descent_blend_cp=20,
+                  offset_high_descent_queue_lead_m=.030,
+                  offset_high_descent_command_start_grace_s=.30,
+                  pregrasp_min_hover_clearance_m=.03,
                   grasp_z_offset_m=.010)
     def move(p, **kw):
         nonlocal pose
@@ -88,20 +96,19 @@ def make_motion_node(cancel_after_low=False):
                                    inverse_kinematics=lambda *a,**kw:None,current_joint=lambda:[0]*6,
                                    move_joint_tcp=move,
                                    move_linear_tcp=move))
-    return (
-        lambda after_high=None: ns['_execute_offset_entry'](
+    def run(after_high=None):
+        return ns['_execute_offset_entry'](
             node, Pose(.5,.2,.013,0,0,0), .124, after_high
-        ),
-        moves,
-        events,
-    )
+        )
+    run.params = params
+    return run, moves, events
 
 
 def test_offset_path_order_and_low_observation():
     run,moves,events=make_motion_node()
     run()
     np.testing.assert_allclose([[p.x,p.y,p.z] for p in moves],
-                               [[.388,.2,.3],[.388,.2,.013],[.5,.2,.013]])
+                               [[.388,.2,.133],[.388,.2,.013],[.5,.2,.013]])
     assert events.index('offset_descent') < events.index('wait') < events.index('offset_insert')
 
 
@@ -143,6 +150,66 @@ def test_offset_descent_and_insert_use_normalized_linear_speed():
     assert 'speed=motion["linear_speed"]' in section
     assert 'accel=motion["linear_acc"]' in section
     assert 'offset_grasp_speed_percent' not in section
+
+
+def test_offset_high_clearance_cannot_undercut_pregrasp_minimum():
+    run, moves, _ = make_motion_node()
+    run.params['offset_high_clearance_m'] = .02
+
+    with pytest.raises(RuntimeError, match='must be at least'):
+        run()
+
+    assert moves == []
+
+
+def test_redundant_startup_move_is_skipped_but_gripper_still_opens():
+    import ast
+    import math
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    source = Path(__file__).parents[1] / 'dobot_nova5_driver/nova5_cosmetic_box_single_arm_cycle_v2.py'
+    module = ast.parse(source.read_text())
+    node_class = next(
+        node for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == 'CosmeticBoxSingleArmNode'
+    )
+    method = next(
+        node for node in node_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == '_move_startup_and_open'
+    )
+    namespace = {'math': math}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), namespace)
+
+    startup = [14.0, 7.0, -130.0, 47.0, 83.0, 10.0]
+    joint_moves = []
+    gripper_calls = []
+    statuses = []
+    node = SimpleNamespace(
+        _motion_profile=lambda: {'return_startup_speed': 100, 'return_startup_acc': 100},
+        _six_values=lambda name: startup,
+        get_parameter=lambda name: SimpleNamespace(
+            value={'startup_joint_skip_tolerance_deg': 1.0, 'dh_force': 50}[name]
+        ),
+        _publish_status=statuses.append,
+        _require_cycle_active=lambda stage: None,
+        _cycle_cancel_requested=lambda: False,
+        get_logger=lambda: SimpleNamespace(warning=lambda message: None),
+        controller=SimpleNamespace(
+            current_joint=lambda: [14.2, 7.0, -130.1, 47.0, 83.0, 10.0],
+            move_joint=lambda *args, **kwargs: joint_moves.append((args, kwargs)),
+        ),
+        gripper=SimpleNamespace(
+            set_force=lambda force: gripper_calls.append(('force', force)),
+            open=lambda **kwargs: gripper_calls.append(('open', kwargs)),
+        ),
+    )
+
+    namespace['_move_startup_and_open'](node)
+
+    assert joint_moves == []
+    assert [call[0] for call in gripper_calls] == ['force', 'open']
+    assert any('skipping redundant MovJ' in status for status in statuses)
 
 
 def test_enabled_offset_branch_combines_orientation_with_offset_high():

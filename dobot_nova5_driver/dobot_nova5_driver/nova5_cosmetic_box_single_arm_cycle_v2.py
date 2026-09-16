@@ -65,6 +65,16 @@ from .dobot_dh_api_v2 import (
 )
 
 
+# Keep look-ahead submission close to the configured TCP gate.  The feedback
+# stream is faster than this on the Nova5, while the sleep still yields to the
+# vision and ROS executor threads.
+LOOKAHEAD_GATE_POLL_S = 0.002
+# Vision callbacks are delivered by the ROS executor thread.  Polling at 5 ms
+# keeps a newly published pose/handoff state from adding a visible scheduler
+# gap without busy-spinning the request worker.
+VISION_REQUEST_POLL_S = 0.005
+
+
 def pose_to_transform(pose: TcpPose) -> np.ndarray:
     transform = np.eye(4, dtype=np.float64)
     transform[:3, :3] = SciPyRot.from_euler("xyz", [pose.rx, pose.ry, pose.rz], degrees=True).as_matrix()
@@ -218,6 +228,10 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("auto_enable", True)
         self.declare_parameter("auto_start", False)
         self.declare_parameter("startup_joint", [14.0, 7.0, -130.0, 47.0, 83.0, 10.0]) #初始位置，关节角度
+        # A completed cycle already ends at startup_joint.  Before the next
+        # single-cycle request, use fresh joint feedback to avoid replaying the
+        # same MovJ.  Gripper opening is still performed below.
+        self.declare_parameter("startup_joint_skip_tolerance_deg", 1.0)
         self.declare_parameter("transfer_joint", [14.0, -29.0, -99.0, 39.0, 88.0, 15.0])
         # 101 is the left pick arm.  These parameters only read 102 feedback;
         # the left node never sends a motion command to the right/VLA arm.
@@ -283,6 +297,22 @@ class CosmeticBoxSingleArmNode(Node):
         # 后半段参数是“单条指令有效百分比”，不再与 joint_speed 重复相乘。
         self.declare_parameter("grasp_lift_speed_factor", 100)
         self.declare_parameter("grasp_lift_acc_factor", 100)
+        # After the gripper has confirmed a hold, queue the transfer joint as
+        # the lift command approaches its safe height.  CP blending removes
+        # the stop/restart between the two post-grasp moves while the lift
+        # remains a real first segment with a configurable lead margin.
+        self.declare_parameter("grasp_lift_transfer_blend_enabled", True)
+        self.declare_parameter("grasp_lift_transfer_blend_cp", 20)
+        self.declare_parameter("grasp_lift_transfer_queue_lead_m", 0.010)
+        self.declare_parameter("grasp_lift_transfer_command_start_grace_s", 0.30)
+        # The safe-height and fixed-placement PTPs are both known, collision-
+        # checked waypoints after barcode handling is complete.  Queue only
+        # this transition; all gripper and scanner feedback checkpoints remain
+        # blocking as before.
+        self.declare_parameter("post_scan_place_blend_enabled", True)
+        self.declare_parameter("post_scan_place_blend_cp", 20)
+        self.declare_parameter("post_scan_place_queue_lead_m", 0.020)
+        self.declare_parameter("post_scan_place_command_start_grace_s", 0.30)
         self.declare_parameter("transfer_speed_factor", 100)
         self.declare_parameter("transfer_acc_factor", 100)
         self.declare_parameter("place_speed_factor", 100)
@@ -306,6 +336,16 @@ class CosmeticBoxSingleArmNode(Node):
         # 回到原中转距离后继续沿 User X- 增加的安全余量，默认 30 mm。
         # 用于覆盖长盒子执行 Ry/Rz 时角点产生的额外旋转包络。
         self.declare_parameter("scanner_retreat_extra_m", 0.030)
+        # The scanner-retreat segment is a known straight User-X escape.  Once
+        # the configured extra clearance has nearly been reached, the
+        # collision-checked post-scan safe-height PTP can be queued with CP so
+        # the controller does not stop between the two segments.  A separate
+        # switch and lead keep this transition independently tunable from the
+        # safe-height-to-place queue.
+        self.declare_parameter("scanner_retreat_post_scan_blend_enabled", True)
+        self.declare_parameter("scanner_retreat_post_scan_blend_cp", 20)
+        self.declare_parameter("scanner_retreat_post_scan_queue_lead_m", 0.010)
+        self.declare_parameter("scanner_retreat_post_scan_command_start_grace_s", 0.30)
         # J6 多面找码速度：只影响找码期间 J6 的连续点动，以及扫码成功后
         # 吸附到最近 90° 标准面的对齐动作。速度越高，停止超调通常越大。
         # MoveJog 没有单条 v 参数；200% 下该值会被合成为并钳位到 100%，
@@ -332,6 +372,18 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("offset_grasp_enabled", True)
         self.declare_parameter("offset_grasp_clearance_m", 0.020)
         self.declare_parameter("offset_finger_span_m", 0.060)
+        # Reach the image-down offset while descending to this clearance above
+        # grasp depth.  The remaining approach stays vertical and retains the
+        # gripper/pregrasp checks at offset-high.
+        self.declare_parameter("offset_high_clearance_m", 0.120)
+        # The offset-high PTP and the following vertical descent are both
+        # known safe once the gripper pre-shape and target identity checks have
+        # passed.  Queue the MovL descent before the PTP reaches its endpoint
+        # so the controller can blend the two segments without an idle stop.
+        self.declare_parameter("offset_high_descent_blend_enabled", True)
+        self.declare_parameter("offset_high_descent_blend_cp", 20)
+        self.declare_parameter("offset_high_descent_queue_lead_m", 0.030)
+        self.declare_parameter("offset_high_descent_command_start_grace_s", 0.30)
         self.declare_parameter("grasp_lift_m", 0.060)
         # Current real-cell trials show an approximately 10 mm vertical bias
         # between the transformed vision pose and the physical gripper tip.
@@ -437,7 +489,7 @@ class CosmeticBoxSingleArmNode(Node):
         # Keep only a short dedicated low-pose observation hold between the
         # descent and insert so top-barcode scanning is retained without a
         # fixed half-second stop on every side-barcode cycle.
-        self.declare_parameter("top_surface_barcode_wait_s", 0.30)
+        self.declare_parameter("top_surface_barcode_wait_s", 0.20)
         self.declare_parameter("top_surface_barcode_topic", "/trigger_top_surface_barcode")
         self.declare_parameter(
             "top_surface_barcode_result_topic", "/top_surface_barcode_result"
@@ -1058,6 +1110,54 @@ class CosmeticBoxSingleArmNode(Node):
                 "Secondary TCP Y interlock DISABLED: 101 will not connect to or "
                 "check 102 feedback; use only when the two-arm collision risk is "
                 "controlled by the operator"
+            )
+        if bool(self.get_parameter("grasp_lift_transfer_blend_enabled").value):
+            self.get_logger().info(
+                "Post-grasp lift/transfer CP look-ahead active: "
+                f"cp={max(1, min(100, int(round(float(self.get_parameter('grasp_lift_transfer_blend_cp').value)))))}%, "
+                f"queue_lead={max(0.0, float(self.get_parameter('grasp_lift_transfer_queue_lead_m').value)) * 1000.0:.1f}mm; "
+                "grasp confirmation remains before lift and after transfer"
+            )
+        else:
+            self.get_logger().info(
+                "Post-grasp lift/transfer CP look-ahead disabled; using blocking motion stages"
+            )
+        if bool(self.get_parameter("post_scan_place_blend_enabled").value):
+            self.get_logger().info(
+                "Post-scan safe-height/place CP look-ahead active: "
+                f"cp={max(1, min(100, int(round(float(self.get_parameter('post_scan_place_blend_cp').value)))))}%, "
+                f"queue_lead={max(0.0, float(self.get_parameter('post_scan_place_queue_lead_m').value)) * 1000.0:.1f}mm; "
+                "placement feedback remains before release"
+            )
+        else:
+            self.get_logger().info(
+                "Post-scan safe-height/place CP look-ahead disabled; "
+                "using separate safe-height and placement PTPs"
+            )
+        if bool(
+            self.get_parameter("scanner_retreat_post_scan_blend_enabled").value
+        ):
+            self.get_logger().info(
+                "Scanner-retreat/post-scan CP look-ahead active: "
+                f"cp={max(1, min(100, int(round(float(self.get_parameter('scanner_retreat_post_scan_blend_cp').value)))))}%, "
+                f"queue_lead={max(0.0, float(self.get_parameter('scanner_retreat_post_scan_queue_lead_m').value)) * 1000.0:.1f}mm; "
+                "scanner clearance is verified before post-scan rotation"
+            )
+        else:
+            self.get_logger().info(
+                "Scanner-retreat/post-scan CP look-ahead disabled; "
+                "using a blocking scanner retreat"
+            )
+        if bool(self.get_parameter("offset_high_descent_blend_enabled").value):
+            self.get_logger().info(
+                "Offset-high/descent CP look-ahead active: "
+                f"cp={max(1, min(100, int(round(float(self.get_parameter('offset_high_descent_blend_cp').value)))))}%, "
+                f"queue_lead={max(0.0, float(self.get_parameter('offset_high_descent_queue_lead_m').value)) * 1000.0:.1f}mm; "
+                "gripper pre-shape and target revalidation remain before descent"
+            )
+        else:
+            self.get_logger().info(
+                "Offset-high/descent CP look-ahead disabled; using separate blocking stages"
             )
         if bool(self.get_parameter("pregrasp_use_live_pose_for_descent").value):
             orientation_mode = (
@@ -2212,15 +2312,42 @@ class CosmeticBoxSingleArmNode(Node):
         require_cycle_active: bool = False,
         open_gripper: bool = True,
     ) -> None:
-        self._publish_status("moving to startup joint")
         motion = self._motion_profile()
         if require_cycle_active:
             self._require_cycle_active("before startup joint motion")
-        self.controller.move_joint(
-            self._six_values("startup_joint"),
-            speed=motion["return_startup_speed"],
-            accel=motion["return_startup_acc"],
+        startup_joint = self._six_values("startup_joint")
+        tolerance_deg = max(
+            0.0,
+            float(self.get_parameter("startup_joint_skip_tolerance_deg").value),
         )
+        startup_error_deg = math.inf
+        try:
+            current_joint = self.controller.current_joint()
+            if len(current_joint) == len(startup_joint) and all(
+                math.isfinite(float(value)) for value in current_joint
+            ):
+                startup_error_deg = max(
+                    abs(float(current) - float(target))
+                    for current, target in zip(current_joint, startup_joint)
+                )
+        except Exception as exc:
+            self.get_logger().warning(
+                f"Could not verify startup joint feedback; executing startup MovJ: {exc}"
+            )
+
+        if tolerance_deg > 0.0 and startup_error_deg <= tolerance_deg:
+            self._publish_status(
+                "startup joint already reached "
+                f"(max error={startup_error_deg:.2f}deg <= {tolerance_deg:.2f}deg); "
+                "skipping redundant MovJ"
+            )
+        else:
+            self._publish_status("moving to startup joint")
+            self.controller.move_joint(
+                startup_joint,
+                speed=motion["return_startup_speed"],
+                accel=motion["return_startup_acc"],
+            )
         if require_cycle_active:
             self._require_cycle_active("at startup joint")
         if open_gripper:
@@ -2396,6 +2523,14 @@ class CosmeticBoxSingleArmNode(Node):
                 )
             self.secondary_auto_resume_requested.clear()
             self.cycle_enabled = True
+        # Publish this before taking the action lock so a click that is waiting
+        # for a previous action is visible immediately in the GUI/status topic.
+        # The target-dependent motion still begins only after the fresh D405
+        # pose is available; this status separates that vision wait from a
+        # controller idle delay.
+        self._publish_status(
+            "single cycle request accepted; preparing startup and fresh D405 target"
+        )
         try:
             with self.action_lock:
                 # 单轮流程开始前必须确保夹爪已经打开。
@@ -2467,6 +2602,9 @@ class CosmeticBoxSingleArmNode(Node):
             previous_handoff = self.handoff_state_count
         trigger = Bool()
         trigger.data = True
+        self._publish_status(
+            "requesting fresh D405 target; robot remains at startup until the pose is verified"
+        )
         self.trigger_publisher.publish(trigger)
         required_samples = max(1, int(self.get_parameter("vision_samples").value))
         deadline = time.monotonic() + max(0.1, float(self.get_parameter("vision_timeout_s").value))
@@ -2531,7 +2669,7 @@ class CosmeticBoxSingleArmNode(Node):
                     break
             if status_update:
                 self._publish_status(status_update)
-            time.sleep(0.02)
+            time.sleep(VISION_REQUEST_POLL_S)
         else:
             self.get_logger().warning(
                 "Timed out waiting for a fresh D405 target with a CLEAR handoff zone"
@@ -3189,7 +3327,27 @@ class CosmeticBoxSingleArmNode(Node):
         low_xyz = plan_offset(
             xyz, planned_camera_rotation @ rgb_rotation, length_m, span,
             float(self.get_parameter("offset_grasp_clearance_m").value))
-        high_xyz = low_xyz.copy(); high_xyz[2] = current.z
+        high_clearance_m = float(self.get_parameter("offset_high_clearance_m").value)
+        minimum_hover_clearance_m = max(
+            0.0,
+            float(self.get_parameter("pregrasp_min_hover_clearance_m").value),
+        )
+        if not math.isfinite(high_clearance_m) or high_clearance_m < minimum_hover_clearance_m:
+            raise RuntimeError(
+                f"offset_high_clearance_m={high_clearance_m:.4f}m must be at least "
+                f"pregrasp_min_hover_clearance_m={minimum_hover_clearance_m:.4f}m"
+            )
+        # Never add an unexpected upward leg when a caller starts below the
+        # configured high point.  Such a start is accepted only when it still
+        # preserves the normal minimum hover clearance.
+        high_z = min(float(current.z), float(low_xyz[2]) + high_clearance_m)
+        actual_high_clearance_m = high_z - float(low_xyz[2])
+        if actual_high_clearance_m < minimum_hover_clearance_m:
+            raise RuntimeError(
+                f"Current TCP leaves only {actual_high_clearance_m:.4f}m above grasp depth; "
+                f"at least {minimum_hover_clearance_m:.4f}m is required before offset descent"
+            )
+        high_xyz = low_xyz.copy(); high_xyz[2] = high_z
         waypoints = [TcpPose(*v, target.rx, target.ry, target.rz) for v in (high_xyz, low_xyz, xyz)]
         for pose in waypoints:
             self.controller.inverse_kinematics(pose, user_index=user, tool_index=tool,
@@ -3197,10 +3355,69 @@ class CosmeticBoxSingleArmNode(Node):
         motion = self._motion_profile()
         self._publish_status(
             f"offset plan: low XYZ=({low_xyz[0]:.3f},{low_xyz[1]:.3f},{low_xyz[2]:.3f})m; "
+            f"high Z={high_z:.3f}m, clearance={actual_high_clearance_m*1000:.1f}mm; "
             f"offset={np.linalg.norm(low_xyz-xyz)*1000:.1f}mm; "
             f"descent/insert speed={motion['linear_speed']}%, "
             f"accel={motion['linear_acc']}%"
         )
+
+        blend_offset_high_descent = bool(
+            self.get_parameter("offset_high_descent_blend_enabled").value
+        )
+        if blend_offset_high_descent:
+            self._publish_status(
+                "offset-high to descent continuous path enabled; "
+                "descent will be queued before the high waypoint stops"
+            )
+            self._execute_offset_high_descent_blend(
+                waypoints[0],
+                waypoints[1],
+                motion,
+                after_offset_high=after_offset_high,
+            )
+            self._require_cycle_active("after offset-high/descent path")
+            actual = self._current_command_pose()
+            if np.linalg.norm(
+                np.array(
+                    [
+                        actual.x - waypoints[1].x,
+                        actual.y - waypoints[1].y,
+                        actual.z - waypoints[1].z,
+                    ],
+                    dtype=np.float64,
+                )
+            ) > 0.003:
+                raise RuntimeError("Offset waypoint position not reached: offset_descent")
+
+            self._publish_status("top-barcode low offset observation")
+            with self._timed_stage("top_barcode_low_observation"):
+                self._wait_for_top_surface_barcode()
+
+            self._require_cycle_active("before offset insert")
+            self._publish_status("offset_insert")
+            with self._timed_stage("offset_insert"):
+                self.controller.move_linear_tcp(
+                    waypoints[2],
+                    speed=motion["linear_speed"],
+                    accel=motion["linear_acc"],
+                    user_index=user,
+                    tool_index=tool,
+                )
+            self._require_cycle_active("after offset_insert")
+            actual = self._current_command_pose()
+            if np.linalg.norm(
+                np.array(
+                    [
+                        actual.x - waypoints[2].x,
+                        actual.y - waypoints[2].y,
+                        actual.z - waypoints[2].z,
+                    ],
+                    dtype=np.float64,
+                )
+            ) > 0.003:
+                raise RuntimeError("Offset waypoint position not reached: offset_insert")
+            return
+
         for index, (stage, pose) in enumerate(zip(
                 ("offset_high", "offset_descent", "offset_insert"), waypoints)):
             self._require_cycle_active(stage)
@@ -3235,6 +3452,208 @@ class CosmeticBoxSingleArmNode(Node):
                 self._publish_status("top-barcode low offset observation")
                 with self._timed_stage("top_barcode_low_observation"):
                     self._wait_for_top_surface_barcode()
+
+    def _execute_offset_high_descent_blend(
+        self,
+        high_pose: TcpPose,
+        low_pose: TcpPose,
+        motion: dict[str, int],
+        after_offset_high=None,
+    ) -> bool:
+        """Queue the vertical offset descent before the high PTP stops.
+
+        The high waypoint is the first command because it establishes the
+        grasp attitude and the lateral offset.  Once the TCP is within the
+        configured lead distance, the existing gripper pre-shape and target
+        revalidation callback runs while the controller is still completing
+        that safe high segment.  A Cartesian ``MovL`` to ``low_pose`` is then
+        queued with CP blending.  If the controller cannot expose an active
+        queue or rejects ``MovL`` queuing, the helper completes the high move
+        and falls back to the original blocking descent.
+        """
+
+        lead_m = float(
+            self.get_parameter("offset_high_descent_queue_lead_m").value
+        )
+        if not math.isfinite(lead_m):
+            raise RuntimeError(
+                "offset_high_descent_queue_lead_m must be finite, "
+                f"got {lead_m!r}"
+            )
+        lead_m = max(0.0, lead_m)
+        cp = max(
+            1,
+            min(
+                100,
+                int(
+                    round(
+                        float(
+                            self.get_parameter("offset_high_descent_blend_cp").value
+                        )
+                    )
+                ),
+            ),
+        )
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        queue_timeout_s = max(
+            0.2,
+            float(self.get_parameter("jog_axis_timeout_s").value),
+        )
+        command_start_grace_s = max(
+            0.05,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "offset_high_descent_command_start_grace_s"
+                    ).value
+                ),
+            ),
+        )
+
+        self._require_cycle_active("before offset-high motion")
+        self._publish_status(
+            "offset_high; descent will be queued near the endpoint "
+            f"(lead {lead_m * 1000.0:.1f}mm, CP={cp})"
+        )
+        with self._timed_stage("offset_high"):
+            high_command = self.controller.submit_move_joint_tcp(
+                high_pose,
+                speed=motion["joint_speed"],
+                accel=motion["joint_pose_acc"],
+                cp=cp,
+                user_index=user_index,
+                tool_index=tool_index,
+            )
+            command_submitted_at = time.monotonic()
+            gate_deadline = command_submitted_at + queue_timeout_s
+            validated = False
+            low_command = None
+            fallback_reason = ""
+            while True:
+                self._require_cycle_active("while waiting to queue offset descent")
+                try:
+                    current_pose = self._current_command_pose()
+                except Exception as exc:
+                    if time.monotonic() >= gate_deadline:
+                        self._stop_active_motion_for_queue_failure(
+                            "offset-high descent gate feedback timeout"
+                        )
+                        raise RuntimeError(
+                            "Could not observe TCP pose while waiting to queue "
+                            f"offset descent: {exc}"
+                        ) from exc
+                    time.sleep(LOOKAHEAD_GATE_POLL_S)
+                    continue
+
+                distance_to_high_m = float(
+                    np.linalg.norm(
+                        np.array(
+                            [
+                                current_pose.x - high_pose.x,
+                                current_pose.y - high_pose.y,
+                                current_pose.z - high_pose.z,
+                            ],
+                            dtype=np.float64,
+                        )
+                    )
+                )
+                active = self.controller.motion_command_is_active(high_command)
+                gate_reached = distance_to_high_m <= lead_m
+                if gate_reached and active:
+                    if not validated:
+                        if after_offset_high is not None:
+                            try:
+                                after_offset_high()
+                            except Exception:
+                                # The high PTP is still active while the
+                                # callback checks the gripper and target.  A
+                                # failed check must stop that motion before
+                                # the exception escapes; otherwise an old
+                                # trajectory could continue after a retry.
+                                self._stop_active_motion_for_queue_failure(
+                                    "offset-high validation failure"
+                                )
+                                raise
+                        validated = True
+                    # The validation callback can take long enough for the
+                    # high command to reach its endpoint.  Recheck activity
+                    # before submitting the queued descent.
+                    if not self.controller.motion_command_is_active(high_command):
+                        fallback_reason = "high waypoint completed during revalidation"
+                        break
+                    if not hasattr(self.controller, "submit_move_linear_tcp"):
+                        fallback_reason = "controller has no asynchronous MovL helper"
+                        break
+                    try:
+                        low_command = self.controller.submit_move_linear_tcp(
+                            low_pose,
+                            speed=motion["linear_speed"],
+                            accel=motion["linear_acc"],
+                            cp=cp,
+                            user_index=user_index,
+                            tool_index=tool_index,
+                        )
+                    except Exception as exc:
+                        if self.controller.motion_command_is_active(high_command):
+                            fallback_reason = f"controller rejected queued MovL: {exc}"
+                            break
+                        raise
+                    break
+
+                if not active:
+                    if time.monotonic() - command_submitted_at < command_start_grace_s:
+                        time.sleep(LOOKAHEAD_GATE_POLL_S)
+                        continue
+                    fallback_reason = "high waypoint completed before descent queue gate"
+                    break
+                if time.monotonic() >= gate_deadline:
+                    self._stop_active_motion_for_queue_failure(
+                        "offset-high descent queue gate timeout"
+                    )
+                    raise TimeoutError(
+                        "Timed out waiting to queue offset descent: "
+                        f"distance={distance_to_high_m * 1000.0:.1f}mm, "
+                        f"gate={lead_m * 1000.0:.1f}mm"
+                    )
+                time.sleep(LOOKAHEAD_GATE_POLL_S)
+
+            if low_command is None:
+                self.controller.wait_for_command(high_command, timeout_s=5.0)
+                if not validated:
+                    if after_offset_high is not None:
+                        after_offset_high()
+                    validated = True
+                self._publish_status(
+                    "offset-high reached before descent queue; using blocking descent "
+                    + (f"({fallback_reason})" if fallback_reason else "")
+                )
+
+        self._require_cycle_active("before offset descent")
+        if low_command is not None:
+            with self._timed_stage("offset_descent"):
+                try:
+                    self.controller.wait_for_command(low_command, timeout_s=60.0)
+                except Exception:
+                    self._stop_active_motion_for_queue_failure(
+                        "queued offset descent wait"
+                    )
+                    raise
+            self._require_cycle_active("after blended offset-high/descent")
+            self._publish_status("blended offset-high and descent reached")
+            return True
+
+        with self._timed_stage("offset_descent"):
+            self.controller.move_linear_tcp(
+                low_pose,
+                speed=motion["linear_speed"],
+                accel=motion["linear_acc"],
+                user_index=user_index,
+                tool_index=tool_index,
+            )
+        self._require_cycle_active("after blocking offset descent")
+        return False
 
     def _execute_one_cycle(self, target: TcpPose, width_m: float, height_m: float, length_m: float) -> None:
         motion = self._motion_profile()
@@ -3396,17 +3815,34 @@ class CosmeticBoxSingleArmNode(Node):
         with self._timed_stage("grasp_confirm"):
             self._confirm_grasp_before_lift(max_opening, width_m)
 
-        with self._timed_stage("grasp_lift"):
-            self._require_cycle_active("immediately before grasp lift")
-            self._relative_user_move(
-                z=float(self.get_parameter("grasp_lift_m").value),
-                label="lifting grasp",
-                speed_factor=motion["grasp_lift_speed"],
-                accel_factor=motion["grasp_lift_acc"],
+        transfer_precompleted = False
+        blend_lift_transfer = (
+            not top_surface_barcode
+            and bool(
+                self.get_parameter("grasp_lift_transfer_blend_enabled").value
             )
+        )
+        if blend_lift_transfer:
+            with self._timed_stage("grasp_lift_transfer"):
+                transfer_precompleted = self._execute_grasp_lift_transfer(
+                    motion,
+                    max_opening,
+                )
+        else:
+            with self._timed_stage("grasp_lift"):
+                self._require_cycle_active("immediately before grasp lift")
+                self._relative_user_move(
+                    z=float(self.get_parameter("grasp_lift_m").value),
+                    label="lifting grasp",
+                    speed_factor=motion["grasp_lift_speed"],
+                    accel_factor=motion["grasp_lift_acc"],
+                )
         self._require_cycle_active("after grasp lift")
         with self._timed_stage("post_lift_grasp_check"):
-            self._validate_grasp_feedback("after lift", max_opening)
+            self._validate_grasp_feedback(
+                "after lift-transfer" if transfer_precompleted else "after lift",
+                max_opening,
+            )
 
         if top_surface_barcode:
             self._publish_status(
@@ -3457,15 +3893,20 @@ class CosmeticBoxSingleArmNode(Node):
 
         # 扫码器可能在机械臂前往 transfer_joint 的途中就读到条码。必须在
         # 运动前开启窗口，否则这条比“到达中转点”早几十毫秒的消息会被回调丢弃。
-        self._reset_barcode_window()
-        self._publish_status("moving to barcode transfer joint; barcode window armed")
-        self._require_cycle_active("immediately before barcode transfer motion")
-        with self._timed_stage("move_transfer"):
-            self.controller.move_joint(
-                self._six_values("transfer_joint"),
-                speed=motion["transfer_speed"],
-                accel=motion["transfer_acc"],
+        if transfer_precompleted:
+            self._publish_status(
+                "at barcode transfer joint; lift/transfer path already completed"
             )
+        else:
+            self._reset_barcode_window()
+            self._publish_status("moving to barcode transfer joint; barcode window armed")
+            self._require_cycle_active("immediately before barcode transfer motion")
+            with self._timed_stage("move_transfer"):
+                self.controller.move_joint(
+                    self._six_values("transfer_joint"),
+                    speed=motion["transfer_speed"],
+                    accel=motion["transfer_acc"],
+                )
         self._require_cycle_active("at barcode transfer joint")
 
         # 到达中转点后先检查“运动途中”捕获的码。已经扫到时无需再靠近
@@ -3507,14 +3948,12 @@ class CosmeticBoxSingleArmNode(Node):
             with self._timed_stage("bottom_flip_j6_pre_return"):
                 self._return_j6_before_bottom_recovery()
 
-        # 此时盒子侧面仍贴近扫码器，不能直接执行带 Ry/Rz 的关节 PTP，
-        # 否则中间关节轨迹的旋转包络可能扫到扫码器。先沿 User X- 原路
-        # 退出实际靠近距离，确认退让完成后才进入扫码后组合运动。
-        with self._timed_stage("scanner_retreat"):
-            self._retreat_box_from_scanner(scanner_approach_m)
-        self._require_cycle_active("after scanner safety retreat")
-
         if bottom_recovery:
+            # 此时盒子侧面仍贴近扫码器，底面恢复路径有自己的退让、放桌和
+            # 翻转顺序，不能与侧面条码的连续队列共用。
+            with self._timed_stage("scanner_retreat"):
+                self._retreat_box_from_scanner(scanner_approach_m)
+            self._require_cycle_active("after scanner safety retreat")
             with self._timed_stage("bottom_barcode_recovery"):
                 self._execute_bottom_barcode_recovery(
                     target,
@@ -3531,24 +3970,71 @@ class CosmeticBoxSingleArmNode(Node):
             float(value)
             for value in self.get_parameter("scan_exit_user_xyz").value
         ]
-        with self._timed_stage("post_scan_safe_height_ptp"):
-            self._move_to_user_xyz_with_rotation(
-                approach_xyz,
-                ry_delta_deg=float(self.get_parameter("face_up_user_ry_deg").value),
-                rz_delta_deg=float(self.get_parameter("post_scan_user_rz_deg").value),
-            )
-        self._require_cycle_active("at safe height above placement area")
         fixed_place_xyz = self._side_barcode_place_xyz()
         side_rx_delta_deg = float(
             self.get_parameter("side_barcode_place_rx_delta_deg").value
         )
-        with self._timed_stage("side_barcode_fixed_place_ptp"):
-            self._move_to_user_xyz_with_rotation(
-                fixed_place_xyz,
-                ry_delta_deg=0.0,
-                rz_delta_deg=0.0,
-                rx_delta_deg=side_rx_delta_deg,
-            )
+        post_scan_place_precompleted = False
+        scanner_retreat_blend = (
+            bool(self.get_parameter("scanner_retreat_post_scan_blend_enabled").value)
+            and bool(self.get_parameter("post_scan_place_blend_enabled").value)
+        )
+        if scanner_retreat_blend:
+            # The straight scanner retreat and the already collision-checked
+            # post-scan safe-height/place waypoints are one safe transition.
+            # Queue the latter while the former still has the configured
+            # extra X- clearance remaining; the helper falls back to the
+            # original blocking sequence if this controller rejects a queue.
+            # These motions overlap by design.  Keep one wall-clock timing
+            # stage so the cycle summary does not double-count the nested
+            # scanner-retreat and post-scan durations.
+            with self._timed_stage("scanner_retreat_post_scan_place"):
+                post_scan_place_precompleted = (
+                    self._execute_scanner_retreat_post_scan_blend(
+                        scanner_approach_m,
+                        approach_xyz,
+                        fixed_place_xyz,
+                        side_rx_delta_deg,
+                        motion,
+                    )
+                )
+        else:
+            # 此时盒子侧面仍贴近扫码器，不能直接执行带 Ry/Rz 的关节 PTP，
+            # 否则中间关节轨迹的旋转包络可能扫到扫码器。先沿 User X- 原路
+            # 退出实际靠近距离，确认退让完成后才进入扫码后组合运动。
+            with self._timed_stage("scanner_retreat"):
+                self._retreat_box_from_scanner(scanner_approach_m)
+            self._require_cycle_active("after scanner safety retreat")
+
+            if bool(self.get_parameter("post_scan_place_blend_enabled").value):
+                with self._timed_stage("post_scan_safe_height_place"):
+                    post_scan_place_precompleted = self._execute_post_scan_safe_place_blend(
+                        approach_xyz,
+                        fixed_place_xyz,
+                        side_rx_delta_deg,
+                        motion,
+                    )
+            else:
+                with self._timed_stage("post_scan_safe_height_ptp"):
+                    self._move_to_user_xyz_with_rotation(
+                        approach_xyz,
+                        ry_delta_deg=float(self.get_parameter("face_up_user_ry_deg").value),
+                        rz_delta_deg=float(self.get_parameter("post_scan_user_rz_deg").value),
+                    )
+
+        self._require_cycle_active(
+            "at fixed placement pose"
+            if post_scan_place_precompleted
+            else "at safe height above placement area"
+        )
+        if not post_scan_place_precompleted:
+            with self._timed_stage("side_barcode_fixed_place_ptp"):
+                self._move_to_user_xyz_with_rotation(
+                    fixed_place_xyz,
+                    ry_delta_deg=0.0,
+                    rz_delta_deg=0.0,
+                    rx_delta_deg=side_rx_delta_deg,
+                )
         self._require_cycle_active(
             "at side-barcode fixed placement pose with User Rx tilt"
         )
@@ -4185,6 +4671,494 @@ class CosmeticBoxSingleArmNode(Node):
             tool_index=int(self.get_parameter("command_tool_index").value),
         )
 
+    def _stop_active_motion_for_queue_failure(self, reason: str) -> None:
+        """Stop a queued look-ahead motion before propagating its failure.
+
+        The normal cycle recovery opens the gripper and may perform a vertical
+        escape.  That recovery is only safe after the controller has stopped
+        the active lift/transfer queue, so keep this cleanup in one place.
+        """
+
+        try:
+            mode = self.controller.robot_mode
+        except Exception:
+            mode = -1
+        if mode not in (7, 8, 10):
+            return
+        try:
+            self.controller.stop_motion()
+        except Exception as stop_exc:
+            self.get_logger().warning(
+                f"Could not stop active lift/transfer motion after {reason}: {stop_exc}"
+            )
+
+    def _execute_grasp_lift_transfer(
+        self,
+        motion: dict[str, int],
+        max_opening: float,
+    ) -> bool:
+        """Blend the confirmed grasp lift into the transfer-joint move.
+
+        The lift remains the first command and starts only after the existing
+        two-sample grasp confirmation.  Once feedback shows that the TCP is
+        within the configured lead distance of the safe lift height, the
+        transfer ``MovJ`` is submitted with the same CP value.  The controller
+        can then blend the two command segments instead of decelerating to an
+        idle mode between them.  ``False`` means the lift completed before the
+        look-ahead gate (or the firmware rejected queueing), so the caller must
+        use the ordinary blocking transfer path.
+        """
+
+        lift_m = float(self.get_parameter("grasp_lift_m").value)
+        if not math.isfinite(lift_m) or lift_m <= 0.0:
+            raise RuntimeError(f"grasp_lift_m must be positive, got {lift_m!r}")
+
+        lead_m = float(
+            self.get_parameter("grasp_lift_transfer_queue_lead_m").value
+        )
+        if not math.isfinite(lead_m):
+            raise RuntimeError(
+                "grasp_lift_transfer_queue_lead_m must be finite, "
+                f"got {lead_m!r}"
+            )
+        lead_m = max(0.0, lead_m)
+        # Do not allow a queue request before the lift has made meaningful
+        # vertical progress.  A value equal to the full lift is therefore a
+        # safe configuration error with a clear legacy fallback.
+        if lead_m >= lift_m:
+            self.get_logger().warning(
+                "Lift/transfer look-ahead disabled for this cycle: "
+                f"queue lead={lead_m * 1000.0:.1f}mm is not below lift="
+                f"{lift_m * 1000.0:.1f}mm; using the blocking transfer path"
+            )
+            self._require_cycle_active("before fallback grasp lift")
+            self._relative_user_move(
+                z=lift_m,
+                label="lifting grasp",
+                speed_factor=motion["grasp_lift_speed"],
+                accel_factor=motion["grasp_lift_acc"],
+            )
+            return False
+
+        cp = max(
+            1,
+            min(
+                100,
+                int(
+                    round(
+                        float(
+                            self.get_parameter("grasp_lift_transfer_blend_cp").value
+                        )
+                    )
+                ),
+            ),
+        )
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        start_pose = self._current_command_pose()
+        lift_target_z = float(start_pose.z) + lift_m
+        queue_gate_z = lift_target_z - lead_m
+        queue_timeout_s = max(
+            0.2,
+            float(self.get_parameter("jog_axis_timeout_s").value),
+        )
+
+        self._require_cycle_active("immediately before blended grasp lift")
+        self._publish_status(
+            "lifting grasp; transfer joint will be queued near "
+            f"{queue_gate_z * 1000.0:.1f}mm TCP Z "
+            f"(lead {lead_m * 1000.0:.1f}mm, CP={cp})"
+        )
+        lift_command = self.controller.submit_rel_move_user_joint(
+            TcpPose(0.0, 0.0, lift_m, 0.0, 0.0, 0.0),
+            speed=motion["grasp_lift_speed"],
+            accel=motion["grasp_lift_acc"],
+            cp=cp,
+            user_index=user_index,
+            tool_index=tool_index,
+        )
+
+        # The dashboard reply can arrive before the first feedback packet that
+        # changes RobotMode/CurrentCommandId.  Treat that short handoff as a
+        # pending command rather than immediately falling back to a blocking
+        # lift; otherwise every real cycle can miss the queue gate.
+        command_start_grace_s = max(
+            0.05,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "grasp_lift_transfer_command_start_grace_s"
+                    ).value
+                ),
+            ),
+        )
+        command_submitted_at = time.monotonic()
+        gate_deadline = time.monotonic() + queue_timeout_s
+        while True:
+            self._require_cycle_active("while waiting to queue transfer")
+            try:
+                current_pose = self._current_command_pose()
+            except Exception as exc:
+                # A transient dashboard/feedback read should not cause a
+                # premature queue.  The feedback stream is still monitored by
+                # the controller; retry until the command or gate is resolved.
+                if time.monotonic() >= gate_deadline:
+                    self._stop_active_motion_for_queue_failure("TCP gate feedback timeout")
+                    raise RuntimeError(
+                        "Could not observe TCP Z while waiting to queue transfer: "
+                        f"{exc}"
+                    ) from exc
+                time.sleep(LOOKAHEAD_GATE_POLL_S)
+                continue
+            if float(current_pose.z) >= queue_gate_z:
+                if self.controller.motion_command_is_active(lift_command):
+                    break
+                # If the endpoint is already visible while the command is no
+                # longer active, the lift really completed before we could
+                # queue the next segment; use the safe legacy path.
+                self.controller.wait_for_command(lift_command, timeout_s=5.0)
+                self._publish_status(
+                    "grasp lift reached its endpoint before the queue gate; "
+                    "using the blocking transfer path"
+                )
+                return False
+            if not self.controller.motion_command_is_active(lift_command):
+                if time.monotonic() - command_submitted_at < command_start_grace_s:
+                    time.sleep(LOOKAHEAD_GATE_POLL_S)
+                    continue
+                # The first command has already reached its terminal state, so
+                # there is no remaining segment to blend into.  Confirm its
+                # completion and let the caller issue the normal transfer.
+                self.controller.wait_for_command(lift_command, timeout_s=5.0)
+                self._publish_status(
+                    "grasp lift reached its endpoint before the queue gate; "
+                    "using the blocking transfer path"
+                )
+                return False
+            if time.monotonic() >= gate_deadline:
+                self._stop_active_motion_for_queue_failure("queue gate timeout")
+                raise TimeoutError(
+                    "Timed out waiting for the grasp-lift TCP Z queue gate: "
+                    f"current={float(current_pose.z) * 1000.0:.1f}mm, "
+                    f"gate={queue_gate_z * 1000.0:.1f}mm"
+                )
+            time.sleep(LOOKAHEAD_GATE_POLL_S)
+
+        self._require_cycle_active("at the grasp-lift transfer queue gate")
+        # Preserve a feedback checkpoint before any horizontal/joint transfer
+        # motion is allowed.  If the gripper reports an empty or implausible
+        # hold, stop the still-active lift before the normal retry recovery
+        # opens the fingers and retreats vertically.
+        try:
+            self._validate_grasp_feedback("before lift-transfer queue", max_opening)
+        except RecoverableGraspError:
+            self._stop_active_motion_for_queue_failure("pre-transfer grasp feedback failure")
+            raise
+        if not self.controller.motion_command_is_active(lift_command):
+            self.controller.wait_for_command(lift_command, timeout_s=5.0)
+            self._publish_status(
+                "grasp lift completed while checking feedback; "
+                "using the blocking transfer path"
+            )
+            return False
+        # Keep the existing barcode semantics: callbacks are accepted from the
+        # transfer motion onward, including the short CP-blended segment.
+        self._reset_barcode_window()
+        self._publish_status("queueing transfer joint before lift endpoint")
+        try:
+            transfer_command = self.controller.submit_move_joint(
+                self._six_values("transfer_joint"),
+                speed=motion["transfer_speed"],
+                accel=motion["transfer_acc"],
+                cp=cp,
+            )
+        except Exception as exc:
+            # Some controller firmware accepts only one command at a time.  If
+            # it rejected the second command while the lift is still active,
+            # wait for the lift and let the caller use the safe legacy path.
+            if self.controller.motion_command_is_active(lift_command):
+                self.get_logger().warning(
+                    "Controller rejected the lift/transfer queue while the lift "
+                    f"was active; completing the lift then falling back: {exc}"
+                )
+                self.controller.wait_for_command(lift_command, timeout_s=5.0)
+                return False
+            raise
+
+        try:
+            self.controller.wait_for_command(transfer_command, timeout_s=60.0)
+        except Exception:
+            self._stop_active_motion_for_queue_failure("queued transfer wait")
+            raise
+        self._require_cycle_active("after blended grasp lift and transfer")
+        self._publish_status("blended grasp lift and transfer joint reached")
+        return True
+
+    def _execute_post_scan_safe_place_blend(
+        self,
+        approach_xyz: list[float],
+        fixed_place_xyz: list[float],
+        side_rx_delta_deg: float,
+        motion: dict[str, int],
+        allow_pending_queue: bool = False,
+    ) -> bool:
+        """Queue the fixed placement PTP while the safe-height PTP finishes.
+
+        This transition is deliberately narrower than the lift/transfer
+        queue.  Barcode acquisition has finished, and both waypoints are
+        predetermined, collision-checked PTP targets.  In the normal call the
+        scanner retreat has also finished.  A scanner look-ahead caller may
+        set ``allow_pending_queue`` while that known straight retreat is still
+        in the controller queue; the safe-height command is then allowed to
+        remain pending until its TCP gate is reached.  The helper validates the
+        final placement pose before the gripper release stage.
+        """
+
+        if len(approach_xyz) != 3 or len(fixed_place_xyz) != 3:
+            raise ValueError("safe-height and placement XYZ targets must contain 3 values")
+
+        lead_m = float(self.get_parameter("post_scan_place_queue_lead_m").value)
+        if not math.isfinite(lead_m):
+            raise RuntimeError(
+                "post_scan_place_queue_lead_m must be finite, "
+                f"got {lead_m!r}"
+            )
+        lead_m = max(0.0, lead_m)
+        cp = max(
+            1,
+            min(
+                100,
+                int(
+                    round(
+                        float(
+                            self.get_parameter("post_scan_place_blend_cp").value
+                        )
+                    )
+                ),
+            ),
+        )
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+
+        # The scanner-retreat command does not change orientation, so the
+        # measured post-retreat pose is a stable reference for both targets.
+        start_pose = self._current_command_pose()
+        approach_pose = self._compose_user_target_pose(
+            start_pose,
+            approach_xyz,
+            ry_delta_deg=float(self.get_parameter("face_up_user_ry_deg").value),
+            rz_delta_deg=float(self.get_parameter("post_scan_user_rz_deg").value),
+        )
+        place_pose = self._compose_user_target_pose(
+            approach_pose,
+            fixed_place_xyz,
+            ry_delta_deg=0.0,
+            rz_delta_deg=0.0,
+            rx_delta_deg=side_rx_delta_deg,
+        )
+
+        current_joint = self.controller.current_joint()
+        safe_joint = self.controller.inverse_kinematics(
+            approach_pose,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=current_joint,
+        )
+        self.controller.inverse_kinematics(
+            place_pose,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=safe_joint,
+        )
+        self._require_cycle_active("before post-scan safe-height motion")
+
+        combined_speed = motion["post_scan_speed"]
+        combined_acc = motion["post_scan_acc"]
+        self._publish_status(
+            "moving to post-scan safe height; fixed placement will be queued "
+            f"near the endpoint (lead {lead_m * 1000.0:.1f}mm, CP={cp})"
+        )
+        safe_command = self.controller.submit_move_joint_tcp(
+            approach_pose,
+            speed=combined_speed,
+            accel=combined_acc,
+            cp=cp,
+            user_index=user_index,
+            tool_index=tool_index,
+        )
+
+        command_start_grace_s = max(
+            0.05,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "post_scan_place_command_start_grace_s"
+                    ).value
+                ),
+            ),
+        )
+        command_submitted_at = time.monotonic()
+        queue_timeout_s = max(
+            0.2,
+            float(self.get_parameter("jog_axis_timeout_s").value),
+        )
+        gate_deadline = time.monotonic() + queue_timeout_s
+        while True:
+            self._require_cycle_active("while waiting to queue fixed placement")
+            try:
+                current_pose = self._current_command_pose()
+            except Exception as exc:
+                if time.monotonic() >= gate_deadline:
+                    self._stop_active_motion_for_queue_failure(
+                        "safe-height gate feedback timeout"
+                    )
+                    raise RuntimeError(
+                        "Could not observe TCP pose while waiting to queue fixed placement: "
+                        f"{exc}"
+                    ) from exc
+                time.sleep(LOOKAHEAD_GATE_POLL_S)
+                continue
+
+            distance_to_safe_m = float(
+                np.linalg.norm(
+                    np.array(
+                        [
+                            current_pose.x - approach_pose.x,
+                            current_pose.y - approach_pose.y,
+                            current_pose.z - approach_pose.z,
+                        ],
+                        dtype=np.float64,
+                    )
+                )
+            )
+            active = self.controller.motion_command_is_active(safe_command)
+            # CurrentCommandId remains on the preceding scanner-retreat
+            # command until that command reaches its endpoint.  When the safe
+            # PTP was deliberately submitted behind that known predecessor,
+            # ``motion_command_is_active(safe_command)`` is therefore false
+            # even though the command is valid and waiting in the firmware
+            # queue.  Keep polling the measured TCP gate in that narrow case.
+            pending = False
+            if allow_pending_queue and not active:
+                try:
+                    pending = self.controller.robot_mode in (7, 8)
+                except Exception:
+                    pending = False
+            if distance_to_safe_m <= lead_m:
+                if active or pending:
+                    break
+                if time.monotonic() - command_submitted_at < command_start_grace_s:
+                    time.sleep(LOOKAHEAD_GATE_POLL_S)
+                    continue
+                self.controller.wait_for_command(safe_command, timeout_s=5.0)
+                self._publish_status(
+                    "post-scan safe-height PTP completed before the queue gate; "
+                    "using the blocking placement path"
+                )
+                return False
+            if not active and pending:
+                if time.monotonic() >= gate_deadline:
+                    self._stop_active_motion_for_queue_failure(
+                        "safe-height pending queue gate timeout"
+                    )
+                    raise TimeoutError(
+                        "Timed out waiting for the queued post-scan safe-height "
+                        "motion to reach its placement gate: "
+                        f"distance={distance_to_safe_m * 1000.0:.1f}mm, "
+                        f"gate={lead_m * 1000.0:.1f}mm"
+                    )
+                time.sleep(LOOKAHEAD_GATE_POLL_S)
+                continue
+            if not active:
+                if time.monotonic() - command_submitted_at < command_start_grace_s:
+                    time.sleep(LOOKAHEAD_GATE_POLL_S)
+                    continue
+                self.controller.wait_for_command(safe_command, timeout_s=5.0)
+                self._publish_status(
+                    "post-scan safe-height PTP completed before the queue gate; "
+                    "using the blocking placement path"
+                )
+                return False
+            if time.monotonic() >= gate_deadline:
+                self._stop_active_motion_for_queue_failure(
+                    "safe-height placement queue gate timeout"
+                )
+                raise TimeoutError(
+                    "Timed out waiting to queue fixed placement: "
+                    f"distance={distance_to_safe_m * 1000.0:.1f}mm, "
+                    f"gate={lead_m * 1000.0:.1f}mm"
+                )
+            time.sleep(LOOKAHEAD_GATE_POLL_S)
+
+        self._require_cycle_active("at post-scan safe-height queue gate")
+        self._publish_status("queueing fixed placement PTP before safe-height endpoint")
+        try:
+            place_command = self.controller.submit_move_joint_tcp(
+                place_pose,
+                speed=combined_speed,
+                accel=combined_acc,
+                cp=cp,
+                user_index=user_index,
+                tool_index=tool_index,
+            )
+        except Exception as exc:
+            if self.controller.motion_command_is_active(safe_command):
+                self.get_logger().warning(
+                    "Controller rejected the safe-height/fixed-placement queue while "
+                    f"the safe-height move was active; completing it then falling back: {exc}"
+                )
+                self.controller.wait_for_command(safe_command, timeout_s=5.0)
+                return False
+            raise
+
+        try:
+            self.controller.wait_for_command(place_command, timeout_s=60.0)
+        except Exception:
+            self._stop_active_motion_for_queue_failure("queued fixed placement wait")
+            raise
+        self._require_cycle_active("after blended safe-height and fixed placement")
+
+        final = self._current_command_pose()
+        tolerance = max(0.0005, float(self.get_parameter("jog_tolerance_m").value))
+        position_errors = [
+            abs(final.x - place_pose.x),
+            abs(final.y - place_pose.y),
+            abs(final.z - place_pose.z),
+        ]
+        if max(position_errors) > tolerance * 1.5:
+            raise RuntimeError(
+                "Blended fixed-placement final XYZ error too large: "
+                f"{[round(error, 4) for error in position_errors]}m"
+            )
+        final_rotation = SciPyRot.from_euler(
+            "xyz", [final.rx, final.ry, final.rz], degrees=True
+        )
+        target_rotation = SciPyRot.from_euler(
+            "xyz", [place_pose.rx, place_pose.ry, place_pose.rz], degrees=True
+        )
+        orientation_error_deg = math.degrees(
+            SciPyRot.from_matrix(
+                final_rotation.as_matrix() @ target_rotation.as_matrix().T
+            ).magnitude()
+        )
+        orientation_tolerance_deg = max(
+            1.0,
+            float(self.get_parameter("face_up_jog_tolerance_deg").value),
+        )
+        if orientation_error_deg > orientation_tolerance_deg:
+            raise RuntimeError(
+                "Blended fixed-placement final orientation error too large: "
+                f"{orientation_error_deg:.2f}deg > {orientation_tolerance_deg:.2f}deg"
+            )
+        self._publish_status(
+            "blended post-scan safe-height and fixed-placement pose reached: "
+            f"XYZ=({final.x * 1000.0:.1f},{final.y * 1000.0:.1f},"
+            f"{final.z * 1000.0:.1f})mm"
+        )
+        return True
+
     def _move_box_to_scanner(self, length_m: float) -> float:
         """按盒子长边自适应靠近扫码器，同时保持指定的侧面间隙。
 
@@ -4364,15 +5338,295 @@ class CosmeticBoxSingleArmNode(Node):
         actual_x_m = max(0.0, float(final_pose.x) - start_x)
         return actual_x_m, barcode_seen
 
+    def _scanner_retreat_distance(self, actual_approach_m: float) -> float:
+        """Return the User-X distance required to clear the scanner."""
+
+        extra_retreat_m = float(self.get_parameter("scanner_retreat_extra_m").value)
+        if not math.isfinite(extra_retreat_m) or extra_retreat_m < 0.0 or extra_retreat_m > 0.200:
+            raise RuntimeError(
+                f"scanner_retreat_extra_m must be finite and in [0, 0.200]m, "
+                f"got {extra_retreat_m:.4f}m"
+            )
+        actual_approach_m = float(actual_approach_m)
+        if not math.isfinite(actual_approach_m):
+            raise RuntimeError(
+                f"actual scanner approach must be finite, got {actual_approach_m!r}"
+            )
+        return abs(actual_approach_m) + extra_retreat_m
+
+    def _validate_scanner_retreat_displacement(
+        self,
+        tcp_before: TcpPose,
+        tcp_after: TcpPose,
+        retreat_m: float,
+    ) -> float:
+        """Verify that the commanded User-X safety retreat was reached."""
+
+        actual_retreat_m = float(tcp_after.x) - float(tcp_before.x)
+        expected_retreat_m = -float(retreat_m)
+        tolerance_m = max(
+            0.001,
+            float(self.get_parameter("jog_tolerance_m").value) * 1.5,
+        )
+        if abs(actual_retreat_m - expected_retreat_m) > tolerance_m:
+            raise RuntimeError(
+                f"Scanner safety retreat X displacement mismatch: "
+                f"requested={expected_retreat_m * 1000.0:.1f}mm, "
+                f"actual={actual_retreat_m * 1000.0:.1f}mm; combined motion refused"
+            )
+        return actual_retreat_m
+
+    def _execute_scanner_retreat_post_scan_blend(
+        self,
+        actual_approach_m: float,
+        approach_xyz: list[float],
+        fixed_place_xyz: list[float],
+        side_rx_delta_deg: float,
+        motion: dict[str, int],
+    ) -> bool:
+        """Blend scanner clearance into the post-scan safe-height/place path.
+
+        The scanner retreat is a straight User-X move with a known extra
+        clearance.  Near its endpoint, queue the already IK-checked safe-height
+        PTP; the existing helper then queues fixed placement near the next
+        endpoint.  If the firmware does not accept a command while the retreat
+        is active, wait for and validate the retreat and run the ordinary
+        post-scan helper.
+        """
+
+        retreat_m = self._scanner_retreat_distance(actual_approach_m)
+        if retreat_m <= 0.0005:
+            self._publish_status(
+                "scanner safety retreat not required; no X+ approach was made"
+            )
+            return self._execute_post_scan_safe_place_blend(
+                approach_xyz,
+                fixed_place_xyz,
+                side_rx_delta_deg,
+                motion,
+            )
+
+        required_methods = (
+            "submit_rel_move_user_joint",
+            "motion_command_is_active",
+            "wait_for_command",
+        )
+        if not all(hasattr(self.controller, method) for method in required_methods):
+            self._publish_status(
+                "scanner-retreat look-ahead unavailable; using blocking scanner retreat"
+            )
+            self._retreat_box_from_scanner(actual_approach_m)
+            return self._execute_post_scan_safe_place_blend(
+                approach_xyz,
+                fixed_place_xyz,
+                side_rx_delta_deg,
+                motion,
+            )
+
+        lead_m = float(
+            self.get_parameter("scanner_retreat_post_scan_queue_lead_m").value
+        )
+        if not math.isfinite(lead_m):
+            raise RuntimeError(
+                "scanner_retreat_post_scan_queue_lead_m must be finite, "
+                f"got {lead_m!r}"
+            )
+        # Keep a small amount of actual retreat progress before allowing the
+        # next PTP to be queued.  The default 10 mm lead still leaves 20 mm of
+        # the default extra scanner clearance before any large rotation path.
+        lead_m = min(
+            max(0.0, lead_m),
+            max(0.0, retreat_m - 0.005),
+        )
+        cp = max(
+            1,
+            min(
+                100,
+                int(
+                    round(
+                        float(
+                            self.get_parameter(
+                                "scanner_retreat_post_scan_blend_cp"
+                            ).value
+                        )
+                    )
+                ),
+            ),
+        )
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        retreat_speed = self._motion_profile()["scanner_retreat_speed"]
+        retreat_acc = self._motion_profile()["scanner_retreat_acc"]
+        tcp_before = self._current_command_pose()
+        start_x = float(tcp_before.x)
+
+        self._require_cycle_active("before scanner-retreat look-ahead")
+        self._publish_status(
+            "scanner safety retreat User X-; post-scan safe height will be queued "
+            f"near the endpoint (lead {lead_m * 1000.0:.1f}mm, CP={cp})"
+        )
+        try:
+            retreat_command = self.controller.submit_rel_move_user_joint(
+                TcpPose(-retreat_m, 0.0, 0.0, 0.0, 0.0, 0.0),
+                speed=retreat_speed,
+                accel=retreat_acc,
+                cp=cp,
+                user_index=user_index,
+                tool_index=tool_index,
+            )
+        except Exception as exc:
+            self.get_logger().warning(
+                "Controller rejected scanner-retreat look-ahead submission; "
+                f"using blocking retreat: {exc}"
+            )
+            self._retreat_box_from_scanner(actual_approach_m)
+            return self._execute_post_scan_safe_place_blend(
+                approach_xyz,
+                fixed_place_xyz,
+                side_rx_delta_deg,
+                motion,
+            )
+
+        command_start_grace_s = max(
+            0.05,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "scanner_retreat_post_scan_command_start_grace_s"
+                    ).value
+                ),
+            ),
+        )
+        command_submitted_at = time.monotonic()
+        queue_timeout_s = max(
+            0.2,
+            float(self.get_parameter("jog_axis_timeout_s").value),
+        )
+        gate_deadline = time.monotonic() + queue_timeout_s
+
+        while True:
+            self._require_cycle_active("while waiting to queue post-scan motion")
+            try:
+                current_pose = self._current_command_pose()
+            except Exception as exc:
+                if time.monotonic() >= gate_deadline:
+                    self._stop_active_motion_for_queue_failure(
+                        "scanner-retreat gate feedback timeout"
+                    )
+                    raise RuntimeError(
+                        "Could not observe TCP pose while waiting to queue post-scan "
+                        f"motion: {exc}"
+                    ) from exc
+                time.sleep(LOOKAHEAD_GATE_POLL_S)
+                continue
+
+            progress_m = start_x - float(current_pose.x)
+            remaining_m = retreat_m - progress_m
+            active = self.controller.motion_command_is_active(retreat_command)
+            if remaining_m <= lead_m and progress_m >= 0.0:
+                if active:
+                    break
+                if time.monotonic() - command_submitted_at < command_start_grace_s:
+                    time.sleep(LOOKAHEAD_GATE_POLL_S)
+                    continue
+                self.controller.wait_for_command(retreat_command, timeout_s=5.0)
+                tcp_after = self._current_command_pose()
+                actual_retreat = self._validate_scanner_retreat_displacement(
+                    tcp_before,
+                    tcp_after,
+                    retreat_m,
+                )
+                self._publish_status(
+                    "scanner retreat reached its endpoint before post-scan queue; "
+                    f"User X moved {actual_retreat * 1000.0:.1f}mm; using blocking post-scan path"
+                )
+                return self._execute_post_scan_safe_place_blend(
+                    approach_xyz,
+                    fixed_place_xyz,
+                    side_rx_delta_deg,
+                    motion,
+                )
+            if not active:
+                if time.monotonic() - command_submitted_at < command_start_grace_s:
+                    time.sleep(LOOKAHEAD_GATE_POLL_S)
+                    continue
+                self.controller.wait_for_command(retreat_command, timeout_s=5.0)
+                tcp_after = self._current_command_pose()
+                actual_retreat = self._validate_scanner_retreat_displacement(
+                    tcp_before,
+                    tcp_after,
+                    retreat_m,
+                )
+                self._publish_status(
+                    "scanner retreat completed before the post-scan queue gate; "
+                    f"User X moved {actual_retreat * 1000.0:.1f}mm; using blocking post-scan path"
+                )
+                return self._execute_post_scan_safe_place_blend(
+                    approach_xyz,
+                    fixed_place_xyz,
+                    side_rx_delta_deg,
+                    motion,
+                )
+            if time.monotonic() >= gate_deadline:
+                self._stop_active_motion_for_queue_failure(
+                    "scanner-retreat post-scan queue gate timeout"
+                )
+                raise TimeoutError(
+                    "Timed out waiting to queue post-scan motion after scanner retreat: "
+                    f"remaining={remaining_m * 1000.0:.1f}mm, "
+                    f"gate={lead_m * 1000.0:.1f}mm"
+                )
+            time.sleep(LOOKAHEAD_GATE_POLL_S)
+
+        self._require_cycle_active("at scanner-retreat post-scan queue gate")
+        self._publish_status(
+            "queueing post-scan safe-height PTP before scanner-retreat endpoint"
+        )
+        try:
+            post_scan_completed = self._execute_post_scan_safe_place_blend(
+                approach_xyz,
+                fixed_place_xyz,
+                side_rx_delta_deg,
+                motion,
+                allow_pending_queue=True,
+            )
+        except Exception as exc:
+            # If the first queued PTP was rejected while the straight retreat
+            # is still active, finish and validate that retreat, then retry the
+            # post-scan helper through its normal blocking/CP path.
+            if self.controller.motion_command_is_active(retreat_command):
+                self.get_logger().warning(
+                    "Controller rejected the scanner-retreat/post-scan queue while "
+                    f"retreat was active; completing retreat then falling back: {exc}"
+                )
+                self.controller.wait_for_command(retreat_command, timeout_s=5.0)
+                tcp_after = self._current_command_pose()
+                self._validate_scanner_retreat_displacement(
+                    tcp_before,
+                    tcp_after,
+                    retreat_m,
+                )
+                return self._execute_post_scan_safe_place_blend(
+                    approach_xyz,
+                    fixed_place_xyz,
+                    side_rx_delta_deg,
+                    motion,
+                )
+            raise
+
+        # A CP queue normally makes the retreat command terminal as the safe
+        # PTP starts.  If the firmware reports it as still active after the
+        # post-scan helper returns, wait for that command before releasing the
+        # gripper or entering any recovery path.
+        if self.controller.motion_command_is_active(retreat_command):
+            self.controller.wait_for_command(retreat_command, timeout_s=5.0)
+        return post_scan_completed
+
     def _retreat_box_from_scanner(self, actual_approach_m: float) -> None:
         """扫码后保持姿态沿 User X- 退回，给后续旋转留出安全空间。"""
         extra_retreat_m = float(self.get_parameter("scanner_retreat_extra_m").value)
-        if extra_retreat_m < 0.0 or extra_retreat_m > 0.200:
-            raise RuntimeError(
-                f"scanner_retreat_extra_m must be in [0, 0.200]m, "
-                f"got {extra_retreat_m:.4f}m"
-            )
-        retreat_m = abs(float(actual_approach_m)) + extra_retreat_m
+        retreat_m = self._scanner_retreat_distance(actual_approach_m)
         if retreat_m <= 0.0005:
             self._publish_status("scanner safety retreat not required; no X+ approach was made")
             return
@@ -4393,18 +5647,11 @@ class CosmeticBoxSingleArmNode(Node):
         )
         self._require_cycle_active("during scanner safety retreat")
         tcp_after = self._current_command_pose()
-        actual_retreat_m = tcp_after.x - tcp_before.x
-        expected_retreat_m = -retreat_m
-        tolerance_m = max(
-            0.001,
-            float(self.get_parameter("jog_tolerance_m").value) * 1.5,
+        actual_retreat_m = self._validate_scanner_retreat_displacement(
+            tcp_before,
+            tcp_after,
+            retreat_m,
         )
-        if abs(actual_retreat_m - expected_retreat_m) > tolerance_m:
-            raise RuntimeError(
-                f"Scanner safety retreat X displacement mismatch: "
-                f"requested={expected_retreat_m*1000:.1f}mm, "
-                f"actual={actual_retreat_m*1000:.1f}mm; combined motion refused"
-            )
         self._publish_status(
             f"scanner safety retreat completed: User X moved "
             f"{actual_retreat_m*1000:.1f}mm; combined motion is now permitted"
@@ -4928,25 +6175,18 @@ class CosmeticBoxSingleArmNode(Node):
             with self.barcode_lock:
                 self.barcode_window_active = False
 
-    def _move_to_user_xyz_with_rotation(
+    def _compose_user_target_pose(
         self,
+        current: TcpPose,
         target_xyz: list[float],
         ry_delta_deg: float,
         rz_delta_deg: float,
         rx_delta_deg: float = 0.0,
-        linear_tcp: bool = False,
-    ) -> None:
-        """用一条 User/Tool PTP 同时完成 XYZ、User Ry/Rz/Rx 变化。
+    ) -> TcpPose:
+        """Compose a User-axis rotation with a measured TCP pose."""
 
-        姿态组合顺序严格按现场要求：先绕固定 User Y 轴旋转 ``Ry``，再绕
-        固定 User Z 轴旋转 ``Rz``，最后绕固定 User X 轴旋转 ``Rx``。
-        因此最终矩阵为 ``Rx @ Rz @ Ry @ R_start``。
-        """
         if len(target_xyz) != 3:
-            raise ValueError("scan_exit_user_xyz must contain 3 values")
-        user_index = int(self.get_parameter("user_index").value)
-        tool_index = int(self.get_parameter("command_tool_index").value)
-        current = self._current_command_pose()
+            raise ValueError("target XYZ must contain 3 values")
         start_rotation = SciPyRot.from_euler(
             "xyz",
             [current.rx, current.ry, current.rz],
@@ -4970,7 +6210,7 @@ class CosmeticBoxSingleArmNode(Node):
         target_rx, target_ry, target_rz = SciPyRot.from_matrix(
             target_rotation
         ).as_euler("xyz", degrees=True)
-        target = TcpPose(
+        return TcpPose(
             float(target_xyz[0]),
             float(target_xyz[1]),
             float(target_xyz[2]),
@@ -4978,6 +6218,36 @@ class CosmeticBoxSingleArmNode(Node):
             float(target_ry),
             float(target_rz),
         )
+
+    def _move_to_user_xyz_with_rotation(
+        self,
+        target_xyz: list[float],
+        ry_delta_deg: float,
+        rz_delta_deg: float,
+        rx_delta_deg: float = 0.0,
+        linear_tcp: bool = False,
+    ) -> None:
+        """用一条 User/Tool PTP 同时完成 XYZ、User Ry/Rz/Rx 变化。
+
+        姿态组合顺序严格按现场要求：先绕固定 User Y 轴旋转 ``Ry``，再绕
+        固定 User Z 轴旋转 ``Rz``，最后绕固定 User X 轴旋转 ``Rx``。
+        因此最终矩阵为 ``Rx @ Rz @ Ry @ R_start``。
+        """
+        if len(target_xyz) != 3:
+            raise ValueError("scan_exit_user_xyz must contain 3 values")
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        current = self._current_command_pose()
+        target = self._compose_user_target_pose(
+            current,
+            target_xyz,
+            ry_delta_deg=ry_delta_deg,
+            rz_delta_deg=rz_delta_deg,
+            rx_delta_deg=rx_delta_deg,
+        )
+        target_rotation = SciPyRot.from_euler(
+            "xyz", [target.rx, target.ry, target.rz], degrees=True
+        ).as_matrix()
         motion = self._motion_profile()
         combined_speed = motion["post_scan_speed"]
         rotation_text = (
@@ -5358,6 +6628,110 @@ class CosmeticBoxControlWindow(QMainWindow):
         self.joint_acc = QSpinBox(); self.joint_acc.setRange(1, 100); self.joint_acc.setValue(int(self.node.get_parameter("joint_acc").value))
         self.grasp_lift_speed = QSpinBox(); self.grasp_lift_speed.setRange(1, 100); self.grasp_lift_speed.setValue(int(self.node.get_parameter("grasp_lift_speed_factor").value))
         self.grasp_lift_acc = QSpinBox(); self.grasp_lift_acc.setRange(1, 100); self.grasp_lift_acc.setValue(int(self.node.get_parameter("grasp_lift_acc_factor").value))
+        self.grasp_lift_transfer_blend = QCheckBox(
+            "抬升接近终点时连续衔接中转位（CP）"
+        )
+        self.grasp_lift_transfer_blend.setChecked(
+            bool(self.node.get_parameter("grasp_lift_transfer_blend_enabled").value)
+        )
+        self.grasp_lift_transfer_cp = QSpinBox()
+        self.grasp_lift_transfer_cp.setRange(1, 100)
+        self.grasp_lift_transfer_cp.setValue(
+            int(self.node.get_parameter("grasp_lift_transfer_blend_cp").value)
+        )
+        self.grasp_lift_transfer_queue_lead = self._new_double(
+            float(
+                self.node.get_parameter("grasp_lift_transfer_queue_lead_m").value
+            )
+            * 1000.0,
+            0.0,
+            50.0,
+            1,
+            1.0,
+        )
+        self.post_scan_place_blend = QCheckBox(
+            "扫码后安全高度连续衔接固定放置位（CP）"
+        )
+        self.post_scan_place_blend.setChecked(
+            bool(self.node.get_parameter("post_scan_place_blend_enabled").value)
+        )
+        self.post_scan_place_cp = QSpinBox()
+        self.post_scan_place_cp.setRange(1, 100)
+        self.post_scan_place_cp.setValue(
+            int(self.node.get_parameter("post_scan_place_blend_cp").value)
+        )
+        self.post_scan_place_queue_lead = self._new_double(
+            float(
+                self.node.get_parameter("post_scan_place_queue_lead_m").value
+            )
+            * 1000.0,
+            0.0,
+            100.0,
+            1,
+            1.0,
+        )
+        self.scanner_retreat_post_scan_blend = QCheckBox(
+            "扫码退让连续衔接扫码后移动（CP）"
+        )
+        self.scanner_retreat_post_scan_blend.setChecked(
+            bool(
+                self.node.get_parameter(
+                    "scanner_retreat_post_scan_blend_enabled"
+                ).value
+            )
+        )
+        self.scanner_retreat_post_scan_cp = QSpinBox()
+        self.scanner_retreat_post_scan_cp.setRange(1, 100)
+        self.scanner_retreat_post_scan_cp.setValue(
+            int(
+                self.node.get_parameter(
+                    "scanner_retreat_post_scan_blend_cp"
+                ).value
+            )
+        )
+        self.scanner_retreat_post_scan_queue_lead = self._new_double(
+            float(
+                self.node.get_parameter(
+                    "scanner_retreat_post_scan_queue_lead_m"
+                ).value
+            )
+            * 1000.0,
+            0.0,
+            100.0,
+            1,
+            1.0,
+        )
+        self.offset_high_descent_blend = QCheckBox(
+            "偏置高位连续衔接下降（CP）"
+        )
+        self.offset_high_descent_blend.setChecked(
+            bool(
+                self.node.get_parameter(
+                    "offset_high_descent_blend_enabled"
+                ).value
+            )
+        )
+        self.offset_high_descent_cp = QSpinBox()
+        self.offset_high_descent_cp.setRange(1, 100)
+        self.offset_high_descent_cp.setValue(
+            int(
+                self.node.get_parameter(
+                    "offset_high_descent_blend_cp"
+                ).value
+            )
+        )
+        self.offset_high_descent_queue_lead = self._new_double(
+            float(
+                self.node.get_parameter(
+                    "offset_high_descent_queue_lead_m"
+                ).value
+            )
+            * 1000.0,
+            0.0,
+            100.0,
+            1,
+            1.0,
+        )
         self.transfer_speed = QSpinBox(); self.transfer_speed.setRange(1, 100); self.transfer_speed.setValue(int(self.node.get_parameter("transfer_speed_factor").value))
         self.transfer_acc = QSpinBox(); self.transfer_acc.setRange(1, 100); self.transfer_acc.setValue(int(self.node.get_parameter("transfer_acc_factor").value))
         self.post_scan_acc = QSpinBox(); self.post_scan_acc.setRange(1, 100); self.post_scan_acc.setValue(int(self.node.get_parameter("post_scan_acc_factor").value))
@@ -5405,6 +6779,27 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("关节加速度兼容基准 %", self.joint_acc)
         form.addRow("抓取后抬升速度兼容基准 %", self.grasp_lift_speed)
         form.addRow("抓取后抬升加速度兼容基准 %", self.grasp_lift_acc)
+        form.addRow("抬升→中转连续队列", self.grasp_lift_transfer_blend)
+        form.addRow("抬升→中转 CP 平滑比例 %", self.grasp_lift_transfer_cp)
+        form.addRow("抬升终点前排队距离 mm", self.grasp_lift_transfer_queue_lead)
+        form.addRow("安全高度→固定放置连续队列", self.post_scan_place_blend)
+        form.addRow("安全高度→固定放置 CP 平滑比例 %", self.post_scan_place_cp)
+        form.addRow("安全高度终点前排队距离 mm", self.post_scan_place_queue_lead)
+        form.addRow(
+            "扫码退让→扫码后移动连续队列",
+            self.scanner_retreat_post_scan_blend,
+        )
+        form.addRow(
+            "扫码退让→扫码后移动 CP 平滑比例 %",
+            self.scanner_retreat_post_scan_cp,
+        )
+        form.addRow(
+            "扫码退让终点前排队距离 mm",
+            self.scanner_retreat_post_scan_queue_lead,
+        )
+        form.addRow("偏置高位→下降连续队列", self.offset_high_descent_blend)
+        form.addRow("偏置高位→下降 CP 平滑比例 %", self.offset_high_descent_cp)
+        form.addRow("偏置高位终点前排队距离 mm", self.offset_high_descent_queue_lead)
         form.addRow("抓取后中转位速度兼容基准 %", self.transfer_speed)
         form.addRow("抓取后中转位加速度兼容基准 %", self.transfer_acc)
         form.addRow("直线速度兼容基准 %", self.linear_speed)
@@ -5620,6 +7015,54 @@ class CosmeticBoxControlWindow(QMainWindow):
             Parameter("joint_acc", value=self.joint_acc.value()),
             Parameter("grasp_lift_speed_factor", value=self.grasp_lift_speed.value()),
             Parameter("grasp_lift_acc_factor", value=self.grasp_lift_acc.value()),
+            Parameter(
+                "grasp_lift_transfer_blend_enabled",
+                value=self.grasp_lift_transfer_blend.isChecked(),
+            ),
+            Parameter(
+                "grasp_lift_transfer_blend_cp",
+                value=self.grasp_lift_transfer_cp.value(),
+            ),
+            Parameter(
+                "grasp_lift_transfer_queue_lead_m",
+                value=self.grasp_lift_transfer_queue_lead.value() / 1000.0,
+            ),
+            Parameter(
+                "post_scan_place_blend_enabled",
+                value=self.post_scan_place_blend.isChecked(),
+            ),
+            Parameter(
+                "post_scan_place_blend_cp",
+                value=self.post_scan_place_cp.value(),
+            ),
+            Parameter(
+                "post_scan_place_queue_lead_m",
+                value=self.post_scan_place_queue_lead.value() / 1000.0,
+            ),
+            Parameter(
+                "scanner_retreat_post_scan_blend_enabled",
+                value=self.scanner_retreat_post_scan_blend.isChecked(),
+            ),
+            Parameter(
+                "scanner_retreat_post_scan_blend_cp",
+                value=self.scanner_retreat_post_scan_cp.value(),
+            ),
+            Parameter(
+                "scanner_retreat_post_scan_queue_lead_m",
+                value=self.scanner_retreat_post_scan_queue_lead.value() / 1000.0,
+            ),
+            Parameter(
+                "offset_high_descent_blend_enabled",
+                value=self.offset_high_descent_blend.isChecked(),
+            ),
+            Parameter(
+                "offset_high_descent_blend_cp",
+                value=self.offset_high_descent_cp.value(),
+            ),
+            Parameter(
+                "offset_high_descent_queue_lead_m",
+                value=self.offset_high_descent_queue_lead.value() / 1000.0,
+            ),
             Parameter("transfer_speed_factor", value=self.transfer_speed.value()),
             Parameter("transfer_acc_factor", value=self.transfer_acc.value()),
             Parameter("linear_speed", value=self.linear_speed.value()),

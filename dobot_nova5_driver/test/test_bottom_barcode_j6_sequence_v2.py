@@ -126,10 +126,8 @@ def test_failed_270_sweep_returns_90_then_reverses_remaining_180():
 def test_pre_return_is_before_scanner_retreat_in_cycle():
     source = SOURCE.read_text()
     start = source.index('with self._timed_stage("barcode_acquisition")')
-    end = source.index('if bottom_recovery:', source.index('"scanner_retreat"', start))
-    section = source[start:end]
-    assert section.index('"bottom_flip_j6_pre_return"') < section.index(
-        '"scanner_retreat"'
+    assert source.index('"bottom_flip_j6_pre_return"', start) < source.index(
+        '"scanner_retreat"', start
     )
 
 
@@ -200,7 +198,7 @@ def test_bottom_fixed_place_applies_additional_user_ry_rotation():
 
 def test_side_barcode_path_combines_safe_fixed_place_and_rx_tilt():
     source = SOURCE.read_text()
-    start = source.index('with self._timed_stage("post_scan_safe_height_ptp")')
+    start = source.index('approach_xyz = [')
     end = source.index('with self._timed_stage("placement_grasp_check")', start)
     section = source[start:end]
     assert 'get_parameter("side_barcode_place_rx_delta_deg")' in section

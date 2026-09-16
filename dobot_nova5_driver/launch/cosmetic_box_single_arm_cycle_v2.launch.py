@@ -40,10 +40,82 @@ def generate_launch_description() -> LaunchDescription:
                     "starting the monitored scanner approach"
                 ),
             ),
+            DeclareLaunchArgument(
+                "scanner_retreat_post_scan_blend_enabled",
+                default_value="true",
+                description=(
+                    "Queue the post-scan safe-height motion before the scanner "
+                    "retreat reaches its endpoint"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "scanner_retreat_post_scan_blend_cp",
+                default_value="20",
+                description="Dobot CP blending ratio for scanner retreat to post-scan motion",
+            ),
+            DeclareLaunchArgument(
+                "scanner_retreat_post_scan_queue_lead_m",
+                default_value="0.010",
+                description=(
+                    "Distance before scanner-retreat endpoint at which post-scan "
+                    "motion is queued (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "scanner_retreat_post_scan_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Grace period for first feedback after scanner-retreat queue "
+                    "submission (s)"
+                ),
+            ),
             DeclareLaunchArgument("offset_grasp_enabled", default_value="true",
                                   description="Reach offset-high while aligning grasp attitude, then descend and insert"),
             DeclareLaunchArgument("offset_grasp_clearance_m", default_value="0.020"),
             DeclareLaunchArgument("offset_finger_span_m", default_value="0.060"),
+            DeclareLaunchArgument(
+                "offset_high_clearance_m",
+                default_value="0.120",
+                description=(
+                    "Offset-high clearance above grasp depth; lateral motion, "
+                    "orientation alignment and partial descent share one PTP"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "offset_high_descent_blend_enabled",
+                default_value="true",
+                description=(
+                    "Queue the vertical offset descent before offset-high stops "
+                    "so the two approach segments are CP blended"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "offset_high_descent_blend_cp",
+                default_value="20",
+                description="Dobot CP blending ratio for offset-high to descent",
+            ),
+            DeclareLaunchArgument(
+                "offset_high_descent_queue_lead_m",
+                default_value="0.030",
+                description=(
+                    "Distance before offset-high at which the descent is queued (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "offset_high_descent_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Grace period for first feedback after offset-high submission (s)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "startup_joint_skip_tolerance_deg",
+                default_value="1.0",
+                description=(
+                    "Skip a redundant startup MovJ when every joint is already "
+                    "within this feedback tolerance; zero disables the optimization"
+                ),
+            ),
             DeclareLaunchArgument(
                 "top_surface_barcode_enabled",
                 default_value="true",
@@ -59,7 +131,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "top_surface_barcode_wait_s",
-                default_value="0.30",
+                default_value="0.20",
                 description="Maximum hover time to wait for top-surface barcode confirmation",
             ),
             DeclareLaunchArgument(
@@ -142,6 +214,64 @@ def generate_launch_description() -> LaunchDescription:
                 "grasp_lift_acc_factor",
                 default_value="100",
                 description="Effective grasp-lift acceleration percentage",
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_transfer_blend_enabled",
+                default_value="true",
+                description=(
+                    "Queue the transfer joint near the end of the safe grasp lift "
+                    "so the controller can blend the two motions"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_transfer_blend_cp",
+                default_value="20",
+                description="Dobot CP blending ratio for the grasp-lift to transfer transition",
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_transfer_queue_lead_m",
+                default_value="0.010",
+                description=(
+                    "Distance before the lift endpoint at which the transfer "
+                    "joint is queued (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_transfer_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Grace period for first feedback after submitting the lift "
+                    "before falling back to the blocking transfer path (s)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "post_scan_place_blend_enabled",
+                default_value="true",
+                description=(
+                    "Queue the fixed placement PTP near the end of the post-scan "
+                    "safe-height PTP when the side-barcode path is active"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "post_scan_place_blend_cp",
+                default_value="20",
+                description="Dobot CP blending ratio for safe-height to fixed-placement transition",
+            ),
+            DeclareLaunchArgument(
+                "post_scan_place_queue_lead_m",
+                default_value="0.020",
+                description=(
+                    "Distance before the post-scan safe-height endpoint at which "
+                    "fixed placement is queued (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "post_scan_place_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Grace period for first feedback after submitting the safe-height "
+                    "move before falling back to the blocking placement path (s)"
+                ),
             ),
             DeclareLaunchArgument(
                 "joint_acc",
@@ -236,9 +366,53 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration("scanner_transfer_barcode_grace_s"),
                             value_type=float,
                         ),
+                        "scanner_retreat_post_scan_blend_enabled": ParameterValue(
+                            LaunchConfiguration("scanner_retreat_post_scan_blend_enabled"),
+                            value_type=bool,
+                        ),
+                        "scanner_retreat_post_scan_blend_cp": ParameterValue(
+                            LaunchConfiguration("scanner_retreat_post_scan_blend_cp"),
+                            value_type=int,
+                        ),
+                        "scanner_retreat_post_scan_queue_lead_m": ParameterValue(
+                            LaunchConfiguration("scanner_retreat_post_scan_queue_lead_m"),
+                            value_type=float,
+                        ),
+                        "scanner_retreat_post_scan_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration(
+                                "scanner_retreat_post_scan_command_start_grace_s"
+                            ),
+                            value_type=float,
+                        ),
                         "offset_grasp_enabled": ParameterValue(LaunchConfiguration("offset_grasp_enabled"), value_type=bool),
                         "offset_grasp_clearance_m": ParameterValue(LaunchConfiguration("offset_grasp_clearance_m"), value_type=float),
                         "offset_finger_span_m": ParameterValue(LaunchConfiguration("offset_finger_span_m"), value_type=float),
+                        "offset_high_clearance_m": ParameterValue(
+                            LaunchConfiguration("offset_high_clearance_m"),
+                            value_type=float,
+                        ),
+                        "offset_high_descent_blend_enabled": ParameterValue(
+                            LaunchConfiguration("offset_high_descent_blend_enabled"),
+                            value_type=bool,
+                        ),
+                        "offset_high_descent_blend_cp": ParameterValue(
+                            LaunchConfiguration("offset_high_descent_blend_cp"),
+                            value_type=int,
+                        ),
+                        "offset_high_descent_queue_lead_m": ParameterValue(
+                            LaunchConfiguration("offset_high_descent_queue_lead_m"),
+                            value_type=float,
+                        ),
+                        "offset_high_descent_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration(
+                                "offset_high_descent_command_start_grace_s"
+                            ),
+                            value_type=float,
+                        ),
+                        "startup_joint_skip_tolerance_deg": ParameterValue(
+                            LaunchConfiguration("startup_joint_skip_tolerance_deg"),
+                            value_type=float,
+                        ),
                         "top_surface_barcode_enabled": ParameterValue(
                             LaunchConfiguration("top_surface_barcode_enabled"),
                             value_type=bool,
@@ -286,6 +460,38 @@ def generate_launch_description() -> LaunchDescription:
                         "grasp_lift_acc_factor": ParameterValue(
                             LaunchConfiguration("grasp_lift_acc_factor"),
                             value_type=int,
+                        ),
+                        "grasp_lift_transfer_blend_enabled": ParameterValue(
+                            LaunchConfiguration("grasp_lift_transfer_blend_enabled"),
+                            value_type=bool,
+                        ),
+                        "grasp_lift_transfer_blend_cp": ParameterValue(
+                            LaunchConfiguration("grasp_lift_transfer_blend_cp"),
+                            value_type=int,
+                        ),
+                        "grasp_lift_transfer_queue_lead_m": ParameterValue(
+                            LaunchConfiguration("grasp_lift_transfer_queue_lead_m"),
+                            value_type=float,
+                        ),
+                        "grasp_lift_transfer_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration("grasp_lift_transfer_command_start_grace_s"),
+                            value_type=float,
+                        ),
+                        "post_scan_place_blend_enabled": ParameterValue(
+                            LaunchConfiguration("post_scan_place_blend_enabled"),
+                            value_type=bool,
+                        ),
+                        "post_scan_place_blend_cp": ParameterValue(
+                            LaunchConfiguration("post_scan_place_blend_cp"),
+                            value_type=int,
+                        ),
+                        "post_scan_place_queue_lead_m": ParameterValue(
+                            LaunchConfiguration("post_scan_place_queue_lead_m"),
+                            value_type=float,
+                        ),
+                        "post_scan_place_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration("post_scan_place_command_start_grace_s"),
+                            value_type=float,
                         ),
                         "joint_acc": ParameterValue(
                             LaunchConfiguration("joint_acc"),
