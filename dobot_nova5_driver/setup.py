@@ -17,9 +17,16 @@ setup(
                 "launch/nova5_driver.launch.py",
                 "launch/cosmetic_box_single_arm_cycle.launch.py",
                 "launch/cosmetic_box_single_arm_cycle_v2.launch.py",
+                "launch/cosmetic_box_single_arm_cycle_v3.launch.py",
             ],
         ),
-        (f"share/{package_name}", ["README_cosmetic_box_single_arm.md"]),
+        (
+            f"share/{package_name}",
+            [
+                "README_cosmetic_box_single_arm.md",
+                "README_cosmetic_box_turntable_v3.md",
+            ],
+        ),
         (
             f"share/{package_name}/config",
             ["config/70-cosmetic-barcode-scanner.rules"],
@@ -53,6 +60,9 @@ setup(
             "nova5_cosmetic_box_cycle = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle:main",
             "barcode_scanner_node_v2 = dobot_nova5_driver.barcode_scanner_ros_node_v2:main",
             "nova5_cosmetic_box_cycle_v2 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v2:main",
+            "barcode_scanner_node_v3 = dobot_nova5_driver.barcode_scanner_ros_node_v3:main",
+            "d435_turntable_barcode_v3 = dobot_nova5_driver.d435_turntable_barcode_node_v3:main",
+            "nova5_cosmetic_box_cycle_v3 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3:main",
         ],
     },
 )

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Standalone Dobot Nova5 + DH AG-95 control helper.
+"""V3 standalone Dobot Nova5 + DH AG-95 control helper.
 
 This file is intentionally independent from the LeRobot Robot/RobotConfig
 framework. It only uses Dobot's TCP Python SDK in ``TCP_IP_Python_V4/dobot_api.py``.
@@ -236,9 +236,6 @@ class DHGripper:
             state = self.read_init_state()
             if state != INIT_DONE:
                 initialization_seen = True
-            # Some firmware completes before the first poll observes the
-            # transient state.  A short minimum dwell prevents accepting the
-            # stale pre-command INIT_DONE value immediately after the write.
             if state == INIT_DONE and (
                 initialization_seen or time.monotonic() - start >= 0.5
             ):
