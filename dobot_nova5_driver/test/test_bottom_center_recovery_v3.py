@@ -70,6 +70,103 @@ def test_turntable_bottom_branch_routes_before_legacy_close_and_transfer():
     assert actions == ["preshape", "bottom_center_recovery", "removed", "top_place"]
 
 
+def test_preconfirmed_side_barcode_uses_direct_centre_hover_and_vertical_descent():
+    class StopAfterApproach(RuntimeError):
+        pass
+
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    params = {
+        "offset_grasp_enabled": True,
+        "grasp_z_offset_m": 0.0,
+        "grasp_z_offset_limit_m": 0.010,
+        "minimum_safe_tcp_z_m": 0.129,
+        "turntable_enabled": True,
+        "turntable_height_safety_enabled": False,
+        "dh_max_opening_m": 0.095,
+        "dh_timeout_s": 3.0,
+        "dh_grasp_force": 50,
+        "user_index": 0,
+        "command_tool_index": 1,
+        "side_barcode_direct_hover_clearance_m": 0.120,
+        "pregrasp_min_hover_clearance_m": 0.030,
+    }
+    node.get_parameter = lambda name: SimpleNamespace(value=params[name])
+    node._motion_profile = lambda: {
+        "joint_speed": 20,
+        "joint_pose_acc": 20,
+        "linear_speed": 20,
+        "linear_acc": 20,
+    }
+    node._apply_grasp_z_safety = lambda pose, *_args: pose
+    node._publish_status = lambda _message: None
+    node._timed_stage = stage
+    node._require_cycle_active = lambda _label: None
+    node._wait_for_secondary_y_clearance = lambda _label: None
+    node._cycle_cancel_requested = lambda: False
+    node.data_lock = threading.RLock()
+    node.pregrasp_pose_count = 0
+
+    startup = TcpPose(0.40, 0.10, 0.320, 179.0, 0.0, -90.0)
+    target = TcpPose(0.56, -0.15, 0.134, 178.0, 2.0, -4.0)
+    feedback = [startup]
+    motions = []
+
+    def move_joint_tcp(pose, **_kwargs):
+        feedback[0] = pose
+        motions.append(("centre_hover", pose))
+
+    def move_linear_tcp(pose, **_kwargs):
+        feedback[0] = pose
+        motions.append(("vertical_descent", pose))
+
+    node._current_command_pose = lambda: feedback[0]
+    node.controller = SimpleNamespace(
+        inverse_kinematics=lambda *_args, **_kwargs: [0.0] * 6,
+        current_joint=lambda: [0.0] * 6,
+        move_joint_tcp=move_joint_tcp,
+        move_linear_tcp=move_linear_tcp,
+    )
+    node._revalidate_target_at_hover = lambda target_pose, *_args, **_kwargs: target_pose
+    node._execute_offset_entry = lambda *_args, **_kwargs: pytest.fail(
+        "preconfirmed side barcode must not use the offset entry"
+    )
+    node._wait_for_top_surface_barcode = lambda: pytest.fail(
+        "preconfirmed side barcode must not wait for top-surface scanning"
+    )
+    node._current_top_surface_barcode = lambda: pytest.fail(
+        "preconfirmed side barcode must not read a top-surface result"
+    )
+    barcode_windows = []
+    node._set_top_surface_barcode_window = barcode_windows.append
+    node.gripper = SimpleNamespace(
+        read_position=lambda: 0.6,
+        set_position=lambda *_args, **_kwargs: None,
+        wait_until_stopped=lambda **_kwargs: None,
+        set_force=lambda *_args: None,
+        close=lambda **_kwargs: (_ for _ in ()).throw(StopAfterApproach()),
+    )
+
+    with pytest.raises(StopAfterApproach):
+        node._execute_one_cycle(
+            target,
+            width_m=0.055,
+            height_m=0.038,
+            length_m=0.121,
+            turntable_side_barcode="barcode_detected",
+        )
+
+    assert [name for name, _pose in motions] == [
+        "centre_hover",
+        "vertical_descent",
+    ]
+    hover = motions[0][1]
+    assert (hover.x, hover.y, hover.z) == pytest.approx(
+        (target.x, target.y, target.z + 0.120)
+    )
+    assert motions[1][1] == target
+    assert barcode_windows == [False, False]
+
+
 def make_sequence_node(*, initial_j6=0.0, j6_limit=355.0):
     node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
     params = {

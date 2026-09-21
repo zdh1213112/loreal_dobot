@@ -396,6 +396,10 @@ class CosmeticBoxSingleArmNode(Node):
         # grasp depth.  The remaining approach stays vertical and retains the
         # gripper/pregrasp checks at offset-high.
         self.declare_parameter("offset_high_clearance_m", 0.120)
+        # A D435-confirmed side barcode does not need the offset/top-observation
+        # path.  Move diagonally from startup to this height above the D405
+        # grasp target, then use a vertical Cartesian descent.
+        self.declare_parameter("side_barcode_direct_hover_clearance_m", 0.120)
         # The offset-high PTP and the following vertical descent are both
         # known safe once the gripper pre-shape and target identity checks have
         # passed.  Queue the MovL descent before the PTP reaches its endpoint
@@ -4721,6 +4725,14 @@ class CosmeticBoxSingleArmNode(Node):
     ) -> None:
         motion = self._motion_profile()
         offset_grasp_enabled = bool(self.get_parameter("offset_grasp_enabled").value)
+        side_barcode_preconfirmed = bool(str(turntable_side_barcode).strip())
+        # D435 has already classified this material when a side barcode is
+        # present.  In that case D405 is needed only for target localization:
+        # use a centre hover followed by a vertical descent instead of the
+        # offset-high/descent/insert path used for top-surface observation.
+        use_offset_grasp_entry = (
+            offset_grasp_enabled and not side_barcode_preconfirmed
+        )
         z_offset_m = float(self.get_parameter("grasp_z_offset_m").value)
         z_offset_limit_m = abs(float(self.get_parameter("grasp_z_offset_limit_m").value))
         if abs(z_offset_m) > z_offset_limit_m:
@@ -4782,9 +4794,14 @@ class CosmeticBoxSingleArmNode(Node):
             f"box_height={height_m*1000:.1f}mm"
         )
         with self._timed_stage("grasp_prepare"):
-            if offset_grasp_enabled:
+            if use_offset_grasp_entry:
                 self._publish_status(
                     "commanding measured gripper width; pre-shaping during direct offset approach"
+                )
+            elif side_barcode_preconfirmed:
+                self._publish_status(
+                    "D435 side barcode already confirmed; pre-shaping while moving "
+                    "directly above the D405 grasp centre"
                 )
             else:
                 self._publish_status(
@@ -4806,10 +4823,52 @@ class CosmeticBoxSingleArmNode(Node):
                 joint_near=self.controller.current_joint(),
             )
             planar = None
-            if not offset_grasp_enabled:
+            if not use_offset_grasp_entry:
                 current = self._current_command_pose()
+                hover_z = current.z
+                if side_barcode_preconfirmed:
+                    direct_clearance_m = float(
+                        self.get_parameter(
+                            "side_barcode_direct_hover_clearance_m"
+                        ).value
+                    )
+                    minimum_hover_clearance_m = max(
+                        0.005,
+                        float(
+                            self.get_parameter(
+                                "pregrasp_min_hover_clearance_m"
+                            ).value
+                        ),
+                    )
+                    if (
+                        not math.isfinite(direct_clearance_m)
+                        or direct_clearance_m < minimum_hover_clearance_m
+                    ):
+                        raise RuntimeError(
+                            "side_barcode_direct_hover_clearance_m="
+                            f"{direct_clearance_m:.4f}m must be at least "
+                            "pregrasp_min_hover_clearance_m="
+                            f"{minimum_hover_clearance_m:.4f}m"
+                        )
+                    # Do not introduce an upward leg if this branch is entered
+                    # from a TCP already below the configured hover height.
+                    hover_z = min(current.z, target.z + direct_clearance_m)
+                    actual_clearance_m = hover_z - target.z
+                    if actual_clearance_m < minimum_hover_clearance_m:
+                        raise RuntimeError(
+                            "current TCP permits only "
+                            f"{actual_clearance_m*1000.0:.1f}mm clearance above "
+                            "the side-barcode grasp target; at least "
+                            f"{minimum_hover_clearance_m*1000.0:.1f}mm is required"
+                        )
+                    self._publish_status(
+                        "side-barcode direct approach: diagonal PTP from current "
+                        f"pose to target XY at Z={hover_z*1000.0:.1f}mm "
+                        f"({actual_clearance_m*1000.0:.1f}mm above grasp depth), "
+                        "then vertical MovL descent"
+                    )
                 planar = TcpPose(
-                    target.x, target.y, current.z, target.rx, target.ry, target.rz
+                    target.x, target.y, hover_z, target.rx, target.ry, target.rz
                 )
         # The point-cloud handoff check is not enough when 102's TCP is not
         # visible in the D405 cloud.  Check the actual 102 feedback immediately
@@ -4818,17 +4877,17 @@ class CosmeticBoxSingleArmNode(Node):
         # continues without manual intervention.
         with self._timed_stage("secondary_y_clearance"):
             self._wait_for_secondary_y_clearance(
-                "offset-high" if offset_grasp_enabled else "move-above"
+                "offset-high" if use_offset_grasp_entry else "move-above"
             )
         self._require_cycle_active(
             "immediately before offset-high"
-            if offset_grasp_enabled
+            if use_offset_grasp_entry
             else "immediately before move-above"
         )
         # A confirmed D435 side barcode already has priority over the D405
         # top barcode.  Skip the redundant detector and its low-pose wait for
         # this material, while keeping D405 target localization unchanged.
-        observe_top_barcode = not bool(turntable_side_barcode)
+        observe_top_barcode = not side_barcode_preconfirmed
         self._set_top_surface_barcode_window(observe_top_barcode)
         with self.data_lock:
             pregrasp_reference_count = self.pregrasp_pose_count
@@ -4857,7 +4916,7 @@ class CosmeticBoxSingleArmNode(Node):
                     allow_hover_correction=allow_hover_correction,
                 )
 
-        if offset_grasp_enabled:
+        if use_offset_grasp_entry:
             self._publish_status(
                 "moving to offset-high while aligning grasp orientation; "
                 "center translation remains skipped"
@@ -4872,7 +4931,14 @@ class CosmeticBoxSingleArmNode(Node):
                 after_offset_high=validate_at_offset_high,
             )
         else:
-            self._publish_status("moving above selected box")
+            if side_barcode_preconfirmed:
+                self._publish_status(
+                    "D435 side barcode already confirmed; skipping offset-high, "
+                    "offset descent, offset insert and top-surface observation; "
+                    "moving directly above the D405 grasp centre"
+                )
+            else:
+                self._publish_status("moving above selected box")
             with self._timed_stage("move_above"):
                 self.controller.move_joint_tcp(
                     planar,
@@ -4883,10 +4949,16 @@ class CosmeticBoxSingleArmNode(Node):
                 )
             self._require_cycle_active("after move-above")
             target = confirm_preshape_and_revalidate(allow_hover_correction=True)
-            self._publish_status("top-barcode hover observation")
-            with self._timed_stage("top_barcode_hover_observation"):
-                self._wait_for_top_surface_barcode()
-            self._publish_status("descending TCP tip to 75% box height")
+            if observe_top_barcode:
+                self._publish_status("top-barcode hover observation")
+                with self._timed_stage("top_barcode_hover_observation"):
+                    self._wait_for_top_surface_barcode()
+                self._publish_status("descending TCP tip to 75% box height")
+            else:
+                self._publish_status(
+                    "descending vertically to the D405 grasp centre for the "
+                    "preconfirmed side-barcode material"
+                )
             self._require_cycle_active("immediately before grasp descent")
             with self._timed_stage("grasp_descend"):
                 self.controller.move_linear_tcp(

@@ -118,7 +118,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_scan_timeout_s",
-                default_value="1.41",
+                default_value="2.81",
                 description="Fixed D435 side-barcode classification window",
             ),
             DeclareLaunchArgument(
@@ -256,6 +256,14 @@ def generate_launch_description() -> LaunchDescription:
                 description=(
                     "Offset-high clearance above grasp depth; lateral motion, "
                     "orientation alignment and partial descent share one PTP"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "side_barcode_direct_hover_clearance_m",
+                default_value="0.050",
+                description=(
+                    "Clearance above the D405 grasp target for the diagonal "
+                    "side-barcode approach before its vertical descent (m)"
                 ),
             ),
             DeclareLaunchArgument(
@@ -753,6 +761,12 @@ def generate_launch_description() -> LaunchDescription:
                         "offset_finger_span_m": ParameterValue(LaunchConfiguration("offset_finger_span_m"), value_type=float),
                         "offset_high_clearance_m": ParameterValue(
                             LaunchConfiguration("offset_high_clearance_m"),
+                            value_type=float,
+                        ),
+                        "side_barcode_direct_hover_clearance_m": ParameterValue(
+                            LaunchConfiguration(
+                                "side_barcode_direct_hover_clearance_m"
+                            ),
                             value_type=float,
                         ),
                         "offset_high_descent_blend_enabled": ParameterValue(
