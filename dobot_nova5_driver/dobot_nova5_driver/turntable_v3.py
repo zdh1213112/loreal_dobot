@@ -132,46 +132,51 @@ class PlacementRetreatTrigger:
     """Latch one VLA place-and-retreat sequence from passive TCP feedback.
 
     A cycle must first observe the monitored TCP on the turntable side of the
-    User-Y boundary.  It fires only after both User-Y has retreated across the
-    boundary and User-Z is at or above the safe height continuously for the
-    configured dwell.  Starting in the safe region therefore never fires.
+    User-Y boundary.  It fires after User-Y has retreated across that boundary
+    continuously for the configured dwell.  Z is intentionally not part of
+    this passive trigger.  Starting in the safe region therefore never fires.
     """
 
     place_y_m: float
-    safe_z_m: float
     stable_s: float
     place_seen: bool = False
     safe_since_s: float | None = None
+    entry_armed: bool = True
 
     def __post_init__(self) -> None:
-        values = (self.place_y_m, self.safe_z_m, self.stable_s)
+        values = (self.place_y_m, self.stable_s)
         if not all(math.isfinite(float(value)) for value in values):
             raise ValueError("placement-retreat trigger parameters must be finite")
         if self.stable_s < 0.0:
             raise ValueError("placement-retreat stable time must be non-negative")
 
-    def reset(self) -> None:
+    def reset(self, *, require_fresh_entry: bool = False) -> None:
         self.place_seen = False
         self.safe_since_s = None
+        # An explicit operator round reset may happen while 102 is still in
+        # the old placement region.  In that case first observe Y back on the
+        # retreat side, then require a genuinely new entry/retreat sequence.
+        self.entry_armed = not bool(require_fresh_entry)
 
-    def update(self, tcp_y_m: float, tcp_z_m: float, now_s: float) -> bool:
-        values = (tcp_y_m, tcp_z_m, now_s)
+    def update(self, tcp_y_m: float, now_s: float) -> bool:
+        values = (tcp_y_m, now_s)
         if not all(math.isfinite(float(value)) for value in values):
             self.safe_since_s = None
             return False
 
         tcp_y_m = float(tcp_y_m)
-        tcp_z_m = float(tcp_z_m)
         now_s = float(now_s)
+        if not self.entry_armed:
+            if tcp_y_m < float(self.place_y_m):
+                self.entry_armed = True
+            return False
+
         if not self.place_seen:
             if tcp_y_m >= float(self.place_y_m):
                 self.place_seen = True
             return False
 
-        safe_now = (
-            tcp_y_m < float(self.place_y_m)
-            and tcp_z_m >= float(self.safe_z_m)
-        )
+        safe_now = tcp_y_m < float(self.place_y_m)
         if not safe_now:
             self.safe_since_s = None
             return False

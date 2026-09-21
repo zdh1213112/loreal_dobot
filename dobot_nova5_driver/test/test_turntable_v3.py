@@ -23,32 +23,45 @@ from dobot_nova5_driver.turntable_v3 import (
 )
 
 
-def test_placement_retreat_requires_place_y_then_stable_safe_yz():
+def test_placement_retreat_requires_place_y_then_stable_retreat_y():
     trigger = PlacementRetreatTrigger(
         place_y_m=0.400,
-        safe_z_m=0.200,
         stable_s=0.200,
     )
 
-    assert not trigger.update(0.300, 0.250, 0.0)  # Starting safe must not fire.
+    assert not trigger.update(0.300, 0.0)  # Starting safe must not fire.
     assert not trigger.place_seen
-    assert not trigger.update(0.410, 0.150, 0.1)
+    assert not trigger.update(0.410, 0.1)
     assert trigger.place_seen
-    assert not trigger.update(0.390, 0.205, 0.2)
-    assert not trigger.update(0.390, 0.205, 0.399)
-    assert trigger.update(0.390, 0.205, 0.401)
+    assert not trigger.update(0.390, 0.2)
+    assert not trigger.update(0.390, 0.399)
+    assert trigger.update(0.390, 0.401)
     assert not trigger.place_seen
 
 
-def test_placement_retreat_resets_dwell_when_y_or_z_becomes_unsafe():
-    trigger = PlacementRetreatTrigger(0.400, 0.200, 0.200)
+def test_placement_retreat_resets_dwell_when_y_becomes_unsafe():
+    trigger = PlacementRetreatTrigger(0.400, 0.200)
 
-    assert not trigger.update(0.410, 0.160, 1.0)
-    assert not trigger.update(0.390, 0.210, 1.1)
-    assert not trigger.update(0.405, 0.210, 1.2)
-    assert not trigger.update(0.390, 0.210, 1.3)
-    assert not trigger.update(0.390, 0.210, 1.49)
-    assert trigger.update(0.390, 0.210, 1.51)
+    assert not trigger.update(0.410, 1.0)
+    assert not trigger.update(0.390, 1.1)
+    assert not trigger.update(0.405, 1.2)
+    assert not trigger.update(0.390, 1.3)
+    assert not trigger.update(0.390, 1.49)
+    assert trigger.update(0.390, 1.51)
+
+
+def test_operator_reset_requires_a_fresh_y_entry_after_reaching_retreat_side():
+    trigger = PlacementRetreatTrigger(0.400, 0.0)
+    assert not trigger.update(0.410, 1.0)
+    assert trigger.place_seen
+
+    trigger.reset(require_fresh_entry=True)
+    assert not trigger.entry_armed
+    assert not trigger.update(0.420, 1.1)
+    assert not trigger.update(0.390, 1.2)  # Arms only; old retreat cannot fire.
+    assert trigger.entry_armed
+    assert not trigger.update(0.410, 1.3)
+    assert trigger.update(0.390, 1.4)
 
 
 def test_short_stale_secondary_feedback_fails_closed_without_idle_reconnect(monkeypatch):
@@ -125,7 +138,7 @@ def test_place_done_resolves_unknown_and_starts_independent_prescan(monkeypatch)
     node.d435_continuous_presence = False
     node.d435_continuous_last_value = ""
     node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(
-        0.400, 0.200, 0.200
+        0.400, 0.200
     )
     statuses = []
     node._publish_status = statuses.append
@@ -167,7 +180,7 @@ def test_place_done_reuses_current_continuous_barcode_without_turntable_thread(
     node.turntable_scan_error = "old error"
     node.turntable_scan_cancel = threading.Event()
     node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(
-        0.400, 0.200, 0.200
+        0.400, 0.200
     )
     node.d435_continuous_detection = True
     node.d435_continuous_presence = True
@@ -210,6 +223,122 @@ def test_duplicate_place_done_is_ignored_while_material_is_ready(monkeypatch):
     assert node.turntable_place_done_count == 4
     assert node.turntable_place_done_duplicate_warned
     assert "ignoring duplicate" in statuses[-1]
+
+
+def test_secondary_tcp_automatic_place_trigger_uses_y_only():
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    node.get_parameter = lambda name: SimpleNamespace(
+        value={"turntable_auto_place_from_secondary_tcp": True}[name]
+    )
+    node.turntable_lock = threading.RLock()
+    node.turntable_waiting_for_place = True
+    node.turntable_place_done_count = 0
+    node.turntable_place_done_consumed = 0
+    node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(0.400, 0.0)
+    statuses = []
+    accepted = []
+    node._publish_status = statuses.append
+    node._accept_turntable_place_done = accepted.append
+
+    # No Z value is supplied: entering and retreating across the Y boundary
+    # alone must create the event.
+    node._update_turntable_place_from_secondary_tcp({"right_y_m": 0.410})
+    node._update_turntable_place_from_secondary_tcp({"right_y_m": 0.390})
+
+    assert len(accepted) == 1
+    assert "Z ignored" in accepted[0]
+    assert "TCP Z is not used" in statuses[-1]
+
+
+def test_startup_recovery_reset_forgets_previous_turntable_round():
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    node.turntable_lock = threading.RLock()
+    node.turntable_condition = threading.Condition(node.turntable_lock)
+    node.turntable_scan_cancel = threading.Event()
+    node.turntable_scan_thread = None
+    node.turntable_scan_in_progress = True
+    node.turntable_material_ready = True
+    node.turntable_ready_barcode = "old-barcode"
+    node.turntable_scan_error = "old-error"
+    node.turntable_waiting_for_place = False
+    node.turntable_place_done_count = 7
+    node.turntable_place_done_consumed = 7
+    node.turntable_place_done_duplicate_warned = True
+    node.turntable_barcode_value = "old-window-value"
+    node.turntable_barcode_result_count = 3
+    node.d435_continuous_last_value = "old-continuous-value"
+    node.d435_continuous_presence = True
+    node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(0.400, 0.0)
+    node.turntable_secondary_retreat_trigger.update(0.410, 1.0)
+    node.last_accepted_target = TcpPose(0.5, -0.1, 0.13, 0.0, 0.0, 0.0)
+    node.last_accepted_width_m = 0.05
+    node.last_accepted_length_m = 0.12
+    node.last_accepted_height_m = 0.04
+    stopped = []
+    windows = []
+    node._stop_turntable_if_running = stopped.append
+    node._set_turntable_barcode_window = lambda active: windows.append(
+        ("turntable", active)
+    )
+    node._set_top_surface_barcode_window = lambda active: windows.append(
+        ("top", active)
+    )
+
+    node._reset_turntable_round_for_operator_recovery()
+
+    assert stopped == ["operator startup recovery"]
+    assert windows == [("turntable", False), ("top", False)]
+    assert node.turntable_waiting_for_place
+    assert not node.turntable_scan_in_progress
+    assert not node.turntable_material_ready
+    assert node.turntable_ready_barcode == ""
+    assert node.turntable_scan_error == ""
+    assert node.turntable_place_done_count == 0
+    assert node.turntable_place_done_consumed == 0
+    assert not node.turntable_scan_cancel.is_set()
+    assert not node.turntable_secondary_retreat_trigger.entry_armed
+    assert node.last_accepted_target is None
+    assert node.last_accepted_width_m is None
+
+
+def test_move_startup_arms_a_fresh_continuous_wait_after_reset():
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    node.worker = SimpleNamespace(is_alive=lambda: False)
+    node.secondary_safety_lock = threading.RLock()
+    node.secondary_auto_resume_requested = threading.Event()
+    node.secondary_protective_stop_latched = threading.Event()
+    node.cycle_enabled = True
+    node.get_parameter = lambda name: SimpleNamespace(
+        value={"secondary_collision_check_enabled": False}[name]
+    )
+    node.turntable_scan_cancel = threading.Event()
+    node.turntable_condition = threading.Condition(threading.RLock())
+    node.controller = SimpleNamespace(robot_mode=5)
+    node.action_lock = threading.RLock()
+    events = []
+    node._publish_status = lambda message: events.append(("status", message))
+    node._prepare_robot_for_startup_recovery = lambda: events.append(("prepare",))
+    node._move_startup_and_open = lambda **_kwargs: events.append(("startup",))
+    node._reset_turntable_round_for_operator_recovery = lambda: events.append(
+        ("reset",)
+    )
+
+    def ensure_worker():
+        assert node.cycle_enabled
+        events.append(("worker",))
+
+    node._ensure_worker = ensure_worker
+
+    node.move_startup()
+
+    assert node.cycle_enabled
+    assert [(event[0]) for event in events if event[0] != "status"] == [
+        "prepare",
+        "startup",
+        "reset",
+        "worker",
+    ]
+    assert "waiting for a fresh 102" in events[-1][1]
 
 
 def _make_turntable_scan_node(
@@ -310,6 +439,7 @@ def _make_prescan_worker_node(scan_result="", scan_error=None):
     node.turntable_material_ready = False
     node.turntable_ready_barcode = ""
     node.turntable_scan_error = ""
+    node.turntable_scan_cancel = threading.Event()
     node.running = True
     node.cycle_enabled = True
     node.get_parameter = lambda name: SimpleNamespace(

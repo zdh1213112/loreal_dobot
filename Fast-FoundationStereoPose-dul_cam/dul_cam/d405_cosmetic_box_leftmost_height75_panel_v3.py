@@ -86,7 +86,10 @@ CAPTURE_FLUSH_FRAMES = 2
 # 稳定目标发布后，继续用 SAM2/FFS 后台跟踪一小段时间，供机械臂到达
 # 抓取上方后读取最新目标位姿。该跟踪不增加单独等待步骤。
 PREGRASP_POSE_TOPIC = "/target_pose_cam_pregrasp"
-PREGRASP_TRACKING_WINDOW_S = 5.0
+# Keep publishing the locked SAM target through the complete V3 bottom-face
+# manipulation. The robot consumes a frame captured after the second Tool-Rx
+# to choose the final regrasp X/Y; five seconds covered only the initial pick.
+PREGRASP_TRACKING_WINDOW_S = 120.0
 TOP_SURFACE_BARCODE_TOPIC = "/trigger_top_surface_barcode"
 TOP_SURFACE_BARCODE_RESULT_TOPIC = "/top_surface_barcode_result"
 

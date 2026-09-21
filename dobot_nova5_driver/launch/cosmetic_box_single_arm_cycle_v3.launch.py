@@ -118,7 +118,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_scan_timeout_s",
-                default_value="4.0",
+                default_value="1.41",
                 description="Fixed D435 side-barcode classification window",
             ),
             DeclareLaunchArgument(
@@ -154,12 +154,12 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "turntable_secondary_safe_z_m",
                 default_value="0.200",
-                description="102 User-0/Tool-1 TCP Z at or above which turntable rotation is permitted",
+                description="Deprecated compatibility argument; 102 TCP Z is not used by the automatic turntable trigger",
             ),
             DeclareLaunchArgument(
                 "turntable_secondary_safe_z_stable_s",
                 default_value="0.200",
-                description="Continuous time with 102 Y below 400 mm and Z at/above 200 mm before accepting one event",
+                description="Continuous time with 102 Y below the placement boundary before accepting one event; legacy name retained for compatibility",
             ),
             DeclareLaunchArgument(
                 "turntable_surface_z_m",
@@ -343,6 +343,31 @@ def generate_launch_description() -> LaunchDescription:
                 "bottom_flip_lift_m",
                 default_value="0.160",
                 description="Vertical lift after bottom-face table regrasp (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_post_turn_descent_m",
+                default_value="0.120",
+                description="Descent after the J6 half-turn before second release (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_tracking_timeout_s",
+                default_value="2.0",
+                description="Wait for a fresh D405 target before the final regrasp",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_first_rz_delta_deg",
+                default_value="40.0",
+                description="Turntable bottom recovery User-Rz rotation before first release",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_first_tool_rx_delta_deg",
+                default_value="70.0",
+                description="Tool-Rx rotation after the first turntable release",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_release_tool_rx_delta_deg",
+                default_value="70.0",
+                description="Tool-Rx rotation after the second release and J6 half-turn",
             ),
             DeclareLaunchArgument(
                 "bottom_barcode_place_ry_delta_deg",
@@ -782,6 +807,26 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "bottom_flip_lift_m": ParameterValue(
                             LaunchConfiguration("bottom_flip_lift_m"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_post_turn_descent_m": ParameterValue(
+                            LaunchConfiguration("bottom_flip_post_turn_descent_m"),
+                            value_type=float,
+                        ),
+                        "bottom_center_tracking_timeout_s": ParameterValue(
+                            LaunchConfiguration("bottom_center_tracking_timeout_s"),
+                            value_type=float,
+                        ),
+                        "bottom_center_first_rz_delta_deg": ParameterValue(
+                            LaunchConfiguration("bottom_center_first_rz_delta_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_center_first_tool_rx_delta_deg": ParameterValue(
+                            LaunchConfiguration("bottom_center_first_tool_rx_delta_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_center_release_tool_rx_delta_deg": ParameterValue(
+                            LaunchConfiguration("bottom_center_release_tool_rx_delta_deg"),
                             value_type=float,
                         ),
                         "bottom_barcode_place_ry_delta_deg": ParameterValue(
