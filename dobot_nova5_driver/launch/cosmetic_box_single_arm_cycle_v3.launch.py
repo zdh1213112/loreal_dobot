@@ -67,13 +67,48 @@ def generate_launch_description() -> LaunchDescription:
                 description="Spatially stable scanner-pattern frames required for confirmation",
             ),
             DeclareLaunchArgument(
+                "turntable_d435_wide_roi_fallback",
+                default_value="true",
+                description="Retry overlapping sharpened views when full wide-ROI YOLO misses",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_wide_roi_tile_fraction",
+                default_value="0.70",
+                description="Width fraction of each overlapping D435 fallback tile",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_wide_roi_unsharp_amount",
+                default_value="1.0",
+                description="Unsharp strength applied only to D435 fallback tiles",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_min_candidate_area_ratio",
+                default_value="0.01",
+                description="Reject tiny D435 YOLO boxes below this ROI area fraction",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_preview_interval_s",
+                default_value="0.033",
+                description="D435 integrated-preview publish interval; 0.033 is about 30 FPS",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_preview_jpeg_quality",
+                default_value="92",
+                description="JPEG quality of the local D435 preview only",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detect_interval_s",
+                default_value="0.0",
+                description="Minimum D435 inference interval; zero processes every acquired frame",
+            ),
+            DeclareLaunchArgument(
                 "turntable_d435_auto_exposure",
                 default_value="false",
                 description="Use D435 RGB auto exposure; false is recommended for a moving turntable",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_exposure",
-                default_value="50",
+                default_value="80",
                 description="D435 RGB manual exposure for motion-freezing barcode images",
             ),
             DeclareLaunchArgument(
@@ -123,7 +158,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_stationary_barcode_check_s",
-                default_value="1.5",
+                default_value="0.8",
                 description="Check the already-visible stopped face before starting turntable rotation",
             ),
             DeclareLaunchArgument(
@@ -163,13 +198,37 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_surface_z_m",
-                default_value="0.126",
-                description="Measured User-0 turntable material-support surface Z (126 mm on this cell)",
+                default_value="0.164",
+                description="Measured User-0/Tool-1 turntable material-support surface Z (164 mm on this cell)",
             ),
             DeclareLaunchArgument(
                 "vision_user_z_bias_m",
                 default_value="0.0287",
                 description="V3-only D405 field correction added to transformed User-0 target Z",
+            ),
+            DeclareLaunchArgument(
+                "near_square_nearest_grasp_enabled",
+                default_value="true",
+                description=(
+                    "For near-square top footprints, choose the Tool-Y edge "
+                    "alignment requiring the least Tool-1 rotation"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "near_square_grasp_aspect_ratio",
+                default_value="1.20",
+                description=(
+                    "Maximum long/short top-edge ratio treated as near-square "
+                    "for nearest-orientation grasping"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "near_square_long_axis_min_clearance_m",
+                default_value="0.005",
+                description=(
+                    "Minimum spare gripper opening required before allowing "
+                    "a near-square grasp that closes across the long edge"
+                ),
             ),
             DeclareLaunchArgument(
                 "turntable_surface_tolerance_m",
@@ -604,6 +663,41 @@ def generate_launch_description() -> LaunchDescription:
                     ],
                     "-p",
                     [
+                        "wide_roi_fallback_enabled:=",
+                        LaunchConfiguration("turntable_d435_wide_roi_fallback"),
+                    ],
+                    "-p",
+                    [
+                        "wide_roi_tile_fraction:=",
+                        LaunchConfiguration("turntable_d435_wide_roi_tile_fraction"),
+                    ],
+                    "-p",
+                    [
+                        "wide_roi_unsharp_amount:=",
+                        LaunchConfiguration("turntable_d435_wide_roi_unsharp_amount"),
+                    ],
+                    "-p",
+                    [
+                        "yolo_min_candidate_area_ratio:=",
+                        LaunchConfiguration("turntable_d435_min_candidate_area_ratio"),
+                    ],
+                    "-p",
+                    [
+                        "preview_publish_interval_s:=",
+                        LaunchConfiguration("turntable_d435_preview_interval_s"),
+                    ],
+                    "-p",
+                    [
+                        "preview_jpeg_quality:=",
+                        LaunchConfiguration("turntable_d435_preview_jpeg_quality"),
+                    ],
+                    "-p",
+                    [
+                        "detect_interval_s:=",
+                        LaunchConfiguration("turntable_d435_detect_interval_s"),
+                    ],
+                    "-p",
+                    [
                         "auto_exposure:=",
                         LaunchConfiguration("turntable_d435_auto_exposure"),
                     ],
@@ -700,6 +794,22 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "vision_user_z_bias_m": ParameterValue(
                             LaunchConfiguration("vision_user_z_bias_m"),
+                            value_type=float,
+                        ),
+                        "near_square_nearest_grasp_enabled": ParameterValue(
+                            LaunchConfiguration(
+                                "near_square_nearest_grasp_enabled"
+                            ),
+                            value_type=bool,
+                        ),
+                        "near_square_grasp_aspect_ratio": ParameterValue(
+                            LaunchConfiguration("near_square_grasp_aspect_ratio"),
+                            value_type=float,
+                        ),
+                        "near_square_long_axis_min_clearance_m": ParameterValue(
+                            LaunchConfiguration(
+                                "near_square_long_axis_min_clearance_m"
+                            ),
                             value_type=float,
                         ),
                         "turntable_surface_tolerance_m": ParameterValue(

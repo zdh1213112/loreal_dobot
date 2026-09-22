@@ -123,6 +123,69 @@ def circular_mean(values: list[float]) -> float:
     return float(np.rad2deg(np.arctan2(np.sin(radians).mean(), np.cos(radians).mean())))
 
 
+def select_nearest_square_grasp_orientation(
+    target: TcpPose,
+    current: TcpPose,
+) -> tuple[TcpPose, str, float, float, float]:
+    """Choose the nearest equivalent long/short-edge Tool-Y alignment.
+
+    The normal D405 command has Tool Y on the selected target's long-edge
+    line.  For a near-square top footprint, rotations of 0/180 degrees keep
+    Tool Y on that line, while +/-90 degrees put Tool Y on the short-edge
+    line.  Opposite signs are physically equivalent for a parallel gripper,
+    so compare all four candidates and retain the smallest SO(3) travel from
+    the current Tool-1 attitude.
+    """
+
+    current_rotation = SciPyRot.from_euler(
+        "xyz", [current.rx, current.ry, current.rz], degrees=True
+    )
+    target_rotation = SciPyRot.from_euler(
+        "xyz", [target.rx, target.ry, target.rz], degrees=True
+    )
+
+    candidates: dict[str, list[tuple[float, SciPyRot]]] = {
+        "long": [],
+        "short": [],
+    }
+    for alignment, yaw_offsets in (
+        ("long", (0.0, 180.0)),
+        ("short", (90.0, -90.0)),
+    ):
+        for yaw_offset in yaw_offsets:
+            candidate = target_rotation * SciPyRot.from_euler(
+                "z", yaw_offset, degrees=True
+            )
+            travel_deg = float(
+                np.rad2deg((current_rotation.inv() * candidate).magnitude())
+            )
+            candidates[alignment].append((travel_deg, candidate))
+
+    long_travel_deg, long_rotation = min(
+        candidates["long"], key=lambda item: item[0]
+    )
+    short_travel_deg, short_rotation = min(
+        candidates["short"], key=lambda item: item[0]
+    )
+    if short_travel_deg + 1e-6 < long_travel_deg:
+        alignment = "short"
+        selected_travel_deg = short_travel_deg
+        selected_rotation = short_rotation
+    else:
+        alignment = "long"
+        selected_travel_deg = long_travel_deg
+        selected_rotation = long_rotation
+
+    rx, ry, rz = selected_rotation.as_euler("xyz", degrees=True)
+    return (
+        TcpPose(target.x, target.y, target.z, float(rx), float(ry), float(rz)),
+        alignment,
+        float(long_travel_deg),
+        float(short_travel_deg),
+        float(selected_travel_deg),
+    )
+
+
 def compose_motion_percent(ratios: tuple[float, ...], scale_percent: float) -> int:
     """Return one Dobot command ratio equivalent to multiplied legacy ratios."""
     effective = 100.0
@@ -242,7 +305,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("feedback_port", 30004)
         self.declare_parameter("auto_enable", True)
         self.declare_parameter("auto_start", False)
-        self.declare_parameter("startup_joint", [23.0, 13.0, -120.0, 30.0, 80.0, 20.0]) #初始位置，关节角度
+        self.declare_parameter("startup_joint", [23.0, 13.0, -117.0, 25.0, 80.0, 20.0]) #初始位置，关节角度
         # A completed cycle already ends at startup_joint.  Before the next
         # single-cycle request, use fresh joint feedback to avoid replaying the
         # same MovJ.  Gripper opening is still performed below.
@@ -482,6 +545,9 @@ class CosmeticBoxSingleArmNode(Node):
         # 盒子长边尺寸：由 SAM2 分割点云的顶面三维包围盒计算，单位为米。
         # 该长度用于计算中转点处盒子向扫码器靠近的距离。
         self.declare_parameter("vision_length_topic", "/cosmetic_box_length")
+        self.declare_parameter(
+            "vision_aspect_ratio_topic", "/cosmetic_box_aspect_ratio"
+        )
         # 盒子高度：顶面与桌面之间的距离，单位为米。
         self.declare_parameter("vision_height_topic", "/cosmetic_box_height")
         self.declare_parameter("vision_trigger_topic", "/trigger_d405_vision")
@@ -517,6 +583,12 @@ class CosmeticBoxSingleArmNode(Node):
         # -28.7 mm offset after the hand-eye transform.  V2 remains untouched.
         self.declare_parameter("vision_user_z_bias_m", 0.0287)
         self.declare_parameter("grasp_offset_rxyz_deg", [180.0, 0.0, -90.0])
+        # A near-square footprint has two equivalent edge alignments.  Select
+        # the one requiring the smaller Tool-1 attitude change, provided the
+        # resulting closing span (the long edge) fits inside the gripper.
+        self.declare_parameter("near_square_nearest_grasp_enabled", True)
+        self.declare_parameter("near_square_grasp_aspect_ratio", 1.20)
+        self.declare_parameter("near_square_long_axis_min_clearance_m", 0.005)
 
         # V3 turntable: the controller toggles run/stop on every tested
         # 0->1->0 pulse.  The D435 scans only while this node owns the active
@@ -567,11 +639,12 @@ class CosmeticBoxSingleArmNode(Node):
             "turntable_barcode_ready_topic", "/turntable_barcode_camera_ready"
         )
         self.declare_parameter("turntable_camera_ready_timeout_s", 20.0)
-        # Measured on the current cell in User 0: the material-supporting top
-        # surface of the turntable is Z=126 mm.  A negative replacement value
+        # Measured on the current cell with User 0 / Tool 1: the
+        # material-supporting top surface of the turntable is Z=164 mm.  A
+        # negative replacement value
         # is still treated as unconfigured and blocks automatic descent.
         self.declare_parameter("turntable_height_safety_enabled", True)
-        self.declare_parameter("turntable_surface_z_m", 0.126)
+        self.declare_parameter("turntable_surface_z_m", 0.164)
         self.declare_parameter("turntable_surface_tolerance_m", 0.020)
         self.declare_parameter("turntable_tcp_below_target_m", 0.0)
         self.declare_parameter("turntable_surface_clearance_m", 0.003)
@@ -699,7 +772,7 @@ class CosmeticBoxSingleArmNode(Node):
         # on the top/edge, DH can report GRIPPED while the opening hardly
         # changes (cycle 1398: 89.3 -> 89.1 mm).  Reject that condition before
         # sending any lift command; this uses existing feedback and adds no wait.
-        self.declare_parameter("grasp_min_closure_from_preshape_m", 0.005)
+        self.declare_parameter("grasp_min_closure_from_preshape_m", 0.004)
         self.declare_parameter("grasp_feedback_required", True)
         self.declare_parameter("timing_enabled", True)
         self.declare_parameter("timing_topic", "/cosmetic_pick_cycle_timing")
@@ -753,9 +826,11 @@ class CosmeticBoxSingleArmNode(Node):
         self.width_count = 0
         self.length_count = 0
         self.height_count = 0
+        self.aspect_ratio_count = 0
         self.latest_width_m: Optional[float] = None
         self.latest_length_m: Optional[float] = None
         self.latest_height_m: Optional[float] = None
+        self.latest_aspect_ratio: Optional[float] = None
         self.vision_result_count = 0
         self.latest_vision_result = ""
         self.handoff_state_count = 0
@@ -834,6 +909,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.last_accepted_width_m: Optional[float] = None
         self.last_accepted_length_m: Optional[float] = None
         self.last_accepted_height_m: Optional[float] = None
+        self.last_accepted_aspect_ratio: Optional[float] = None
 
         self.create_subscription(PoseStamped, str(self.get_parameter("vision_pose_topic").value), self._vision_pose_callback, 10)
         self.create_subscription(
@@ -844,6 +920,12 @@ class CosmeticBoxSingleArmNode(Node):
         )
         self.create_subscription(Float32, str(self.get_parameter("vision_width_topic").value), self._vision_width_callback, 10)
         self.create_subscription(Float32, str(self.get_parameter("vision_length_topic").value), self._vision_length_callback, 10)
+        self.create_subscription(
+            Float32,
+            str(self.get_parameter("vision_aspect_ratio_topic").value),
+            self._vision_aspect_ratio_callback,
+            10,
+        )
         self.create_subscription(Float32, str(self.get_parameter("vision_height_topic").value), self._vision_height_callback, 10)
         self.create_subscription(String, str(self.get_parameter("vision_result_topic").value), self._vision_result_callback, 10)
         self.create_subscription(String, str(self.get_parameter("handoff_state_topic").value), self._handoff_state_callback, 10)
@@ -2410,6 +2492,11 @@ class CosmeticBoxSingleArmNode(Node):
             self.latest_length_m = float(msg.data)
             self.length_count += 1
 
+    def _vision_aspect_ratio_callback(self, msg: Float32) -> None:
+        with self.data_lock:
+            self.latest_aspect_ratio = float(msg.data)
+            self.aspect_ratio_count += 1
+
     def _vision_height_callback(self, msg: Float32) -> None:
         with self.data_lock:
             self.latest_height_m = float(msg.data)
@@ -2804,6 +2891,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.last_accepted_width_m = None
         self.last_accepted_length_m = None
         self.last_accepted_height_m = None
+        self.last_accepted_aspect_ratio = None
 
     def notify_turntable_place_done(self) -> None:
         """GUI/manual equivalent of one rising place-done event."""
@@ -3235,6 +3323,7 @@ class CosmeticBoxSingleArmNode(Node):
                             height_m,
                             length_m,
                             pending_side_barcode,
+                            self.last_accepted_aspect_ratio,
                         )
                     except SecondaryClearanceRetry as exc:
                         if not self.running or not self.cycle_enabled:
@@ -3589,7 +3678,11 @@ class CosmeticBoxSingleArmNode(Node):
                         self._finish_cycle_timing("no_target")
                         raise RuntimeError("no stable D405 target received")
                     try:
-                        self._execute_one_cycle(*result, turntable_side_barcode)
+                        self._execute_one_cycle(
+                            *result,
+                            turntable_side_barcode,
+                            self.last_accepted_aspect_ratio,
+                        )
                         break
                     except SecondaryClearanceRetry as exc:
                         if not self.running or not self.cycle_enabled:
@@ -3637,6 +3730,7 @@ class CosmeticBoxSingleArmNode(Node):
             previous_width = self.width_count
             previous_length = self.length_count
             previous_height = self.height_count
+            previous_aspect_ratio = self.aspect_ratio_count
             previous_result = self.vision_result_count
             previous_handoff = self.handoff_state_count
         trigger = Bool()
@@ -3697,6 +3791,7 @@ class CosmeticBoxSingleArmNode(Node):
                     and self.width_count > previous_width
                     and self.length_count > previous_length
                     and self.height_count > previous_height
+                    and self.aspect_ratio_count > previous_aspect_ratio
                     and fresh_handoff_state
                     and self.latest_handoff_clear
                 )
@@ -3705,6 +3800,7 @@ class CosmeticBoxSingleArmNode(Node):
                     width_m = self.latest_width_m
                     length_m = self.latest_length_m
                     height_m = self.latest_height_m
+                    aspect_ratio = self.latest_aspect_ratio
                     break
             if status_update:
                 self._publish_status(status_update)
@@ -3719,7 +3815,13 @@ class CosmeticBoxSingleArmNode(Node):
             or width_m is None
             or length_m is None
             or height_m is None
+            or aspect_ratio is None
         ):
+            return None
+        if not math.isfinite(aspect_ratio) or aspect_ratio < 1.0:
+            self.get_logger().error(
+                f"Vision aspect ratio {aspect_ratio!r} must be finite and >= 1.0"
+            )
             return None
         min_height = float(self.get_parameter("min_box_height_m").value)
         max_height = float(self.get_parameter("max_box_height_m").value)
@@ -3764,12 +3866,13 @@ class CosmeticBoxSingleArmNode(Node):
         self.get_logger().info(
             f"Accepted 75%-depth target: x={averaged.x:.3f} y={averaged.y:.3f} z={averaged.z:.3f}, "
             f"length={length_m*1000:.1f}mm height={height_m*1000:.1f}mm "
-            f"width_command={width_m*1000:.1f}mm"
+            f"width_command={width_m*1000:.1f}mm aspect={aspect_ratio:.3f}"
         )
         self.last_accepted_target = averaged
         self.last_accepted_width_m = width_m
         self.last_accepted_length_m = length_m
         self.last_accepted_height_m = height_m
+        self.last_accepted_aspect_ratio = aspect_ratio
         return averaged, width_m, height_m, length_m
 
     @staticmethod
@@ -4722,8 +4825,97 @@ class CosmeticBoxSingleArmNode(Node):
         height_m: float,
         length_m: float,
         turntable_side_barcode: str = "",
+        aspect_ratio: Optional[float] = None,
     ) -> None:
         motion = self._motion_profile()
+        if (
+            aspect_ratio is not None
+            and math.isfinite(float(aspect_ratio))
+            and 1.0 <= float(aspect_ratio)
+            < float(self.get_parameter("near_square_grasp_aspect_ratio").value)
+            and bool(self.get_parameter("near_square_nearest_grasp_enabled").value)
+        ):
+            current_pose = self._current_command_pose()
+            (
+                nearest_target,
+                selected_alignment,
+                long_travel_deg,
+                short_travel_deg,
+                selected_travel_deg,
+            ) = select_nearest_square_grasp_orientation(target, current_pose)
+            max_opening_m = float(self.get_parameter("dh_max_opening_m").value)
+            minimum_clearance_m = max(
+                0.0,
+                float(
+                    self.get_parameter(
+                        "near_square_long_axis_min_clearance_m"
+                    ).value
+                ),
+            )
+            long_axis_fits = (
+                math.isfinite(length_m)
+                and length_m + minimum_clearance_m <= max_opening_m
+            )
+            if selected_alignment == "short" and not long_axis_fits:
+                # Tool Y on the short edge puts the gripper closing axis on
+                # the long edge.  Preserve the conventional pose if that span
+                # cannot fit with the configured minimum opening clearance.
+                target_rotation = SciPyRot.from_euler(
+                    "xyz", [target.rx, target.ry, target.rz], degrees=True
+                )
+                current_rotation = SciPyRot.from_euler(
+                    "xyz",
+                    [current_pose.rx, current_pose.ry, current_pose.rz],
+                    degrees=True,
+                )
+                long_candidates = []
+                for yaw_offset in (0.0, 180.0):
+                    candidate_rotation = target_rotation * SciPyRot.from_euler(
+                        "z", yaw_offset, degrees=True
+                    )
+                    candidate_travel_deg = float(
+                        np.rad2deg(
+                            (current_rotation.inv() * candidate_rotation).magnitude()
+                        )
+                    )
+                    long_candidates.append(
+                        (candidate_travel_deg, candidate_rotation)
+                    )
+                long_only_travel_deg, long_only_rotation = min(
+                    long_candidates, key=lambda item: item[0]
+                )
+                rx, ry, rz = long_only_rotation.as_euler("xyz", degrees=True)
+                nearest_target = TcpPose(
+                    target.x,
+                    target.y,
+                    target.z,
+                    float(rx),
+                    float(ry),
+                    float(rz),
+                )
+                selected_alignment = "long"
+                selected_travel_deg = long_only_travel_deg
+                self._publish_status(
+                    "near-square nearest grasp wanted Tool Y on the short edge, "
+                    f"but the {length_m*1000.0:.1f}mm long-edge closing span "
+                    f"does not fit inside {max_opening_m*1000.0:.1f}mm with "
+                    f"{minimum_clearance_m*1000.0:.1f}mm clearance; keeping "
+                    "Tool Y on the long edge"
+                )
+            else:
+                target = nearest_target
+                if selected_alignment == "short":
+                    # The alternate orientation closes across the physical
+                    # long edge.  Full pre-shape prevents the old short-edge
+                    # width command from restricting this equivalent grasp.
+                    width_m = max_opening_m
+            target = nearest_target
+            self._publish_status(
+                f"near-square grasp aspect={float(aspect_ratio):.3f}: "
+                f"Tool-Y long-edge rotation={long_travel_deg:.1f}deg, "
+                f"short-edge rotation={short_travel_deg:.1f}deg; selected "
+                f"{selected_alignment} edge ({selected_travel_deg:.1f}deg)"
+            )
         offset_grasp_enabled = bool(self.get_parameter("offset_grasp_enabled").value)
         side_barcode_preconfirmed = bool(str(turntable_side_barcode).strip())
         # D435 has already classified this material when a side barcode is

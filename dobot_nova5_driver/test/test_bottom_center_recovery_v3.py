@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as SciPyRot
 
@@ -12,12 +13,63 @@ from dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3 import (
     CosmeticBoxSingleArmNode,
     PregraspObservation,
     RecoverableGraspError,
+    select_nearest_square_grasp_orientation,
 )
 
 
 @contextmanager
 def stage(_name):
     yield
+
+
+def pose_with_local_yaw(reference, yaw_deg):
+    rotation = SciPyRot.from_euler(
+        "xyz", [reference.rx, reference.ry, reference.rz], degrees=True
+    ) * SciPyRot.from_euler("z", yaw_deg, degrees=True)
+    rx, ry, rz = rotation.as_euler("xyz", degrees=True)
+    return TcpPose(
+        reference.x,
+        reference.y,
+        reference.z,
+        float(rx),
+        float(ry),
+        float(rz),
+    )
+
+
+def test_near_square_grasp_selects_short_edge_when_it_is_nearer():
+    target = TcpPose(0.55, -0.15, 0.13, 178.0, 2.0, -4.0)
+    current = pose_with_local_yaw(target, 82.0)
+
+    selected, alignment, long_deg, short_deg, selected_deg = (
+        select_nearest_square_grasp_orientation(target, current)
+    )
+
+    assert alignment == "short"
+    assert long_deg == pytest.approx(82.0)
+    assert short_deg == pytest.approx(8.0)
+    assert selected_deg == pytest.approx(8.0)
+    target_y = SciPyRot.from_euler(
+        "xyz", [target.rx, target.ry, target.rz], degrees=True
+    ).as_matrix()[:, 1]
+    selected_y = SciPyRot.from_euler(
+        "xyz", [selected.rx, selected.ry, selected.rz], degrees=True
+    ).as_matrix()[:, 1]
+    assert abs(float(np.dot(target_y, selected_y))) < 1e-6
+
+
+def test_near_square_grasp_treats_180deg_long_edge_as_equivalent():
+    target = TcpPose(0.55, -0.15, 0.13, 178.0, 2.0, -4.0)
+    current = pose_with_local_yaw(target, 172.0)
+
+    _selected, alignment, long_deg, short_deg, selected_deg = (
+        select_nearest_square_grasp_orientation(target, current)
+    )
+
+    assert alignment == "long"
+    assert long_deg == pytest.approx(8.0)
+    assert short_deg == pytest.approx(82.0)
+    assert selected_deg == pytest.approx(8.0)
 
 
 def test_turntable_bottom_branch_routes_before_legacy_close_and_transfer():

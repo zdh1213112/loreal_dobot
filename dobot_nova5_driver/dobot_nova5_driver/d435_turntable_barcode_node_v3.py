@@ -98,7 +98,19 @@ class D435TurntableBarcodeNode(Node):
         self.declare_parameter("stable_hits", 2)
         self.declare_parameter("stable_hit_gap_s", 0.70)
         self.declare_parameter("yolo_min_iou", 0.15)
-        self.declare_parameter("detect_interval_s", 0.03)
+        # A wide turntable ROI loses barcode detail when letterboxed into the
+        # square YOLO input. Retry two overlapping sharpened views only after
+        # the established full-ROI inference misses.
+        self.declare_parameter("wide_roi_fallback_enabled", True)
+        self.declare_parameter("wide_roi_fallback_aspect_ratio", 2.0)
+        self.declare_parameter("wide_roi_tile_fraction", 0.70)
+        self.declare_parameter("wide_roi_unsharp_sigma", 1.2)
+        self.declare_parameter("wide_roi_unsharp_amount", 1.0)
+        self.declare_parameter("yolo_min_candidate_area_ratio", 0.01)
+        # The RealSense stream itself limits this loop to 30 FPS. Zero means
+        # every acquired frame is eligible; inference time remains the natural
+        # back-pressure instead of an additional timer throttle.
+        self.declare_parameter("detect_interval_s", 0.0)
         self.declare_parameter("roi_x", 0)
         self.declare_parameter("roi_y", 0)
         self.declare_parameter("roi_width", 0)
@@ -108,8 +120,12 @@ class D435TurntableBarcodeNode(Node):
             "preview_topic", "/vision_panel/d435_turntable/image/compressed"
         )
         self.declare_parameter("event_topic", "/vision_panel/d435_turntable/event")
-        self.declare_parameter("preview_publish_interval_s", 0.10)
-        self.declare_parameter("preview_jpeg_quality", 80)
+        # The old 0.10 s/JPEG-80 preview was capped at 10 FPS and looked much
+        # softer than the raw 1280x720 frames. Keep inference on the raw image,
+        # but publish a higher-quality local preview at up to the camera's
+        # configured 30 FPS. Inference load may temporarily reduce delivery.
+        self.declare_parameter("preview_publish_interval_s", 0.033)
+        self.declare_parameter("preview_jpeg_quality", 92)
         self.declare_parameter("trigger_topic", "/trigger_turntable_barcode")
         self.declare_parameter(
             "continuous_trigger_topic", "/trigger_d435_continuous_detection"
@@ -204,6 +220,9 @@ class D435TurntableBarcodeNode(Node):
             self.get_parameter("auto_exposure").value
         )
         self.camera_settings_text = "camera settings pending"
+        self.detect_rate_started_at = time.monotonic()
+        self.detect_rate_count = 0
+        self.detect_rate_fps = 0.0
         self.detector = TurntableBarcodeDetector(
             model_path=str(self.get_parameter("model_path").value),
             confidence=float(self.get_parameter("model_confidence").value),
@@ -213,6 +232,24 @@ class D435TurntableBarcodeNode(Node):
             ),
             scanner_assist=bool(
                 self.get_parameter("scanner_assist_enabled").value
+            ),
+            wide_roi_fallback=bool(
+                self.get_parameter("wide_roi_fallback_enabled").value
+            ),
+            wide_roi_aspect_ratio=float(
+                self.get_parameter("wide_roi_fallback_aspect_ratio").value
+            ),
+            wide_roi_tile_fraction=float(
+                self.get_parameter("wide_roi_tile_fraction").value
+            ),
+            wide_roi_unsharp_sigma=float(
+                self.get_parameter("wide_roi_unsharp_sigma").value
+            ),
+            wide_roi_unsharp_amount=float(
+                self.get_parameter("wide_roi_unsharp_amount").value
+            ),
+            yolo_min_candidate_area_ratio=float(
+                self.get_parameter("yolo_min_candidate_area_ratio").value
             ),
         )
         self.capture_thread = threading.Thread(
@@ -622,7 +659,8 @@ class D435TurntableBarcodeNode(Node):
         )
         cv2.putText(
             display,
-            f"{self.camera_settings_text}  sharpness={sharpness:.0f}",
+            f"{self.camera_settings_text}  sharpness={sharpness:.0f}  "
+            f"detect={self.detect_rate_fps:.1f}fps",
             (16, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.58,
@@ -670,6 +708,15 @@ class D435TurntableBarcodeNode(Node):
         now = time.monotonic()
         value = str(hit.value)
         source = str(hit.source)
+        # The same moving barcode may alternate between OpenCV pattern and
+        # full/tiled YOLO evidence on adjacent frames. Treat those as one
+        # spatial candidate; the active source still selects its own required
+        # hit count and is retained in the confirmation log.
+        candidate_source = (
+            "barcode_visual"
+            if source == "scanner_pattern" or source.startswith("yolo")
+            else source
+        )
         with self.state_lock:
             workflow_active = (
                 self.scan_active and generation == self.scan_generation
@@ -722,7 +769,7 @@ class D435TurntableBarcodeNode(Node):
                 )
             same_candidate = (
                 value == self.candidate
-                and source == self.candidate_source
+                and candidate_source == self.candidate_source
                 and now - self.candidate_last_at <= max_gap
                 and spatially_consistent
             )
@@ -730,7 +777,7 @@ class D435TurntableBarcodeNode(Node):
                 self.candidate_hits += 1
             else:
                 self.candidate = value
-                self.candidate_source = source
+                self.candidate_source = candidate_source
                 self.candidate_hits = 1
             self.candidate_rect = tuple(hit.rect)
             self.candidate_last_at = now
@@ -828,7 +875,11 @@ class D435TurntableBarcodeNode(Node):
                 f"confidence={self.detector.confidence:.2f}, provider="
                 f"{self.detector.active_provider}; scanner_assist="
                 f"{'on' if self.detector.scanner_detector is not None else 'off'}; "
-                "flat-background rejection=on"
+                f"wide_roi_fallback="
+                f"{'on' if self.detector.wide_roi_fallback else 'off'}; "
+                f"min_candidate_area="
+                f"{self.detector.yolo_min_candidate_area_ratio:.3f}; "
+                "flat-background rejection=on; parallel-bar verification=on"
             )
             if self.detector.provider_fallback_reason:
                 self.get_logger().warning(
@@ -865,6 +916,17 @@ class D435TurntableBarcodeNode(Node):
                     crop, origin = self._configured_roi(image)
                     provider_before = self.detector.active_provider
                     hit = self.detector.detect(crop)
+                    self.detect_rate_count += 1
+                    detect_finished_at = time.monotonic()
+                    detect_rate_elapsed = (
+                        detect_finished_at - self.detect_rate_started_at
+                    )
+                    if detect_rate_elapsed >= 1.0:
+                        self.detect_rate_fps = (
+                            self.detect_rate_count / detect_rate_elapsed
+                        )
+                        self.detect_rate_count = 0
+                        self.detect_rate_started_at = detect_finished_at
                     if self.detector.active_provider != provider_before:
                         self.get_logger().warning(
                             "D435 ONNX provider changed during inference: "

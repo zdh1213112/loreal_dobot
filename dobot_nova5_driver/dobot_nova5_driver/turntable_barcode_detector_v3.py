@@ -72,6 +72,87 @@ def barcode_region_has_visual_detail(
     return contrast >= 14.0 or max(horizontal_edges, vertical_edges) >= 0.02
 
 
+def barcode_region_has_parallel_bar_structure(
+    image: np.ndarray,
+    rect: tuple[int, int, int, int],
+    *,
+    minimum_runs: int = 6,
+    minimum_line_coverage: float = 0.22,
+    minimum_direction_dominance: float = 1.15,
+) -> bool:
+    """Require repeated, substantially parallel edges in a YOLO proposal.
+
+    The one-class model supplies a useful candidate region, but shiny
+    shrink-wrap can make an entire package score highly. Contrast alone cannot
+    distinguish those broad wrinkles from a barcode. A linear barcode instead
+    produces several edge runs with one dominant direction, and each run
+    continues through a meaningful fraction of the candidate crop. Evaluate
+    both vertical- and horizontal-bar layouts so 90-degree rotations remain
+    valid.
+    """
+
+    if image is None or np.asarray(image).size == 0:
+        return False
+    image_height, image_width = image.shape[:2]
+    x, y, width, height = [int(value) for value in rect]
+    if width <= 0 or height <= 0:
+        return False
+    # A package boundary and the proposal border are not barcode evidence.
+    inset_x = max(1, int(round(width * 0.06)))
+    inset_y = max(1, int(round(height * 0.06)))
+    left = max(0, x + inset_x)
+    top = max(0, y + inset_y)
+    right = min(image_width, x + width - inset_x)
+    bottom = min(image_height, y + height - inset_y)
+    if right - left < 12 or bottom - top < 12:
+        return False
+    interior = image[top:bottom, left:right]
+    gray = (
+        cv2.cvtColor(interior, cv2.COLOR_BGR2GRAY)
+        if interior.ndim == 3
+        else np.asarray(interior)
+    )
+    gray = cv2.GaussianBlur(np.asarray(gray, dtype=np.uint8), (3, 3), 0.6)
+    gradient_x = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    gradient_y = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    required_runs = max(4, int(minimum_runs))
+    required_coverage = max(0.10, min(0.80, float(minimum_line_coverage)))
+    required_dominance = max(1.0, float(minimum_direction_dominance))
+
+    def axis_has_bars(
+        primary: np.ndarray,
+        secondary: np.ndarray,
+        collapse_axis: int,
+    ) -> bool:
+        # The percentile adapts to pale/blurred labels; the absolute floor
+        # prevents sensor noise on a smooth package from becoming an edge.
+        edge_threshold = max(24.0, float(np.percentile(primary, 80.0)))
+        strong = primary >= edge_threshold
+        line_coverage = np.mean(strong, axis=collapse_axis)
+        active = line_coverage >= required_coverage
+        if active.size == 0:
+            return False
+        run_starts = active & np.concatenate(
+            (np.array([True], dtype=bool), np.logical_not(active[:-1]))
+        )
+        run_count = int(np.count_nonzero(run_starts))
+        active_fraction = float(np.mean(active))
+        direction_dominance = float(np.mean(primary)) / max(
+            1e-6, float(np.mean(secondary))
+        )
+        return (
+            run_count >= required_runs
+            and active_fraction >= 0.10
+            and direction_dominance >= required_dominance
+        )
+
+    # Vertical bars have X gradients continuing through rows; horizontal bars
+    # have Y gradients continuing through columns.
+    return axis_has_bars(gradient_x, gradient_y, collapse_axis=0) or axis_has_bars(
+        gradient_y, gradient_x, collapse_axis=1
+    )
+
+
 class TurntableBarcodeDetector:
     """Detect whether the single-class barcode model sees a barcode region."""
 
@@ -82,6 +163,12 @@ class TurntableBarcodeDetector:
         image_size: int = 640,
         scanner_assist: bool = True,
         inference_provider: str = "cuda",
+        wide_roi_fallback: bool = True,
+        wide_roi_aspect_ratio: float = 2.0,
+        wide_roi_tile_fraction: float = 0.70,
+        wide_roi_unsharp_sigma: float = 1.2,
+        wide_roi_unsharp_amount: float = 1.0,
+        yolo_min_candidate_area_ratio: float = 0.01,
     ):
         self.model_path = str(model_path)
         self.confidence = max(0.05, min(0.95, float(confidence)))
@@ -90,6 +177,20 @@ class TurntableBarcodeDetector:
         # validation images, so keep the trained size explicit.
         self.image_size = max(320, int(image_size))
         self.scanner_assist = bool(scanner_assist)
+        self.wide_roi_fallback = bool(wide_roi_fallback)
+        self.wide_roi_aspect_ratio = max(1.0, float(wide_roi_aspect_ratio))
+        self.wide_roi_tile_fraction = max(
+            0.51, min(1.0, float(wide_roi_tile_fraction))
+        )
+        self.wide_roi_unsharp_sigma = max(
+            0.1, float(wide_roi_unsharp_sigma)
+        )
+        self.wide_roi_unsharp_amount = max(
+            0.0, float(wide_roi_unsharp_amount)
+        )
+        self.yolo_min_candidate_area_ratio = max(
+            0.0, min(0.25, float(yolo_min_candidate_area_ratio))
+        )
         requested_provider = str(inference_provider).strip().lower()
         if requested_provider not in {"cuda", "cpu", "auto"}:
             raise ValueError(
@@ -334,13 +435,11 @@ class TurntableBarcodeDetector:
             source="scanner_pattern",
         )
 
-    def detect_yolo(self, image: np.ndarray) -> TurntableBarcodeHit | None:
-        """Select the strongest YOLO hit with visible detail in its box."""
+    def _detect_yolo_once(
+        self, image: np.ndarray
+    ) -> TurntableBarcodeHit | None:
+        """Run one model view and keep its strongest detailed candidate."""
 
-        if self.model is None and self.onnx_session is None:
-            raise RuntimeError("turntable barcode model is not loaded")
-        if image is None or np.asarray(image).size == 0:
-            return None
         if self.onnx_session is not None:
             candidates, class_ids, confidence_values = self._predict_onnx(image)
         else:
@@ -385,12 +484,22 @@ class TurntableBarcodeDetector:
             top = max(0, min(height - 1, int(np.floor(y1))))
             right = max(left + 1, min(width, int(np.ceil(x2))))
             bottom = max(top + 1, min(height, int(np.ceil(y2))))
+            candidate_area_ratio = (
+                float((right - left) * (bottom - top))
+                / float(max(1, width * height))
+            )
+            if candidate_area_ratio < self.yolo_min_candidate_area_ratio:
+                continue
             confidence = (
                 float(confidence_values[index])
                 if index < len(confidence_values)
                 else 1.0
             )
             if not barcode_region_has_visual_detail(
+                image, (left, top, right - left, bottom - top)
+            ):
+                continue
+            if not barcode_region_has_parallel_bar_structure(
                 image, (left, top, right - left, bottom - top)
             ):
                 continue
@@ -406,6 +515,83 @@ class TurntableBarcodeDetector:
             confidence=confidence,
             source="yolo",
         )
+
+    @staticmethod
+    def _translate_hit_x(
+        hit: TurntableBarcodeHit, offset_x: int
+    ) -> TurntableBarcodeHit:
+        x, y, width, height = hit.rect
+        return TurntableBarcodeHit(
+            value=hit.value,
+            rect=(int(x) + int(offset_x), int(y), int(width), int(height)),
+            confidence=hit.confidence,
+            source="yolo_tiled",
+        )
+
+    def _wide_roi_tiles(
+        self, image: np.ndarray
+    ) -> list[tuple[int, np.ndarray]]:
+        """Return two overlapping views that retain detail in a very wide ROI."""
+
+        height, width = image.shape[:2]
+        if (
+            not self.wide_roi_fallback
+            or height <= 0
+            or width / float(height) < self.wide_roi_aspect_ratio
+        ):
+            return []
+        tile_width = max(
+            1,
+            min(width, int(round(width * self.wide_roi_tile_fraction))),
+        )
+        offsets = (0, max(0, width - tile_width))
+        return [
+            (offset, image[:, offset : offset + tile_width])
+            for offset in offsets
+        ]
+
+    def _unsharp_for_wide_roi(self, image: np.ndarray) -> np.ndarray:
+        """Restore low-contrast bar edges lost to motion and ROI letterboxing."""
+
+        amount = self.wide_roi_unsharp_amount
+        if amount <= 0.0:
+            return image
+        blurred = cv2.GaussianBlur(
+            image,
+            (0, 0),
+            sigmaX=self.wide_roi_unsharp_sigma,
+            sigmaY=self.wide_roi_unsharp_sigma,
+        )
+        return cv2.addWeighted(image, 1.0 + amount, blurred, -amount, 0.0)
+
+    def detect_yolo(self, image: np.ndarray) -> TurntableBarcodeHit | None:
+        """Detect a barcode, with a detail-preserving fallback for wide ROIs.
+
+        The turntable ROI is typically about 2.5:1. Letterboxing that entire
+        view into the model's square input reduces its useful height to about
+        255 pixels, which made small, pale moving barcodes disappear. For a
+        wide ROI, infer two 70%-width overlapping, lightly sharpened views
+        directly. They cover the complete ROI while using two model passes
+        instead of the previous full-frame-plus-two-tile three-pass path.
+        """
+
+        if self.model is None and self.onnx_session is None:
+            raise RuntimeError("turntable barcode model is not loaded")
+        if image is None or np.asarray(image).size == 0:
+            return None
+
+        tiles = self._wide_roi_tiles(image)
+        if not tiles:
+            return self._detect_yolo_once(image)
+        tiled_hits = []
+        for offset_x, tile in tiles:
+            enhanced = self._unsharp_for_wide_roi(tile)
+            hit = self._detect_yolo_once(enhanced)
+            if hit is not None:
+                tiled_hits.append(self._translate_hit_x(hit, offset_x))
+        if not tiled_hits:
+            return None
+        return max(tiled_hits, key=lambda item: item.confidence)
 
     def detect(self, image: np.ndarray) -> TurntableBarcodeHit | None:
         """Use the fast scanner pattern path first, then fall back to YOLO."""

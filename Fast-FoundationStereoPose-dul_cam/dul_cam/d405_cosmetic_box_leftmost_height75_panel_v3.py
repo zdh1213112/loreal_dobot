@@ -70,7 +70,7 @@ CAMERA_SERIAL = "409122274792"
 FFS_MODEL_DIR = os.path.join(FFS_DIR, "weights/23-36-37/model_best_bp2_serialize.pth")
 SAM2_CHECKPOINT = os.path.join(SAM2_DIR, "checkpoints/sam2.1/sam2.1_hiera_small.pt")
 SAM2_CFG = "sam2.1/sam2.1_hiera_s.yaml"
-YOLO_MODEL_PATH = "src/Fast-FoundationStereoPose-dul_cam/models/best_0921.pt"
+YOLO_MODEL_PATH = "src/Fast-FoundationStereoPose-dul_cam/models/best_00921_2.pt"
 VALID_ITERS = 6
 MAX_DISP = 192
 ZNEAR = 0.16
@@ -216,8 +216,11 @@ LOCAL_WINDOW_NAME = "D405 RGB + Point Cloud + D435 Turntable Barcode"
 LOCAL_DIVIDER_WIDTH_PX = 4
 D435_PREVIEW_TOPIC = "/vision_panel/d435_turntable/image/compressed"
 D435_EVENT_TOPIC = "/vision_panel/d435_turntable/event"
-D435_PANEL_DISPLAY_WIDTH = 640
-D435_PANEL_DISPLAY_HEIGHT = 360
+# Preserve more of the 1280x720 D435 source detail in the integrated view.
+# 960x540 still fits below the 1284-pixel-wide D405/cloud row on a 1080p
+# workstation display, while avoiding the old 50% downscale.
+D435_PANEL_DISPLAY_WIDTH = 960
+D435_PANEL_DISPLAY_HEIGHT = 540
 D435_PANEL_SOURCE_WIDTH = 1280
 D435_PANEL_SOURCE_HEIGHT = 720
 LOCAL_TOP_WIDTH = IMG_WIDTH + LOCAL_DIVIDER_WIDTH_PX + int(
@@ -284,6 +287,10 @@ pose_pub = ros_node.create_publisher(PoseStamped, "/target_pose_cam_fine", 10)
 width_pub = ros_node.create_publisher(Float32, "/gripper_target_width", 10)
 # 点云包围盒长边的真实尺寸（不加夹爪余量），供扫码靠近距离计算使用。
 length_pub = ros_node.create_publisher(Float32, "/cosmetic_box_length", 10)
+# 顶面真实长短边比，供机器人对近方形物料选择最小旋转抓取姿态。
+aspect_ratio_pub = ros_node.create_publisher(
+    Float32, "/cosmetic_box_aspect_ratio", 10
+)
 # 顶面与桌面之间的盒子高度，供 75% 下爪深度计算使用。
 height_pub = ros_node.create_publisher(Float32, "/cosmetic_box_height", 10)
 # 每次触发的明确成功/失败结果。机械臂据此在 YOLO/ROI 已明确失败时
@@ -2807,8 +2814,15 @@ try:
                                             # without gripper clearance so the robot can
                                             # position the near box face relative to the
                                             # barcode scanner.
-                                            length_msg.data = float(smooth_extent[0])
+                                            length_msg.data = float(
+                                                max(smooth_extent[0], smooth_extent[1])
+                                            )
                                             length_pub.publish(length_msg)
+                                            aspect_ratio_msg = Float32()
+                                            aspect_ratio_msg.data = float(
+                                                width_decision.aspect_ratio
+                                            )
+                                            aspect_ratio_pub.publish(aspect_ratio_msg)
                                             height_msg = Float32()
                                             height_msg.data = last_height_m
                                             height_pub.publish(height_msg)
