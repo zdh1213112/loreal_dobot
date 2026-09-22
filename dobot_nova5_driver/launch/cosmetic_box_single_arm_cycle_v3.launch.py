@@ -153,7 +153,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_scan_timeout_s",
-                default_value="2.81",
+                default_value="3.0",
                 description="Fixed D435 side-barcode classification window",
             ),
             DeclareLaunchArgument(
@@ -228,6 +228,29 @@ def generate_launch_description() -> LaunchDescription:
                 description=(
                     "Minimum spare gripper opening required before allowing "
                     "a near-square grasp that closes across the long edge"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_flip_enabled",
+                default_value="true",
+                description=(
+                    "Use the Tool-Rx -45/+90/-45 bottom-to-side table flip "
+                    "for genuinely cube-like boxes"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_max_dimension_ratio",
+                default_value="1.35",
+                description=(
+                    "Maximum max/min ratio across D405 length, physical width "
+                    "and height for the near-cube bottom flip"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_flip_lift_m",
+                default_value="0.030",
+                description=(
+                    "Short vertical clearance used by the near-cube Tool-Rx flip"
                 ),
             ),
             DeclareLaunchArgument(
@@ -810,6 +833,20 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration(
                                 "near_square_long_axis_min_clearance_m"
                             ),
+                            value_type=float,
+                        ),
+                        "bottom_near_cube_flip_enabled": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_flip_enabled"),
+                            value_type=bool,
+                        ),
+                        "bottom_near_cube_max_dimension_ratio": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_near_cube_max_dimension_ratio"
+                            ),
+                            value_type=float,
+                        ),
+                        "bottom_near_cube_flip_lift_m": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_flip_lift_m"),
                             value_type=float,
                         ),
                         "turntable_surface_tolerance_m": ParameterValue(

@@ -186,6 +186,32 @@ def select_nearest_square_grasp_orientation(
     )
 
 
+def box_three_dimension_ratio(
+    length_m: float,
+    height_m: float,
+    top_aspect_ratio: float,
+) -> Optional[float]:
+    """Return max/min across physical length, width and height.
+
+    D405 publishes the true top-plane long/short aspect ratio while the width
+    topic includes gripper clearance. Recover the physical short edge from
+    ``length / aspect`` so bottom-flip routing does not depend on that command
+    clearance.
+    """
+
+    values = (float(length_m), float(height_m), float(top_aspect_ratio))
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
+        return None
+    if top_aspect_ratio < 1.0:
+        return None
+    physical_width_m = length_m / top_aspect_ratio
+    dimensions = (length_m, physical_width_m, height_m)
+    minimum = min(dimensions)
+    if minimum <= 0.0:
+        return None
+    return float(max(dimensions) / minimum)
+
+
 def compose_motion_percent(ratios: tuple[float, ...], scale_percent: float) -> int:
     """Return one Dobot command ratio equivalent to multiplied legacy ratios."""
     effective = 100.0
@@ -305,7 +331,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("feedback_port", 30004)
         self.declare_parameter("auto_enable", True)
         self.declare_parameter("auto_start", False)
-        self.declare_parameter("startup_joint", [23.0, 13.0, -117.0, 25.0, 80.0, 20.0]) #初始位置，关节角度
+        self.declare_parameter("startup_joint", [25.0, 13.0, -110.0, 15.0, 80.0, 20.0]) #初始位置，关节角度
         # A completed cycle already ends at startup_joint.  Before the next
         # single-cycle request, use fresh joint feedback to avoid replaying the
         # same MovJ.  Gripper opening is still performed below.
@@ -596,7 +622,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("turntable_enabled", True)
         self.declare_parameter("turntable_do_index", 1)
         self.declare_parameter("turntable_pulse_ms", 300)
-        self.declare_parameter("turntable_scan_timeout_s", 1.42)
+        self.declare_parameter("turntable_scan_timeout_s", 3.0)
         # Inspect the already-stopped face before rotating. D435 runs
         # continuously, so a correctly oriented placement should not cause an
         # unnecessary table revolution.
@@ -713,6 +739,20 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("bottom_center_first_tool_rx_delta_deg", 70.0)
         self.declare_parameter("bottom_center_release_tool_rx_delta_deg", 70.0)
         self.declare_parameter("bottom_center_tracking_timeout_s", 2.0)
+        # A genuinely cube-like box uses a shorter single table flip: open at
+        # the detected centre, Tool-Rx -45, grasp, lift only enough to clear
+        # the table, Tool-Rx +90, put down, release, and Tool-Rx -45 back to
+        # the normal pickup attitude. D405 then reacquires the now-side-facing
+        # barcode and the ordinary side-barcode placement branch takes over.
+        self.declare_parameter("bottom_near_cube_flip_enabled", True)
+        self.declare_parameter("bottom_near_cube_max_dimension_ratio", 1.35)
+        # About 15 mm of extra centre-height clears a 70 mm cube while it
+        # rolls through 45 degrees. Keep a modest margin without pushing the
+        # tilted Tool-1 pose unnecessarily far toward the reach boundary.
+        self.declare_parameter("bottom_near_cube_flip_lift_m", 0.030)
+        self.declare_parameter("bottom_near_cube_initial_tool_rx_deg", -45.0)
+        self.declare_parameter("bottom_near_cube_flip_tool_rx_deg", 90.0)
+        self.declare_parameter("bottom_near_cube_restore_tool_rx_deg", -45.0)
         # Lift 160 mm, rotate J6 +180 deg, then lower 120 mm before regrasp.
         self.declare_parameter("bottom_flip_j6_half_turn_deg", 180.0)
         self.declare_parameter("bottom_flip_post_turn_descent_m", 0.120)
@@ -3736,7 +3776,8 @@ class CosmeticBoxSingleArmNode(Node):
         trigger = Bool()
         trigger.data = True
         self._publish_status(
-            "requesting fresh D405 target; robot remains at startup until the pose is verified"
+            "requesting fresh D405 target; robot remains at its current safe pose "
+            "until the pose is verified"
         )
         self.trigger_publisher.publish(trigger)
         required_samples = max(1, int(self.get_parameter("vision_samples").value))
@@ -5192,9 +5233,41 @@ class CosmeticBoxSingleArmNode(Node):
                     "D435 found no side barcode and D405 found no top barcode, "
                     "but bottom-barcode recovery is disabled"
                 )
+            dimension_ratio = (
+                box_three_dimension_ratio(length_m, height_m, float(aspect_ratio))
+                if aspect_ratio is not None
+                else None
+            )
+            near_cube_flip = (
+                dimension_ratio is not None
+                and bool(
+                    self.get_parameter("bottom_near_cube_flip_enabled").value
+                )
+                and dimension_ratio
+                <= float(
+                    self.get_parameter(
+                        "bottom_near_cube_max_dimension_ratio"
+                    ).value
+                )
+            )
+            if near_cube_flip:
+                self._publish_status(
+                    "no side or top barcode; three-dimensional box ratio="
+                    f"{dimension_ratio:.3f}, using the near-cube Tool-Rx table flip"
+                )
+                self._execute_turntable_near_cube_bottom_flip(
+                    actual_grasp_pose,
+                    max_opening,
+                    motion,
+                )
+                self._execute_pregrasped_near_cube_side_cycle(
+                    motion,
+                    max_opening,
+                )
+                return
             self._publish_status(
                 "no side or top barcode; starting the staged pick and table-flip "
-                "sequence at the D405 grasp centre"
+                "sequence for a non-cube box at the D405 grasp centre"
             )
             self._execute_turntable_bottom_center_recovery(
                 actual_grasp_pose,
@@ -5353,6 +5426,11 @@ class CosmeticBoxSingleArmNode(Node):
                     height_m,
                 )
             return
+
+        self._place_as_side_barcode_box(motion)
+
+    def _place_as_side_barcode_box(self, motion: dict[str, int]) -> None:
+        """Place an already lifted and verified side-barcode box."""
 
         # First move above the placement area at the previous safe height while
         # applying the barcode-up orientation.  The side-barcode branch then
@@ -5699,10 +5777,10 @@ class CosmeticBoxSingleArmNode(Node):
                 f"{label}: final TCP XYZ error={xyz_error*1000:.1f}mm"
             )
 
-    def _bottom_center_tool_rx(self, delta_deg: float, label: str) -> None:
-        """Rotate around the current Tool X axis at a fixed TCP XYZ using MovL."""
+    @staticmethod
+    def _tool_rx_target_pose(current: TcpPose, delta_deg: float) -> TcpPose:
+        """Return a fixed-XYZ pose rotated around the current Tool X axis."""
 
-        current = self._current_command_pose()
         start_rotation = SciPyRot.from_euler(
             "xyz",
             [current.rx, current.ry, current.rz],
@@ -5716,13 +5794,22 @@ class CosmeticBoxSingleArmNode(Node):
         target_rx, target_ry, target_rz = target_rotation.as_euler(
             "xyz", degrees=True
         )
-        target = TcpPose(
+        return TcpPose(
             current.x,
             current.y,
             current.z,
             float(target_rx),
             float(target_ry),
             float(target_rz),
+        )
+
+    def _bottom_center_tool_rx(self, delta_deg: float, label: str) -> None:
+        """Rotate around the current Tool X axis at a fixed TCP XYZ using MovL."""
+
+        current = self._current_command_pose()
+        target = self._tool_rx_target_pose(current, delta_deg)
+        target_rotation = SciPyRot.from_euler(
+            "xyz", [target.rx, target.ry, target.rz], degrees=True
         )
         user_index = int(self.get_parameter("user_index").value)
         tool_index = int(self.get_parameter("command_tool_index").value)
@@ -5765,6 +5852,66 @@ class CosmeticBoxSingleArmNode(Node):
                 f"{label}: final XYZ error={xyz_error*1000:.1f}mm, "
                 f"orientation error={rotation_error_deg:.1f}deg"
             )
+
+    def _preflight_near_cube_bottom_flip(
+        self,
+        grasp_z: float,
+        lift_m: float,
+        flip_rx_deg: float,
+        restore_rx_deg: float,
+    ) -> None:
+        """Validate every remaining low flip pose before closing the jaws."""
+
+        current = self._current_command_pose()
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        lifted = TcpPose(
+            current.x,
+            current.y,
+            grasp_z + lift_m,
+            current.rx,
+            current.ry,
+            current.rz,
+        )
+        lifted_joints = self.controller.inverse_kinematics(
+            lifted,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=self.controller.current_joint(),
+        )
+        flipped = self._tool_rx_target_pose(lifted, flip_rx_deg)
+        flipped_joints = self.controller.inverse_kinematics(
+            flipped,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=lifted_joints,
+        )
+        returned = TcpPose(
+            flipped.x,
+            flipped.y,
+            grasp_z,
+            flipped.rx,
+            flipped.ry,
+            flipped.rz,
+        )
+        returned_joints = self.controller.inverse_kinematics(
+            returned,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=flipped_joints,
+        )
+        restored = self._tool_rx_target_pose(returned, restore_rx_deg)
+        self.controller.inverse_kinematics(
+            restored,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=returned_joints,
+        )
+        self._publish_status(
+            "near-cube bottom flip preflight passed before grasp: "
+            f"lift={lift_m*1000:.1f}mm, Tool Rx={flip_rx_deg:+.1f}deg, "
+            "table return and pickup-attitude restore are reachable"
+        )
 
     def _wait_for_bottom_center_tracked_pose(self) -> TcpPose:
         """Wait for one fresh D405 target published after the second Tool-Rx."""
@@ -5871,6 +6018,193 @@ class CosmeticBoxSingleArmNode(Node):
             or abs(float(final_joints[watch_index]) - target_deg) > tolerance_deg
         ):
             raise RuntimeError("Bottom recovery did not reach the nearest 90deg face")
+
+    def _execute_turntable_near_cube_bottom_flip(
+        self,
+        grasp_pose: TcpPose,
+        max_opening: float,
+        motion: dict[str, int],
+    ) -> None:
+        """Flip a cube-like bottom barcode onto a side and regrasp in place."""
+
+        initial_rx_deg = float(
+            self.get_parameter("bottom_near_cube_initial_tool_rx_deg").value
+        )
+        flip_rx_deg = float(
+            self.get_parameter("bottom_near_cube_flip_tool_rx_deg").value
+        )
+        restore_rx_deg = float(
+            self.get_parameter("bottom_near_cube_restore_tool_rx_deg").value
+        )
+        lift_m = float(
+            self.get_parameter("bottom_near_cube_flip_lift_m").value
+        )
+        if abs(initial_rx_deg + 45.0) > 1e-6:
+            raise RuntimeError("Near-cube bottom flip requires initial Tool Rx=-45deg")
+        if abs(flip_rx_deg - 90.0) > 1e-6:
+            raise RuntimeError("Near-cube bottom flip requires Tool Rx=+90deg")
+        if abs(restore_rx_deg + 45.0) > 1e-6:
+            raise RuntimeError("Near-cube bottom flip requires restore Tool Rx=-45deg")
+        if not (0.020 <= lift_m <= 0.200):
+            raise RuntimeError(
+                "bottom_near_cube_flip_lift_m must be in [0.020, 0.200]m"
+            )
+        if not math.isfinite(max_opening) or max_opening <= 0.0:
+            raise RuntimeError("invalid gripper maximum opening for near-cube flip")
+
+        def open_fully() -> None:
+            current_position = self.gripper.read_position()
+            self.gripper.set_position(1.0, wait=False)
+            self.gripper.wait_until_stopped(
+                timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                target_position=1.0,
+                initial_position=current_position,
+                cancel_check=self._cycle_cancel_requested,
+            )
+
+        # The -45deg pickup spans a footprint diagonal. Full opening is needed
+        # here even when the normal measured-width pre-shape is much smaller.
+        with self._timed_stage("bottom_near_cube_full_open"):
+            open_fully()
+        with self._timed_stage("bottom_near_cube_tool_rx_minus_45_pick"):
+            self._bottom_center_tool_rx(
+                initial_rx_deg,
+                "near-cube bottom flip pickup Tool-Rx rotation",
+            )
+        with self._timed_stage("bottom_near_cube_motion_preflight"):
+            try:
+                requested_lift_m = lift_m
+                candidate_lifts_m = [requested_lift_m]
+                while candidate_lifts_m[-1] > 0.020 + 1e-9:
+                    candidate_lifts_m.append(
+                        max(0.020, candidate_lifts_m[-1] - 0.005)
+                    )
+                last_preflight_error: Optional[RuntimeError] = None
+                for candidate_lift_m in candidate_lifts_m:
+                    try:
+                        self._preflight_near_cube_bottom_flip(
+                            grasp_pose.z,
+                            candidate_lift_m,
+                            flip_rx_deg,
+                            restore_rx_deg,
+                        )
+                        lift_m = candidate_lift_m
+                        break
+                    except RuntimeError as exc:
+                        last_preflight_error = exc
+                else:
+                    assert last_preflight_error is not None
+                    raise last_preflight_error
+                if lift_m < requested_lift_m - 1e-9:
+                    self._publish_status(
+                        "near-cube requested flip lift was unreachable at this XY; "
+                        f"using the preflight-verified clearance "
+                        f"{requested_lift_m*1000:.1f}->{lift_m*1000:.1f}mm"
+                    )
+            except RuntimeError:
+                # The jaws are still open. Recover the known upright attitude
+                # so an unreachable later pose cannot strand a held object.
+                self._bottom_center_tool_rx(
+                    -initial_rx_deg,
+                    "near-cube preflight failure upright recovery",
+                )
+                raise
+        with self._timed_stage("bottom_near_cube_close"):
+            self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
+            self.gripper.close(
+                wait=True,
+                cancel_check=self._cycle_cancel_requested,
+            )
+        with self._timed_stage("bottom_near_cube_grasp_confirm"):
+            self._confirm_grasp_before_lift(max_opening, max_opening)
+
+        with self._timed_stage("bottom_near_cube_short_lift"):
+            self._bottom_center_linear_z(
+                grasp_pose.z + lift_m,
+                motion,
+                "near-cube bottom flip table-clear lift",
+                lifting=True,
+            )
+        with self._timed_stage("bottom_near_cube_tool_rx_plus_90"):
+            self._validate_grasp_feedback(
+                "before near-cube Tool-Rx +90deg flip", max_opening
+            )
+            self._bottom_center_tool_rx(
+                flip_rx_deg,
+                "near-cube bottom-to-side Tool-Rx rotation",
+            )
+            self._validate_grasp_feedback(
+                "after near-cube Tool-Rx +90deg flip", max_opening
+            )
+
+        # Returning to the original grasp TCP Z places the near-cube back on
+        # the same support surface without embedding the configured Tool-1
+        # turntable surface Z directly into a TCP-centre command.
+        with self._timed_stage("bottom_near_cube_return_table"):
+            self._bottom_center_linear_z(
+                grasp_pose.z,
+                motion,
+                "near-cube bottom flip return to table",
+                lifting=False,
+            )
+        with self._timed_stage("bottom_near_cube_release"):
+            open_fully()
+        with self._timed_stage("bottom_near_cube_tool_rx_minus_45_restore"):
+            self._bottom_center_tool_rx(
+                restore_rx_deg,
+                "near-cube restore normal pickup Tool-Rx attitude",
+            )
+        with self._timed_stage("bottom_near_cube_final_close"):
+            self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
+            self.gripper.close(
+                wait=True,
+                cancel_check=self._cycle_cancel_requested,
+            )
+        with self._timed_stage("bottom_near_cube_final_grasp_confirm"):
+            self._confirm_grasp_before_lift(max_opening, max_opening)
+        self._publish_status(
+            "near-cube bottom barcode is now on a side; final in-place grasp "
+            "confirmed and ready for the standard side-barcode lift and placement"
+        )
+
+    def _execute_pregrasped_near_cube_side_cycle(
+        self,
+        motion: dict[str, int],
+        max_opening: float,
+    ) -> None:
+        """Lift and place a near-cube already regrasped after its table flip."""
+
+        face_snap_precompleted = False
+        side_face_snap = bool(
+            self.get_parameter("barcode_snap_to_nearest_face").value
+        )
+        if side_face_snap:
+            with self._timed_stage("turntable_lift_face_snap"):
+                face_snap_precompleted = self._execute_turntable_lift_face_snap(motion)
+        else:
+            with self._timed_stage("turntable_safe_departure_lift"):
+                self._execute_turntable_safe_departure_lift(motion)
+        self._require_cycle_active("after near-cube side-barcode lift")
+        with self._timed_stage("post_lift_grasp_check"):
+            self._validate_grasp_feedback(
+                "at turntable safe departure height after near-cube flip",
+                max_opening,
+            )
+        if side_face_snap and not face_snap_precompleted:
+            with self._timed_stage("d435_side_nearest_face_snap"):
+                self._snap_turntable_side_to_nearest_face(motion)
+            with self._timed_stage("post_face_snap_grasp_check"):
+                self._validate_grasp_feedback(
+                    "after near-cube side nearest-90deg J6 alignment",
+                    max_opening,
+                )
+        self._mark_turntable_material_removed()
+        self._publish_status(
+            "near-cube side-barcode grasp departed the turntable; proceeding "
+            "directly to the standard fixed side-barcode placement"
+        )
+        self._reset_barcode_search_travel()
+        self._place_as_side_barcode_box(motion)
 
     def _execute_turntable_bottom_center_recovery(
         self,

@@ -13,6 +13,7 @@ from dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3 import (
     CosmeticBoxSingleArmNode,
     PregraspObservation,
     RecoverableGraspError,
+    box_three_dimension_ratio,
     select_nearest_square_grasp_orientation,
 )
 
@@ -72,6 +73,15 @@ def test_near_square_grasp_treats_180deg_long_edge_as_equivalent():
     assert selected_deg == pytest.approx(8.0)
 
 
+def test_near_cube_ratio_uses_physical_width_and_rejects_flat_square_box():
+    cube_ratio = box_three_dimension_ratio(0.0665, 0.0731, 1.213)
+    flat_ratio = box_three_dimension_ratio(0.0775, 0.0317, 1.029)
+
+    assert cube_ratio == pytest.approx(1.333, abs=0.002)
+    assert cube_ratio < 1.35
+    assert flat_ratio > 2.0
+
+
 def test_turntable_bottom_branch_routes_before_legacy_close_and_transfer():
     node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
     params = {
@@ -120,6 +130,75 @@ def test_turntable_bottom_branch_routes_before_legacy_close_and_transfer():
     node._execute_one_cycle(pose, 0.055, 0.038, 0.121)
 
     assert actions == ["preshape", "bottom_center_recovery", "removed", "top_place"]
+
+
+def test_near_cube_bottom_branch_regrasps_in_place_then_routes_as_side():
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    params = {
+        "offset_grasp_enabled": True,
+        "grasp_z_offset_m": -0.004,
+        "grasp_z_offset_limit_m": 0.010,
+        "minimum_safe_tcp_z_m": 0.129,
+        "turntable_enabled": True,
+        "turntable_height_safety_enabled": False,
+        "bottom_barcode_recovery_enabled": True,
+        "bottom_near_cube_flip_enabled": True,
+        "bottom_near_cube_max_dimension_ratio": 1.35,
+        "near_square_grasp_aspect_ratio": 1.20,
+        "dh_max_opening_m": 0.095,
+        "user_index": 0,
+        "command_tool_index": 1,
+        "top_surface_barcode_enabled": True,
+    }
+    node.get_parameter = lambda name: SimpleNamespace(value=params[name])
+    node._motion_profile = lambda: {}
+    node._apply_grasp_z_safety = lambda pose, *_args: pose
+    node._publish_status = lambda _message: None
+    node._timed_stage = stage
+    node._require_cycle_active = lambda _label: None
+    node._wait_for_secondary_y_clearance = lambda _label: None
+    node._set_top_surface_barcode_window = lambda _enabled: None
+    node._current_top_surface_barcode = lambda: ""
+    node._execute_offset_entry = lambda *_args, **_kwargs: None
+    node.data_lock = threading.RLock()
+    node.pregrasp_pose_count = 0
+    pose = TcpPose(0.56, -0.15, 0.190, 178.0, 2.0, -4.0)
+    node._current_command_pose = lambda: pose
+    node.controller = SimpleNamespace(
+        inverse_kinematics=lambda *_args, **_kwargs: [0.0] * 6,
+        current_joint=lambda: [0.0] * 6,
+    )
+    actions = []
+    node.gripper = SimpleNamespace(
+        read_position=lambda: 0.75,
+        set_position=lambda *_args, **_kwargs: actions.append("preshape"),
+    )
+    node._execute_turntable_near_cube_bottom_flip = (
+        lambda *_args: actions.append("near_cube_flip")
+    )
+    node._execute_pregrasped_near_cube_side_cycle = (
+        lambda *_args: actions.append("side_cycle")
+    )
+    node._execute_turntable_bottom_center_recovery = lambda *_args: pytest.fail(
+        "near cube must not use the non-cube bottom recovery"
+    )
+    node._mark_turntable_material_removed = lambda: pytest.fail(
+        "material remains on the turntable until the reacquired side pickup"
+    )
+
+    node._execute_one_cycle(
+        pose,
+        width_m=0.0748,
+        height_m=0.0731,
+        length_m=0.0665,
+        aspect_ratio=1.213,
+    )
+
+    assert actions == [
+        "preshape",
+        "near_cube_flip",
+        "side_cycle",
+    ]
 
 
 def test_preconfirmed_side_barcode_uses_direct_centre_hover_and_vertical_descent():
@@ -327,6 +406,90 @@ def make_sequence_node(*, initial_j6=0.0, j6_limit=355.0):
     )
     node.controller = SimpleNamespace(current_joint=lambda: joints[0], move_joint=move_joint)
     return node, pose[0], events
+
+
+def test_near_cube_bottom_flip_uses_requested_tool_rx_sequence_and_regrasps_in_place():
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    params = {
+        "bottom_near_cube_initial_tool_rx_deg": -45.0,
+        "bottom_near_cube_flip_tool_rx_deg": 90.0,
+        "bottom_near_cube_restore_tool_rx_deg": -45.0,
+        "bottom_near_cube_flip_lift_m": 0.030,
+        "dh_timeout_s": 3.0,
+        "dh_grasp_force": 50,
+    }
+    node.get_parameter = lambda name: SimpleNamespace(value=params[name])
+    node._timed_stage = stage
+    node._require_cycle_active = lambda _label: None
+    node._cycle_cancel_requested = lambda: False
+    node._publish_status = lambda _message: None
+    events = []
+    pose = [TcpPose(0.56, -0.15, 0.134, 178.0, 2.0, -4.0)]
+    position = [0.75]
+
+    def set_position(value, **_kwargs):
+        position[0] = value
+        events.append(("open", round(value, 3)))
+
+    def close(**_kwargs):
+        position[0] = 0.60
+        events.append(("close", round(pose[0].z, 3)))
+
+    def tool_rx(delta_deg, _label):
+        events.append(("tool_rx", delta_deg, round(pose[0].z, 3)))
+
+    def move_z(target_z, _motion, _label, *, lifting, target_xy=None):
+        assert target_xy is None
+        pose[0] = TcpPose(
+            pose[0].x,
+            pose[0].y,
+            target_z,
+            pose[0].rx,
+            pose[0].ry,
+            pose[0].rz,
+        )
+        events.append(("z", round(target_z, 3), lifting))
+
+    node._current_command_pose = lambda: pose[0]
+    node._bottom_center_tool_rx = tool_rx
+    node._preflight_near_cube_bottom_flip = lambda *_args: None
+    node._bottom_center_linear_z = move_z
+    node._confirm_grasp_before_lift = (
+        lambda *_args: events.append(("confirm", round(pose[0].z, 3)))
+    )
+    node._validate_grasp_feedback = (
+        lambda label, _opening: events.append(("validate", label))
+    )
+    node.gripper = SimpleNamespace(
+        read_position=lambda: position[0],
+        set_position=set_position,
+        wait_until_stopped=lambda **_kwargs: None,
+        set_force=lambda *_args: None,
+        close=close,
+    )
+
+    result = node._execute_turntable_near_cube_bottom_flip(
+        pose[0],
+        max_opening=0.095,
+        motion={},
+    )
+
+    assert events == [
+        ("open", 1.0),
+        ("tool_rx", -45.0, 0.134),
+        ("close", 0.134),
+        ("confirm", 0.134),
+        ("z", 0.164, True),
+        ("validate", "before near-cube Tool-Rx +90deg flip"),
+        ("tool_rx", 90.0, 0.164),
+        ("validate", "after near-cube Tool-Rx +90deg flip"),
+        ("z", 0.134, False),
+        ("open", 1.0),
+        ("tool_rx", -45.0, 0.134),
+        ("close", 0.134),
+        ("confirm", 0.134),
+    ]
+    assert result is None
 
 
 def test_bottom_center_sequence_accepts_j6_xy_shift_and_returns_to_absolute_grasp_z():
