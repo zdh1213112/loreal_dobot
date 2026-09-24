@@ -617,12 +617,15 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("near_square_long_axis_min_clearance_m", 0.005)
 
         # V3 turntable: the controller toggles run/stop on every tested
-        # 0->1->0 pulse.  The D435 scans only while this node owns the active
-        # four-second window; D405 localization is requested after stop/settle.
+        # 0->1->0 pulse.  The D435 scans only while this node owns the configured
+        # scan window; D405 localization is requested after stop/settle.
         self.declare_parameter("turntable_enabled", True)
         self.declare_parameter("turntable_do_index", 1)
         self.declare_parameter("turntable_pulse_ms", 300)
-        self.declare_parameter("turntable_scan_timeout_s", 3.0)
+        # This is a time-only table with no encoder/index feedback.  One
+        # measured steady-speed revolution is about 3.2 s, so retain 0.4 s of
+        # coverage margin for start-up acceleration, load and speed variation.
+        self.declare_parameter("turntable_scan_timeout_s", 3.6)
         # Inspect the already-stopped face before rotating. D435 runs
         # continuously, so a correctly oriented placement should not cause an
         # unnecessary table revolution.
@@ -739,6 +742,10 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("bottom_center_first_tool_rx_delta_deg", 70.0)
         self.declare_parameter("bottom_center_release_tool_rx_delta_deg", 70.0)
         self.declare_parameter("bottom_center_tracking_timeout_s", 2.0)
+        # Both bottom-face branches start from a stable J6 neighbourhood. If
+        # the wrist is farther than this from zero, temporarily pick the box,
+        # lift it clear, set J6=0, put it back, and continue from the new centre.
+        self.declare_parameter("bottom_start_j6_zero_threshold_deg", 40.0)
         # A genuinely cube-like box uses a shorter single table flip: open at
         # the detected centre, Tool-Rx -45, grasp, lift only enough to clear
         # the table, Tool-Rx +90, put down, release, and Tool-Rx -45 back to
@@ -3032,8 +3039,13 @@ class CosmeticBoxSingleArmNode(Node):
             self.turntable_state = f"{purpose.upper()}_PULSE"
         index = int(self.get_parameter("turntable_do_index").value)
         pulse_ms = int(self.get_parameter("turntable_pulse_ms").value)
+        pulse_requested_at = time.monotonic()
         try:
-            self.controller.pulse_digital_output(index, pulse_ms)
+            edge_at = self.controller.pulse_digital_output(
+                index,
+                pulse_ms,
+                pre_low_hold_ms=0,
+            )
         except Exception:
             with self.turntable_lock:
                 self.turntable_state = "UNKNOWN"
@@ -3041,7 +3053,8 @@ class CosmeticBoxSingleArmNode(Node):
         with self.turntable_lock:
             self.turntable_state = result
         self._publish_status(
-            f"turntable {purpose} pulse completed on DO{index}; state={result}"
+            f"turntable {purpose} pulse completed on DO{index}; state={result}; "
+            f"trigger_edge_delay={(edge_at - pulse_requested_at) * 1000:.0f}ms"
         )
 
     def _scan_turntable_for_side_barcode(
@@ -5233,6 +5246,13 @@ class CosmeticBoxSingleArmNode(Node):
                     "D435 found no side barcode and D405 found no top barcode, "
                     "but bottom-barcode recovery is disabled"
                 )
+            actual_grasp_pose = self._normalize_bottom_start_j6_if_needed(
+                actual_grasp_pose,
+                pre_shape_position,
+                width_m,
+                max_opening,
+                motion,
+            )
             dimension_ratio = (
                 box_three_dimension_ratio(length_m, height_m, float(aspect_ratio))
                 if aspect_ratio is not None
@@ -5965,49 +5985,168 @@ class CosmeticBoxSingleArmNode(Node):
             "final bottom regrasp descent was not commanded"
         )
 
+    def _normalize_bottom_start_j6_if_needed(
+        self,
+        grasp_pose: TcpPose,
+        pre_shape_position: float,
+        width_m: float,
+        max_opening: float,
+        motion: dict[str, int],
+    ) -> TcpPose:
+        """Put a bottom-face box back with J6=0 when the start error is large."""
+
+        joints = [float(value) for value in self.controller.current_joint()]
+        if len(joints) != 6:
+            raise RuntimeError("Bottom start J6 check requires 6 joint values")
+        current_j6_deg = joints[5]
+        threshold_deg = abs(
+            float(
+                self.get_parameter("bottom_start_j6_zero_threshold_deg").value
+            )
+        )
+        if not math.isfinite(threshold_deg) or threshold_deg <= 0.0:
+            raise RuntimeError(
+                "bottom_start_j6_zero_threshold_deg must be positive and finite"
+            )
+        if abs(current_j6_deg) < threshold_deg:
+            self._publish_status(
+                f"bottom-face start J6={current_j6_deg:.1f}deg is within "
+                f"±{threshold_deg:.1f}deg of zero; continuing without a "
+                "normalization pick"
+            )
+            return self._current_command_pose()
+
+        self._publish_status(
+            f"bottom-face start J6={current_j6_deg:.1f}deg is outside "
+            f"±{threshold_deg:.1f}deg; picking the box to normalize J6 to 0deg"
+        )
+        with self._timed_stage("bottom_start_j6_zero_close"):
+            self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
+            self.gripper.close(
+                wait=True,
+                cancel_check=self._cycle_cancel_requested,
+            )
+        with self._timed_stage("bottom_start_j6_zero_grasp_confirm"):
+            self._confirm_grasp_before_lift(max_opening, width_m)
+
+        lift_m = float(self.get_parameter("grasp_lift_m").value)
+        with self._timed_stage("bottom_start_j6_zero_lift"):
+            self._bottom_center_linear_z(
+                grasp_pose.z + lift_m,
+                motion,
+                "bottom-face J6-zero preparation lift",
+                lifting=True,
+            )
+        with self._timed_stage("bottom_start_j6_zero_move"):
+            self._validate_grasp_feedback(
+                "before bottom-face start J6 normalization", max_opening
+            )
+            current_joints = [
+                float(value) for value in self.controller.current_joint()
+            ]
+            if len(current_joints) != 6:
+                raise RuntimeError("Bottom start J6 normalization requires 6 joints")
+            safe_limit_deg = abs(
+                float(
+                    self.get_parameter(
+                        "barcode_flip_safe_joint_limit_deg"
+                    ).value
+                )
+            )
+            if safe_limit_deg <= 0.0:
+                raise RuntimeError(
+                    "barcode_flip_safe_joint_limit_deg must be positive"
+                )
+            target_joints = list(current_joints)
+            target_joints[5] = 0.0
+            self.controller.move_joint(
+                target_joints,
+                speed=motion["barcode_alignment_speed"],
+                accel=motion["barcode_alignment_acc"],
+            )
+            self._require_cycle_active("after bottom-face start J6 normalization")
+            final_joints = self.controller.current_joint()
+            tolerance_deg = max(
+                1.0,
+                abs(
+                    float(
+                        self.get_parameter(
+                            "barcode_flip_jog_tolerance_deg"
+                        ).value
+                    )
+                ),
+            )
+            if (
+                len(final_joints) != 6
+                or abs(float(final_joints[5])) > tolerance_deg
+            ):
+                raise RuntimeError("Bottom start J6 did not reach zero")
+            self._validate_grasp_feedback(
+                "after bottom-face start J6 normalization", max_opening
+            )
+
+        normalized_pose = self._current_command_pose()
+        xy_shift_m = math.hypot(
+            normalized_pose.x - grasp_pose.x,
+            normalized_pose.y - grasp_pose.y,
+        )
+        self._publish_status(
+            "bottom-face J6 normalized to zero; accepting TCP XY shift "
+            f"of {xy_shift_m*1000:.1f}mm as the new material centre"
+        )
+        with self._timed_stage("bottom_start_j6_zero_return_table"):
+            self._bottom_center_linear_z(
+                grasp_pose.z,
+                motion,
+                "bottom-face J6-zero return to table",
+                lifting=False,
+            )
+        with self._timed_stage("bottom_start_j6_zero_release"):
+            current_position = self.gripper.read_position()
+            self.gripper.set_position(pre_shape_position, wait=False)
+            self.gripper.wait_until_stopped(
+                timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                target_position=pre_shape_position,
+                initial_position=current_position,
+                cancel_check=self._cycle_cancel_requested,
+            )
+        return self._current_command_pose()
+
     def _snap_bottom_center_to_nearest_face(
         self,
         motion: dict[str, int],
     ) -> None:
-        """Snap J6 to the nearest 90-degree grid after a short table-clear lift."""
+        """Finish the ordinary bottom branch's lifted J6 alignment at zero."""
 
-        watch_index = max(
-            0,
-            min(5, int(self.get_parameter("barcode_flip_watch_joint_index").value)),
-        )
+        watch_index = 5
         joints = [float(value) for value in self.controller.current_joint()]
         if len(joints) != 6:
             raise RuntimeError("Bottom recovery face snap requires 6 joint values")
         current_deg = joints[watch_index]
-        target_deg = nearest_face_anchor_deg(
-            current_deg,
-            float(self.get_parameter("d435_side_face_reference_joint_deg").value),
-            float(self.get_parameter("barcode_flip_step_deg").value),
-            abs(float(self.get_parameter("barcode_flip_safe_joint_limit_deg").value)),
-        )
+        target_deg = 0.0
         correction_deg = target_deg - current_deg
         if abs(correction_deg) <= 0.2:
             self._publish_status(
-                f"bottom recovery J6 already at nearest 90deg face: {current_deg:.1f}deg"
+                f"bottom recovery J6 already aligned to zero: {current_deg:.1f}deg"
             )
             return
         if not self._is_barcode_flip_joint_safe(joints, correction_deg):
             raise RuntimeError(
-                "Bottom recovery nearest 90deg face exceeds the configured joint limit"
+                "Bottom recovery J6-zero alignment exceeds the configured joint limit"
             )
         target_joints = list(joints)
         target_joints[watch_index] = target_deg
         self._publish_status(
-            f"bottom recovery: snapping J{watch_index + 1} to nearest 90deg face "
+            f"bottom recovery: aligning J{watch_index + 1} to zero "
             f"{current_deg:.1f}->{target_deg:.1f}deg"
         )
-        self._require_cycle_active("before bottom recovery nearest-face snap")
+        self._require_cycle_active("before bottom recovery J6-zero alignment")
         self.controller.move_joint(
             target_joints,
             speed=motion["barcode_alignment_speed"],
             accel=motion["barcode_alignment_acc"],
         )
-        self._require_cycle_active("after bottom recovery nearest-face snap")
+        self._require_cycle_active("after bottom recovery J6-zero alignment")
         final_joints = self.controller.current_joint()
         tolerance_deg = max(
             1.0,
@@ -6017,7 +6156,7 @@ class CosmeticBoxSingleArmNode(Node):
             len(final_joints) != 6
             or abs(float(final_joints[watch_index]) - target_deg) > tolerance_deg
         ):
-            raise RuntimeError("Bottom recovery did not reach the nearest 90deg face")
+            raise RuntimeError("Bottom recovery did not reach J6 zero")
 
     def _execute_turntable_near_cube_bottom_flip(
         self,
@@ -9542,7 +9681,7 @@ class CosmeticBoxControlWindow(QMainWindow):
         )
         form.addRow("转盘控制 DO", self.turntable_do_index)
         form.addRow("转盘 0→1→0 脉冲", self.turntable_pulse_ms)
-        form.addRow("D435 四周码超时秒（固定）", self.turntable_scan_timeout)
+        form.addRow("D435 四周码超时秒（含整圈余量）", self.turntable_scan_timeout)
         form.addRow("转盘停止后停稳等待秒", self.turntable_settle)
         form.addRow("转盘表面 User Z mm（负值=未标定/禁止下降）", self.turntable_surface_z)
         form.addRow("V3 D405→User Z 标定补偿 mm", self.vision_user_z_bias)

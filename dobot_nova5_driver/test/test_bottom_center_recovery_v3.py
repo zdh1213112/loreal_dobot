@@ -116,6 +116,9 @@ def test_turntable_bottom_branch_routes_before_legacy_close_and_transfer():
         current_joint=lambda: [0.0] * 6,
     )
     actions = []
+    node._normalize_bottom_start_j6_if_needed = (
+        lambda grasp_pose, *_args: actions.append("j6_prepare") or grasp_pose
+    )
     node.gripper = SimpleNamespace(
         read_position=lambda: 0.6,
         set_position=lambda *_args, **_kwargs: actions.append("preshape"),
@@ -129,7 +132,13 @@ def test_turntable_bottom_branch_routes_before_legacy_close_and_transfer():
 
     node._execute_one_cycle(pose, 0.055, 0.038, 0.121)
 
-    assert actions == ["preshape", "bottom_center_recovery", "removed", "top_place"]
+    assert actions == [
+        "preshape",
+        "j6_prepare",
+        "bottom_center_recovery",
+        "removed",
+        "top_place",
+    ]
 
 
 def test_near_cube_bottom_branch_regrasps_in_place_then_routes_as_side():
@@ -169,6 +178,9 @@ def test_near_cube_bottom_branch_regrasps_in_place_then_routes_as_side():
         current_joint=lambda: [0.0] * 6,
     )
     actions = []
+    node._normalize_bottom_start_j6_if_needed = (
+        lambda grasp_pose, *_args: actions.append("j6_prepare") or grasp_pose
+    )
     node.gripper = SimpleNamespace(
         read_position=lambda: 0.75,
         set_position=lambda *_args, **_kwargs: actions.append("preshape"),
@@ -196,6 +208,7 @@ def test_near_cube_bottom_branch_regrasps_in_place_then_routes_as_side():
 
     assert actions == [
         "preshape",
+        "j6_prepare",
         "near_cube_flip",
         "side_cycle",
     ]
@@ -304,6 +317,7 @@ def make_sequence_node(*, initial_j6=0.0, j6_limit=355.0):
         "bottom_center_first_rz_delta_deg": 40.0,
         "bottom_center_first_tool_rx_delta_deg": 70.0,
         "bottom_center_release_tool_rx_delta_deg": 70.0,
+        "bottom_start_j6_zero_threshold_deg": 40.0,
         "grasp_lift_m": 0.060,
         "bottom_flip_lift_m": 0.160,
         "bottom_flip_j6_half_turn_deg": 180.0,
@@ -406,6 +420,45 @@ def make_sequence_node(*, initial_j6=0.0, j6_limit=355.0):
     )
     node.controller = SimpleNamespace(current_joint=lambda: joints[0], move_joint=move_joint)
     return node, pose[0], events
+
+
+def test_bottom_start_j6_inside_40deg_continues_without_pick():
+    node, grasp_pose, events = make_sequence_node(initial_j6=-39.9)
+
+    result = node._normalize_bottom_start_j6_if_needed(
+        grasp_pose,
+        pre_shape_position=0.6,
+        width_m=0.057,
+        max_opening=0.095,
+        motion={"barcode_alignment_speed": 20, "barcode_alignment_acc": 20},
+    )
+
+    assert result == grasp_pose
+    assert events == []
+
+
+def test_bottom_start_j6_at_threshold_picks_zeros_and_replaces_box():
+    node, grasp_pose, events = make_sequence_node(initial_j6=40.0)
+    node._is_barcode_flip_joint_safe = lambda *_args: True
+
+    result = node._normalize_bottom_start_j6_if_needed(
+        grasp_pose,
+        pre_shape_position=0.6,
+        width_m=0.057,
+        max_opening=0.095,
+        motion={"barcode_alignment_speed": 20, "barcode_alignment_acc": 20},
+    )
+
+    assert events == [
+        ("close", 0.134),
+        ("confirm", 0.134),
+        ("z", 0.194, True, 0.56),
+        ("j6", 0.0),
+        ("z", 0.134, False, 0.5637),
+        ("open", 0.6),
+    ]
+    assert result.x == pytest.approx(0.5637)
+    assert result.z == pytest.approx(grasp_pose.z)
 
 
 def test_near_cube_bottom_flip_uses_requested_tool_rx_sequence_and_regrasps_in_place():

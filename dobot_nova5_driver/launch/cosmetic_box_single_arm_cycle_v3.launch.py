@@ -40,16 +40,13 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_model_path",
-                default_value=(
-                    "/home/zdh/yolo_one/yolo_train_xense_load_image/outputs/"
-                    "train/obb_demo111/weights/best.onnx"
-                ),
-                description="D435 barcode detector weights; fixed-shape ONNX is the default",
+                default_value="/home/zdh/tool/data/D405_barcode_labels/model/best.pt",
+                description="D435 barcode detector weights; D405 barcode-label PT weights by default",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_inference_provider",
                 default_value="cuda",
-                description="ONNX provider: cuda (default with CPU fallback), cpu, or auto",
+                description="ONNX provider when using ONNX weights; PT uses Ultralytics/PyTorch",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_image_size",
@@ -82,9 +79,39 @@ def generate_launch_description() -> LaunchDescription:
                 description="Unsharp strength applied only to D435 fallback tiles",
             ),
             DeclareLaunchArgument(
+                "turntable_d435_detail_roi_x",
+                default_value="280",
+                description="Fixed D435 turntable detail-view left coordinate",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detail_roi_y",
+                default_value="220",
+                description="Fixed D435 turntable detail-view top coordinate",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detail_roi_width",
+                default_value="760",
+                description="Fixed D435 turntable detail-view width",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detail_roi_height",
+                default_value="440",
+                description="Fixed D435 turntable detail-view height",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_full_frame_interval",
+                default_value="6",
+                description="Run one full-frame D435 YOLO pass every N detection frames",
+            ),
+            DeclareLaunchArgument(
                 "turntable_d435_min_candidate_area_ratio",
                 default_value="0.01",
                 description="Reject tiny D435 YOLO boxes below this ROI area fraction",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_moving_stripes",
+                default_value="true",
+                description="Full-frame moving 1-D stripe fallback when the barcode model misses",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_preview_interval_s",
@@ -95,6 +122,11 @@ def generate_launch_description() -> LaunchDescription:
                 "turntable_d435_preview_jpeg_quality",
                 default_value="92",
                 description="JPEG quality of the local D435 preview only",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_sample_dir",
+                default_value="/home/zdh/ffs_ws/d435_barcode_samples",
+                description="Directory for full-resolution D435 PNGs saved with Space",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detect_interval_s",
@@ -108,7 +140,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_exposure",
-                default_value="80",
+                default_value="120",
                 description="D435 RGB manual exposure for motion-freezing barcode images",
             ),
             DeclareLaunchArgument(
@@ -149,12 +181,15 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "turntable_pulse_ms",
                 default_value="300",
-                description="Low reset and high hold duration of each 0->1->0 toggle pulse",
+                description="High hold duration of each 0->1->0 toggle pulse",
             ),
             DeclareLaunchArgument(
                 "turntable_scan_timeout_s",
-                default_value="3.0",
-                description="Fixed D435 side-barcode classification window",
+                default_value="3.6",
+                description=(
+                    "D435 side-barcode search window: measured 3.2s revolution "
+                    "plus 0.4s coverage margin"
+                ),
             ),
             DeclareLaunchArgument(
                 "turntable_stationary_barcode_check_s",
@@ -251,6 +286,14 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="0.030",
                 description=(
                     "Short vertical clearance used by the near-cube Tool-Rx flip"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_start_j6_zero_threshold_deg",
+                default_value="40.0",
+                description=(
+                    "Re-place a bottom-face box with J6=0 when its initial "
+                    "absolute J6 angle reaches this threshold"
                 ),
             ),
             DeclareLaunchArgument(
@@ -701,8 +744,38 @@ def generate_launch_description() -> LaunchDescription:
                     ],
                     "-p",
                     [
+                        "detail_roi_x:=",
+                        LaunchConfiguration("turntable_d435_detail_roi_x"),
+                    ],
+                    "-p",
+                    [
+                        "detail_roi_y:=",
+                        LaunchConfiguration("turntable_d435_detail_roi_y"),
+                    ],
+                    "-p",
+                    [
+                        "detail_roi_width:=",
+                        LaunchConfiguration("turntable_d435_detail_roi_width"),
+                    ],
+                    "-p",
+                    [
+                        "detail_roi_height:=",
+                        LaunchConfiguration("turntable_d435_detail_roi_height"),
+                    ],
+                    "-p",
+                    [
+                        "full_frame_interval:=",
+                        LaunchConfiguration("turntable_d435_full_frame_interval"),
+                    ],
+                    "-p",
+                    [
                         "yolo_min_candidate_area_ratio:=",
                         LaunchConfiguration("turntable_d435_min_candidate_area_ratio"),
+                    ],
+                    "-p",
+                    [
+                        "moving_stripes_enabled:=",
+                        LaunchConfiguration("turntable_d435_moving_stripes"),
                     ],
                     "-p",
                     [
@@ -713,6 +786,11 @@ def generate_launch_description() -> LaunchDescription:
                     [
                         "preview_jpeg_quality:=",
                         LaunchConfiguration("turntable_d435_preview_jpeg_quality"),
+                    ],
+                    "-p",
+                    [
+                        "sample_save_dir:=",
+                        LaunchConfiguration("turntable_d435_sample_dir"),
                     ],
                     "-p",
                     [
@@ -847,6 +925,12 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "bottom_near_cube_flip_lift_m": ParameterValue(
                             LaunchConfiguration("bottom_near_cube_flip_lift_m"),
+                            value_type=float,
+                        ),
+                        "bottom_start_j6_zero_threshold_deg": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_start_j6_zero_threshold_deg"
+                            ),
                             value_type=float,
                         ),
                         "turntable_surface_tolerance_m": ParameterValue(

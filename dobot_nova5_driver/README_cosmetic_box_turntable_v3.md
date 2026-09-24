@@ -63,8 +63,12 @@ Tool 1姿态分别与Tool Y对齐长边的0°/180°等价姿态、Tool Y对齐�
 
 V3使用`length / aspect`还原不含夹爪预张余量的物料宽度，再比较长、宽、高
 三维尺寸。默认最大尺寸/最小尺寸
-`<= bottom_near_cube_max_dimension_ratio=1.35`时使用近似正方体翻面：夹爪在
-D405抓取中心完全打开，固定TCP XYZ绕当前Tool 1 X轴执行Rx -45°后夹紧；保持
+`<= bottom_near_cube_max_dimension_ratio=1.35`时使用近似正方体翻面。
+两个底面分支进入各自翻面前都会检查当前J6：`|J6|<40°`时直接继续；
+`|J6|>=40°`时先在物料中心夹紧、上升60 mm、将J6直接对齐0°，再下降回原始
+抓取绝对Z并松爪。J6归零导致的少量TCP XY变化作为新的物料中心，后续不拉回
+旧XY。完成这项共同准备后，近似正方体分支在D405抓取中心完全打开夹爪，固定
+TCP XYZ绕当前Tool 1 X轴执行Rx -45°后夹紧；保持
 当前XY短距离上升`bottom_near_cube_flip_lift_m=0.030`，固定TCP XYZ执行
 Tool Rx +90°，再保持当前XY下降回本轮初始抓取绝对Z，将物料放回转盘并完全
 打开夹爪。随后固定TCP XYZ执行Tool Rx -45°恢复正常抓取姿态，并在原地再次
@@ -77,8 +81,8 @@ D405定位。条码此时已从底面翻到侧面，所以最终夹持确认后�
 不满足上述三维近似正方体条件的V3转盘底面翻转在到达本轮初始抓取深度后直接
 开始，跳过320 mm初次抬升、
 中转关节位和User X退让。先夹紧并确认夹持，保持当前XY按`grasp_lift_m`
-上升（默认60 mm，只需离开转盘），再把J6吸附到以0°为基准的最近90°
-标准面。保持夹持在当前XYZ执行User Rz +40°，随后保持当前XY下降到本轮
+上升（默认60 mm，只需离开转盘），再把J6精确对齐到0°。
+保持夹持在当前XYZ执行User Rz +40°，随后保持当前XY下降到本轮
 首次抓取的绝对User 0 Z并松爪。夹爪打开时在固定XYZ绕当前Tool X轴执行
 Rx +70°，重新夹紧后上升160 mm并从吸附后的J6角度+180°。
 J6造成的Tool 1反馈TCP XY变化只记录、不阻止流程；随后保持当前XY下降
@@ -225,19 +229,20 @@ D405仍然根据顶面、物料高度和75%下探比例发布绝对抓取点。�
 
 ## D435扫码节点
 
-`d435_turntable_barcode_node_v3.py`绑定相机序列号 `254322071102`，使用现有条码
-YOLO权重。该权重实际是普通目标检测模型，只有class 0一个类别；权重元数据虽然把它
-命名为`box`，训练数据中的框实际是条码区域。V3只判断“有没有条码”，检测成功后固定
-发布`barcode_detected`，不再调用pyzbar放大、旋转和尝试解码。默认使用同权重导出的
-`best.onnx`，在当前CPU上保持与`best.pt`相同的检测结果并提高取样帧率。可通过
-`turntable_d435_model_path`切回PT权重；ONNX固定使用训练尺寸
+`d435_turntable_barcode_node_v3.py`绑定相机序列号 `254322071102`，默认加载
+`/home/zdh/tool/data/D405_barcode_labels/model/best.pt`。该权重是普通目标检测模型，
+只有class 0，名称为`barcode`。V3只判断“有没有条码”，检测成功后固定发布
+`barcode_detected`，不再调用pyzbar放大、旋转和尝试解码。可通过
+`turntable_d435_model_path`指定其他`.pt`或`.onnx`权重；模型推理尺寸为
 `turntable_d435_image_size:=640`。相机提前取流并预热；4秒计时不包含模型加载和相机启动。
 
-D435 ONNX默认使用`turntable_d435_inference_provider:=cuda`。节点会预加载Python环境中的
-cuDNN 9，并优先创建`CUDAExecutionProvider`；启动日志中的`provider=`给出实际Provider。
-如果CUDA初始化或推理失败，会自动重建CPU会话并记录回退原因。需要强制CPU时传入
-`turntable_d435_inference_provider:=cpu`。ONNX Runtime关于`card0/device/vendor`的设备
-枚举警告不代表CUDA失败，应以启动日志中的`provider=CUDAExecutionProvider`为准。
+`.pt`默认由Ultralytics/PyTorch运行；`turntable_d435_inference_provider`只在指定
+`.onnx`权重时生效。ONNX模式默认使用`turntable_d435_inference_provider:=cuda`。节点会
+预加载Python环境中的cuDNN 9，并优先创建`CUDAExecutionProvider`；启动日志中的
+`provider=`给出实际Provider。如果CUDA初始化或推理失败，会自动重建CPU会话并记录回退
+原因。需要强制CPU时传入`turntable_d435_inference_provider:=cpu`。ONNX Runtime关于
+`card0/device/vendor`的设备枚举警告不代表CUDA失败，应以启动日志中的
+`provider=CUDAExecutionProvider`为准。
 
 默认还启用摄像头扫码器式辅助路径：先调用OpenCV `BarcodeDetector.detect()`寻找平行条纹
 四边形，只检测位置、不解码内容。该路径在清晰图上约3ms；同一位置连续3帧成立后才确认，
@@ -298,6 +303,12 @@ D435画面右上角提供两个运行时亮暗按钮：`DARKER -`与`BRIGHTER +`
 D435手动曝光减少或增加10，并按相机实际支持范围限幅；画面上的`exposure/gain`会立即
 更新。它不会改变D405、ROI、YOLO阈值或转盘控制。也可在鼠标焦点位于D435画面时使用
 `[`和`]`执行相同调节。
+
+运行期间在D405与D435组合窗口按空格，可把相机接收到的下一帧D435原始彩色图保存为
+无标注PNG。图片保留相机原始分辨率，不包含预览框、文字和JPEG压缩。默认保存到
+`/home/zdh/ffs_ws/d435_barcode_samples`，文件名带时间戳；可用
+`turntable_d435_sample_dir`更改目录。建议在条码漏检时按空格采集，之后再给图片补标注并
+整理进训练集。
 
 V3启动时默认开启“D435 连续检测”。开启后，D435会持续在当前ROI内
 执行条码检测，画面状态显示为 `CONTINUOUS`，直到再次点击关闭；它不会启动转盘、

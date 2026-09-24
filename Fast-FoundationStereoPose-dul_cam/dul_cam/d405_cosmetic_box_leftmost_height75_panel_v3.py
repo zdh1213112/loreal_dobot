@@ -139,14 +139,14 @@ HANDOFF_CLEARANCE_CLEAR_FRAMES = 2
 HANDOFF_CLEARANCE_RIGHT_EXTENSION_M = 0.080
 HANDOFF_CLEARANCE_SIDE_MARGIN_M = 0.030
 HANDOFF_CLEARANCE_VERTICAL_GAP_M = 0.020
-HANDOFF_CLEARANCE_CHECK_HEIGHT_M = 0.180
+HANDOFF_CLEARANCE_CHECK_HEIGHT_M = 0.100
 HANDOFF_CLEARANCE_VOXEL_SIZE_M = 0.015
 HANDOFF_CLEARANCE_MIN_CLUSTER_POINTS = 30
 
 # 在发布抓取目标之前，同时检查夹爪两根手指各自的垂直下探通道。
 # 任意一侧出现连续点簇都禁止放行；SAM 目标点显式剔除，桌面由高度边界排除。
 GRIPPER_SIDE_FINGER_SPAN_M = 0.060
-GRIPPER_SIDE_TARGET_EXCLUSION_M = 0.004
+GRIPPER_SIDE_TARGET_EXCLUSION_M = 0.010
 GRIPPER_SIDE_CHECK_DEPTH_M = 0.030
 GRIPPER_SIDE_GRASP_BELOW_CENTER_FRACTION = 0.25
 GRIPPER_SIDE_VERTICAL_MARGIN_ABOVE_M = 0.080
@@ -1387,7 +1387,7 @@ def handle_key(key: int) -> None:
         clear_manual_roi()
         reset_requested = True
         clear_target_display_requested = True
-    elif key in (ord("c"), ord("C")):
+    elif key in (ord("c"), ord("C"), ord(" ")):
         message = String()
         message.data = json.dumps({"type": "key", "key": int(key)})
         d435_event_pub.publish(message)

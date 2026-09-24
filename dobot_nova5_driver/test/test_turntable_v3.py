@@ -751,3 +751,55 @@ def test_controller_turntable_pulse_is_zero_one_zero(monkeypatch):
 
     assert dashboard.commands == [(3, 0), (3, 1), (3, 0)]
     assert controller.read_digital_output(3) == 0
+
+
+def test_controller_turntable_stop_skips_redundant_low_hold(monkeypatch):
+    controller = DobotNova5Controller("192.0.2.1")
+    dashboard = FakeDashboard()
+    controller.dashboard = dashboard
+    sleeps = []
+    monkeypatch.setattr(
+        "dobot_nova5_driver.controller_v3.time.sleep", sleeps.append
+    )
+
+    edge_at = controller.pulse_digital_output(
+        3, 300, pre_low_hold_ms=0
+    )
+
+    assert edge_at > 0.0
+    assert dashboard.commands == [(3, 0), (3, 1), (3, 0)]
+    assert sleeps == [0.3]
+    assert controller.read_digital_output(3) == 0
+
+
+@pytest.mark.parametrize(
+    ("initial_state", "result_state", "purpose"),
+    [
+        ("STOPPED", "RUNNING", "start"),
+        ("RUNNING", "STOPPED", "stop"),
+    ],
+)
+def test_turntable_start_and_stop_request_immediate_rising_edge(
+    initial_state, result_state, purpose
+):
+    import time
+
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    node.turntable_lock = threading.RLock()
+    node.turntable_state = initial_state
+    node.get_parameter = lambda name: SimpleNamespace(
+        value={"turntable_do_index": 1, "turntable_pulse_ms": 300}[name]
+    )
+    calls = []
+
+    def pulse(index, pulse_ms, *, pre_low_hold_ms):
+        calls.append((index, pulse_ms, pre_low_hold_ms))
+        return time.monotonic()
+
+    node.controller = SimpleNamespace(pulse_digital_output=pulse)
+    node._publish_status = lambda _: None
+
+    node._toggle_turntable(initial_state, result_state, purpose)
+
+    assert calls == [(1, 300, 0)]
+    assert node.turntable_state == result_state

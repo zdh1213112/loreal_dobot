@@ -161,3 +161,132 @@ def test_tiny_textured_yolo_box_is_rejected_by_relative_area():
     )
 
     assert detector.detect_yolo(image) is None
+
+
+def _moving_barcode_frame(left):
+    image = np.full((720, 1280, 3), 145, dtype=np.uint8)
+    for x in range(left, left + 110, 6):
+        image[470:530, x:x + 3] = 25
+    return image
+
+
+def _moving_horizontal_barcode_frame(left):
+    image = np.full((720, 1280, 3), 145, dtype=np.uint8)
+    for y in range(440, 550, 6):
+        image[y:y + 3, left:left + 60] = 25
+    return image
+
+
+def test_moving_stripe_fallback_finds_barcode_but_not_stationary_label():
+    detector = TurntableBarcodeDetector(scanner_assist=False)
+    first = _moving_barcode_frame(740)
+    second = _moving_barcode_frame(770)
+
+    assert detector.detect_moving_stripes(first) is None
+    hit = detector.detect_moving_stripes(second)
+    assert hit is not None
+    assert hit.source == "moving_stripes"
+    assert hit.rect[0] > 750
+    assert detector.detect_moving_stripes(second) is None
+
+
+def test_moving_stripe_fallback_finds_horizontal_barcode():
+    detector = TurntableBarcodeDetector(scanner_assist=False)
+    first = _moving_horizontal_barcode_frame(740)
+    second = _moving_horizontal_barcode_frame(770)
+
+    assert detector.detect_moving_stripes(first) is None
+    hit = detector.detect_moving_stripes(second)
+    assert hit is not None
+    assert hit.source == "moving_stripes"
+    assert 760 < hit.rect[0] < 830
+    assert hit.rect[3] > hit.rect[2]
+    assert detector.detect_moving_stripes(second) is None
+
+
+def test_moving_horizontal_barcode_respects_acceptance_roi():
+    first = _moving_horizontal_barcode_frame(740)
+    second = _moving_horizontal_barcode_frame(770)
+    detector = TurntableBarcodeDetector(scanner_assist=False)
+
+    assert detector.detect_moving_stripes(first, (700, 400, 850, 600)) is None
+    assert detector.detect_moving_stripes(
+        second, (700, 400, 850, 600)
+    ) is not None
+
+    detector = TurntableBarcodeDetector(scanner_assist=False)
+    assert detector.detect_moving_stripes(first, (0, 0, 300, 300)) is None
+    assert detector.detect_moving_stripes(second, (0, 0, 300, 300)) is None
+
+
+def test_moving_stripe_fallback_keeps_full_frame_and_filters_by_roi():
+    detector = TurntableBarcodeDetector(scanner_assist=False)
+    first = _moving_barcode_frame(740)
+    second = _moving_barcode_frame(770)
+    selected_roi = (324, 385, 1077, 630)
+
+    assert detector.detect_moving_stripes(first, selected_roi) is None
+    hit = detector.detect_moving_stripes(second, selected_roi)
+    assert hit is not None
+    assert hit.source == "moving_stripes"
+    assert 750 < hit.rect[0] < 850
+
+    detector = TurntableBarcodeDetector(scanner_assist=False)
+    assert detector.detect_moving_stripes(first, (0, 0, 300, 300)) is None
+    assert detector.detect_moving_stripes(second, (0, 0, 300, 300)) is None
+
+
+def test_moving_stripe_fallback_rejects_tiny_manual_crop():
+    detector = TurntableBarcodeDetector(scanner_assist=False)
+    image = _moving_barcode_frame(740)[430:565, 665:865]
+
+    assert detector.detect_moving_stripes(image) is None
+    assert detector.detect_moving_stripes(image) is None
+
+
+def test_yolo_roi_only_filters_candidates_without_changing_model_view():
+    image = np.full((720, 1280, 3), 140, dtype=np.uint8)
+    for x in range(100, 190, 6):
+        image[450:510, x:x + 3] = 20
+    for x in range(700, 790, 6):
+        image[450:510, x:x + 3] = 20
+    detector = TurntableBarcodeDetector(
+        scanner_assist=False, yolo_min_candidate_area_ratio=0.005
+    )
+    detector.onnx_session = object()
+    shapes = []
+
+    def predict(view):
+        shapes.append(view.shape[:2])
+        return (
+            np.array([[100, 450, 190, 510], [700, 450, 790, 510]],
+                     dtype=np.float32),
+            np.array([0, 0], dtype=np.int32),
+            np.array([0.90, 0.70], dtype=np.float32),
+        )
+
+    detector._predict_onnx = predict
+    hit_full = detector.detect_yolo(image)
+    hit_roi = detector.detect_yolo(image, (600, 400, 850, 550))
+
+    assert shapes == [(720, 1280), (720, 1280)]
+    assert hit_full is not None and hit_full.rect[0] == 100
+    assert hit_roi is not None and hit_roi.rect[0] == 700
+
+
+def test_scanner_roi_selects_eligible_polygon_not_largest_outside():
+    image = np.full((720, 1280, 3), 140, dtype=np.uint8)
+    detector = TurntableBarcodeDetector(scanner_assist=False)
+
+    class Scanner:
+        def detect(self, _image):
+            return True, np.array([
+                [[100, 400], [250, 400], [250, 550], [100, 550]],
+                [[700, 450], [790, 450], [790, 510], [700, 510]],
+            ], dtype=np.float32)
+
+    detector.scanner_detector = Scanner()
+    hit = detector.detect_scanner_pattern(image, (600, 400, 850, 550))
+
+    assert hit is not None
+    assert hit.rect[0] == 700

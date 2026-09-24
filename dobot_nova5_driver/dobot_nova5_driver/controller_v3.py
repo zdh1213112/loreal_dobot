@@ -811,37 +811,57 @@ class DobotNova5Controller:
             )
         return int(values[0])
 
-    def pulse_digital_output(self, index: int, pulse_ms: int = 300) -> None:
+    def pulse_digital_output(
+        self,
+        index: int,
+        pulse_ms: int = 300,
+        *,
+        pre_low_hold_ms: int | None = None,
+    ) -> float:
         """Emit the tested 0 -> 1 -> 0 toggle pulse on one cabinet DO.
 
         The turntable controller toggles run/stop on every rising edge, so the
-        output is always returned to zero.  Holding ``_command_lock`` for the
-        complete pulse prevents a motion/profile command from sharing the
-        Dashboard socket between the three writes.
+        output is always returned to zero.  V3 start/stop uses
+        ``pre_low_hold_ms=0`` because DO0 is acknowledged before the rising
+        edge and the previous pulse left the output low.  The high pulse
+        width stays unchanged.
+        Return the monotonic time immediately after the rising-edge command
+        succeeds so callers can report the signal latency.
         """
 
         self._ensure_dashboard()
         index = int(index)
         pulse_ms = int(pulse_ms)
+        pre_low_hold_ms = (
+            pulse_ms if pre_low_hold_ms is None else int(pre_low_hold_ms)
+        )
         if not 1 <= index <= 8:
             raise ValueError(f"controller DO index must be in [1, 8], got {index}")
         if not 50 <= pulse_ms <= 5000:
             raise ValueError(
                 f"turntable pulse_ms must be in [50, 5000], got {pulse_ms}"
             )
+        if not 0 <= pre_low_hold_ms <= 5000:
+            raise ValueError(
+                "turntable pre_low_hold_ms must be in [0, 5000], "
+                f"got {pre_low_hold_ms}"
+            )
         delay_s = pulse_ms / 1000.0
         output_high = False
+        edge_at = 0.0
         with self._command_lock:
             try:
                 self._raise_if_error(
                     self.dashboard.DOInstant(index, 0),
                     f"DOInstant({index},0) pulse reset",
                 )
-                time.sleep(delay_s)
+                if pre_low_hold_ms:
+                    time.sleep(pre_low_hold_ms / 1000.0)
                 self._raise_if_error(
                     self.dashboard.DOInstant(index, 1),
                     f"DOInstant({index},1) pulse edge",
                 )
+                edge_at = time.monotonic()
                 output_high = True
                 time.sleep(delay_s)
                 self._raise_if_error(
@@ -857,6 +877,7 @@ class DobotNova5Controller:
                         self.dashboard.DOInstant(index, 0)
                     except Exception:
                         pass
+        return edge_at
 
     def set_joint_profile(self, speed: Optional[int] = None, accel: Optional[int] = None) -> bool:
         self._ensure_dashboard()

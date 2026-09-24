@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -106,7 +109,14 @@ class D435TurntableBarcodeNode(Node):
         self.declare_parameter("wide_roi_tile_fraction", 0.70)
         self.declare_parameter("wide_roi_unsharp_sigma", 1.2)
         self.declare_parameter("wide_roi_unsharp_amount", 1.0)
+        self.declare_parameter("detail_roi_x", 280)
+        self.declare_parameter("detail_roi_y", 220)
+        self.declare_parameter("detail_roi_width", 760)
+        self.declare_parameter("detail_roi_height", 440)
+        self.declare_parameter("full_frame_interval", 6)
         self.declare_parameter("yolo_min_candidate_area_ratio", 0.01)
+        self.declare_parameter("moving_stripes_enabled", True)
+        self.declare_parameter("moving_stripes_stable_hits", 3)
         # The RealSense stream itself limits this loop to 30 FPS. Zero means
         # every acquired frame is eligible; inference time remains the natural
         # back-pressure instead of an additional timer throttle.
@@ -116,6 +126,9 @@ class D435TurntableBarcodeNode(Node):
         self.declare_parameter("roi_width", 0)
         self.declare_parameter("roi_height", 0)
         self.declare_parameter("preview", True)
+        self.declare_parameter(
+            "sample_save_dir", "/home/zdh/ffs_ws/d435_barcode_samples"
+        )
         self.declare_parameter(
             "preview_topic", "/vision_panel/d435_turntable/image/compressed"
         )
@@ -194,6 +207,7 @@ class D435TurntableBarcodeNode(Node):
         self.candidate = ""
         self.candidate_source = ""
         self.candidate_rect: tuple[int, int, int, int] | None = None
+        self.candidate_first_rect: tuple[int, int, int, int] | None = None
         self.candidate_hits = 0
         self.candidate_last_at = 0.0
         self.continuous_last_report_value = ""
@@ -203,6 +217,7 @@ class D435TurntableBarcodeNode(Node):
         self._publish_continuous_presence(False)
         self.roi_lock = threading.Lock()
         self.manual_roi: tuple[int, int, int, int] | None = None
+        self.roi_generation = 0
         self.roi_drawing = False
         self.roi_start = (0, 0)
         self.roi_end = (0, 0)
@@ -213,6 +228,11 @@ class D435TurntableBarcodeNode(Node):
         self.running = True
         self.pipeline = None
         self.color_sensor = None
+        self.sample_save_dir = Path(
+            str(self.get_parameter("sample_save_dir").value)
+        ).expanduser()
+        self.sample_save_lock = threading.Lock()
+        self.pending_sample_saves = 0
         self.camera_option_lock = threading.Lock()
         self.manual_exposure = float(self.get_parameter("exposure").value)
         self.manual_gain = float(self.get_parameter("gain").value)
@@ -248,8 +268,20 @@ class D435TurntableBarcodeNode(Node):
             wide_roi_unsharp_amount=float(
                 self.get_parameter("wide_roi_unsharp_amount").value
             ),
+            detail_roi=(
+                int(self.get_parameter("detail_roi_x").value),
+                int(self.get_parameter("detail_roi_y").value),
+                int(self.get_parameter("detail_roi_width").value),
+                int(self.get_parameter("detail_roi_height").value),
+            ),
+            full_frame_interval=int(
+                self.get_parameter("full_frame_interval").value
+            ),
             yolo_min_candidate_area_ratio=float(
                 self.get_parameter("yolo_min_candidate_area_ratio").value
+            ),
+            moving_stripes_enabled=bool(
+                self.get_parameter("moving_stripes_enabled").value
             ),
         )
         self.capture_thread = threading.Thread(
@@ -397,6 +429,7 @@ class D435TurntableBarcodeNode(Node):
             self.candidate = ""
             self.candidate_source = ""
             self.candidate_rect = None
+            self.candidate_first_rect = None
             self.candidate_hits = 0
             self.candidate_last_at = 0.0
             generation = self.scan_generation
@@ -412,6 +445,7 @@ class D435TurntableBarcodeNode(Node):
             self.candidate = ""
             self.candidate_source = ""
             self.candidate_rect = None
+            self.candidate_first_rect = None
             self.candidate_hits = 0
             self.candidate_last_at = 0.0
             self.continuous_last_report_value = ""
@@ -424,17 +458,20 @@ class D435TurntableBarcodeNode(Node):
             "turntable motion is not controlled by this switch"
         )
 
-    def _roi_bounds(self, image: np.ndarray) -> tuple[int, int, int, int]:
+    def _roi_bounds_with_generation(
+        self, image: np.ndarray
+    ) -> tuple[tuple[int, int, int, int], int]:
         height, width = image.shape[:2]
         with self.roi_lock:
             manual_roi = self.manual_roi
+            generation = self.roi_generation
         if manual_roi is not None:
             left, top, right, bottom = manual_roi
             left = max(0, min(width - 1, int(left)))
             top = max(0, min(height - 1, int(top)))
             right = max(left + 1, min(width, int(right)))
             bottom = max(top + 1, min(height, int(bottom)))
-            return left, top, right, bottom
+            return (left, top, right, bottom), generation
 
         x = max(0, min(width - 1, int(self.get_parameter("roi_x").value)))
         y = max(0, min(height - 1, int(self.get_parameter("roi_y").value)))
@@ -442,11 +479,24 @@ class D435TurntableBarcodeNode(Node):
         roi_height = int(self.get_parameter("roi_height").value)
         right = width if roi_width <= 0 else min(width, x + roi_width)
         bottom = height if roi_height <= 0 else min(height, y + roi_height)
-        return x, y, right, bottom
+        return (x, y, right, bottom), generation
 
-    def _configured_roi(self, image: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
-        left, top, right, bottom = self._roi_bounds(image)
-        return image[top:bottom, left:right], (left, top)
+    def _roi_bounds(self, image: np.ndarray) -> tuple[int, int, int, int]:
+        return self._roi_bounds_with_generation(image)[0]
+
+    def _reset_candidate_for_roi_change(self) -> None:
+        """Discard evidence collected under a previous spatial selection."""
+
+        with self.state_lock:
+            self.candidate = ""
+            self.candidate_source = ""
+            self.candidate_rect = None
+            self.candidate_first_rect = None
+            self.candidate_hits = 0
+            self.candidate_last_at = 0.0
+            self.continuous_last_seen_at = 0.0
+            self.continuous_presence_latched = False
+        self._publish_continuous_presence(False)
 
     def _mouse_roi_callback(self, event, x, y, flags, param) -> None:
         del flags, param
@@ -496,9 +546,11 @@ class D435TurntableBarcodeNode(Node):
             return
         with self.roi_lock:
             self.manual_roi = new_roi
+            self.roi_generation += 1
+            self._reset_candidate_for_roi_change()
         left, top, right, bottom = new_roi
         self._publish_status(
-            "D435 ROI selected by mouse: "
+            "D435 barcode acceptance ROI selected (full-frame inference unchanged): "
             f"x={left}, y={top}, width={right-left}, height={bottom-top}"
         )
 
@@ -507,7 +559,9 @@ class D435TurntableBarcodeNode(Node):
         with self.roi_lock:
             self.manual_roi = full_frame
             self.roi_drawing = False
-        self._publish_status("D435 ROI cleared; full-frame detection restored")
+            self.roi_generation += 1
+            self._reset_candidate_for_roi_change()
+        self._publish_status("D435 ROI cleared; full-frame barcode acceptance restored")
 
     def _drawing_roi(self) -> tuple[bool, tuple[int, int], tuple[int, int]]:
         with self.roi_lock:
@@ -535,10 +589,47 @@ class D435TurntableBarcodeNode(Node):
                 with self.roi_lock:
                     width, height = self.preview_image_size
                 self._clear_manual_roi(width, height)
+            elif key == ord(" "):
+                with self.sample_save_lock:
+                    self.pending_sample_saves += 1
+                    pending = self.pending_sample_saves
+                self._publish_status(
+                    f"D435 raw image save queued ({pending} pending)"
+                )
             elif key == ord("["):
                 self._adjust_manual_brightness(-1)
             elif key == ord("]"):
                 self._adjust_manual_brightness(1)
+
+    def _save_pending_sample(self, image: np.ndarray) -> None:
+        """Save the next raw D435 frame requested from the combined window."""
+
+        with self.sample_save_lock:
+            if self.pending_sample_saves <= 0:
+                return
+            self.pending_sample_saves -= 1
+            pending = self.pending_sample_saves
+
+        filename = f"d435_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+        output_path = self.sample_save_dir / filename
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(
+                str(output_path),
+                image,
+                [int(cv2.IMWRITE_PNG_COMPRESSION), 3],
+            ):
+                raise OSError("OpenCV could not encode the PNG image")
+        except Exception as exc:
+            self.get_logger().error(f"D435 sample image save failed: {exc}")
+            self._publish_status(f"D435 sample image save failed: {exc}")
+            return
+
+        self.get_logger().info(
+            f"Saved raw D435 training image: {output_path}"
+            + (f" ({pending} pending)" if pending else "")
+        )
+        self._publish_status(f"Saved raw D435 training image: {output_path}")
 
     def _render_preview(
         self,
@@ -549,6 +640,36 @@ class D435TurntableBarcodeNode(Node):
     ) -> np.ndarray:
         display = image.copy()
         left, top, right, bottom = self._roi_bounds(image)
+        detail_roi = self.detector.detail_roi
+        if detail_roi is not None:
+            detail_x, detail_y, detail_width, detail_height = detail_roi
+            detail_left = max(0, min(image.shape[1] - 1, int(detail_x)))
+            detail_top = max(0, min(image.shape[0] - 1, int(detail_y)))
+            detail_right = max(
+                detail_left + 1,
+                min(image.shape[1], detail_left + int(detail_width)),
+            )
+            detail_bottom = max(
+                detail_top + 1,
+                min(image.shape[0], detail_top + int(detail_height)),
+            )
+            cv2.rectangle(
+                display,
+                (detail_left, detail_top),
+                (detail_right - 1, detail_bottom - 1),
+                (255, 120, 0),
+                2,
+            )
+            cv2.putText(
+                display,
+                "DETAIL",
+                (detail_left + 6, max(18, detail_top + 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 120, 0),
+                2,
+                cv2.LINE_AA,
+            )
         cv2.rectangle(
             display,
             (left, top),
@@ -563,20 +684,22 @@ class D435TurntableBarcodeNode(Node):
             x, y, width, height = hit.rect
             cv2.rectangle(
                 display,
-                (left + x, top + y),
-                (left + x + width, top + y + height),
+                (x, y),
+                (x + width, y + height),
                 (0, 255, 0),
                 3,
             )
             label = (
                 "SCANNER"
                 if hit.source == "scanner_pattern"
+                else "MOVING STRIPES"
+                if hit.source == "moving_stripes"
                 else f"YOLO {hit.confidence:.2f}"
             )
             cv2.putText(
                 display,
                 label,
-                (left + x, max(18, top + y - 6)),
+                (x, max(18, y - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (0, 255, 0),
@@ -643,7 +766,7 @@ class D435TurntableBarcodeNode(Node):
             )
         cv2.putText(
             display,
-            "Left-drag: select ROI   Right-click/C: full frame   Click brightness buttons",
+            "Left-drag: select ROI   Right-click/C: full frame   SPACE: save raw PNG",
             (16, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.62,
@@ -704,6 +827,39 @@ class D435TurntableBarcodeNode(Node):
         union = max(1, aw * ah + bw * bh - intersection)
         return float(intersection) / float(union)
 
+    @staticmethod
+    def _moving_stripe_spatially_consistent(
+        first: tuple[int, int, int, int] | None,
+        second: tuple[int, int, int, int] | None,
+    ) -> bool:
+        """Associate a moving barcode through perspective/rotation changes.
+
+        IoU is appropriate for a static YOLO proposal, but a side label on a
+        rotating box changes width, height and skew between frames. Requiring
+        the old IoU threshold can therefore reset the three-hit confirmation
+        exactly while the label is crossing the camera. Keep a conservative
+        center/area gate instead: the candidate must remain local, while its
+        rectangle is allowed to change shape.
+        """
+
+        if first is None or second is None:
+            return False
+        ax, ay, aw, ah = [float(value) for value in first]
+        bx, by, bw, bh = [float(value) for value in second]
+        first_area = max(1.0, aw * ah)
+        second_area = max(1.0, bw * bh)
+        area_ratio = second_area / first_area
+        if not 0.30 <= area_ratio <= 3.30:
+            return False
+        first_cx, first_cy = ax + aw * 0.5, ay + ah * 0.5
+        second_cx, second_cy = bx + bw * 0.5, by + bh * 0.5
+        center_distance = math.hypot(
+            second_cx - first_cx,
+            second_cy - first_cy,
+        )
+        max_dimension = max(aw, ah, bw, bh)
+        return center_distance <= max(90.0, 1.75 * max_dimension)
+
     def _accept_hit(self, hit, generation: int) -> bool:
         now = time.monotonic()
         value = str(hit.value)
@@ -729,6 +885,7 @@ class D435TurntableBarcodeNode(Node):
                 # alive, even before the spatial stability count is complete.
                 self.continuous_last_seen_at = now
             scanner_pattern = source == "scanner_pattern"
+            moving_stripes = source == "moving_stripes"
             if scanner_pattern:
                 max_gap = max(
                     0.05,
@@ -751,13 +908,17 @@ class D435TurntableBarcodeNode(Node):
                         float(
                             self.get_parameter("scanner_assist_min_iou").value
                         ),
-                    ),
-                )
+                        ),
+                    )
             else:
                 max_gap = max(
                     0.05, float(self.get_parameter("stable_hit_gap_s").value)
                 )
-                required = max(1, int(self.get_parameter("stable_hits").value))
+                required = (
+                    max(3, int(self.get_parameter("moving_stripes_stable_hits").value))
+                    if moving_stripes else
+                    max(1, int(self.get_parameter("stable_hits").value))
+                )
                 spatially_consistent = self._rect_iou(
                     self.candidate_rect, hit.rect
                 ) >= max(
@@ -765,8 +926,13 @@ class D435TurntableBarcodeNode(Node):
                     min(
                         1.0,
                         float(self.get_parameter("yolo_min_iou").value),
-                    ),
-                )
+                        ),
+                    )
+                if moving_stripes:
+                    spatially_consistent = self._moving_stripe_spatially_consistent(
+                        self.candidate_rect,
+                        hit.rect,
+                    )
             same_candidate = (
                 value == self.candidate
                 and candidate_source == self.candidate_source
@@ -779,10 +945,19 @@ class D435TurntableBarcodeNode(Node):
                 self.candidate = value
                 self.candidate_source = candidate_source
                 self.candidate_hits = 1
+                self.candidate_first_rect = tuple(hit.rect)
             self.candidate_rect = tuple(hit.rect)
             self.candidate_last_at = now
             if self.candidate_hits < required:
                 return False
+            if moving_stripes and self.candidate_first_rect is not None:
+                first_x, first_y, first_w, first_h = self.candidate_first_rect
+                x, y, box_w, box_h = hit.rect
+                movement = abs(
+                    (x + box_w * 0.5) - (first_x + first_w * 0.5)
+                )
+                if movement < max(10.0, box_w * 0.10):
+                    return False
             if workflow_active:
                 self.scan_active = False
             report_continuous = (
@@ -796,6 +971,7 @@ class D435TurntableBarcodeNode(Node):
             # active, but the visible-presence latch suppresses duplicates.
             self.candidate_hits = 0
             self.candidate_rect = None
+            self.candidate_first_rect = None
         if workflow_active:
             result = String()
             result.data = f"success:{value}"
@@ -837,6 +1013,7 @@ class D435TurntableBarcodeNode(Node):
             self.candidate = ""
             self.candidate_source = ""
             self.candidate_rect = None
+            self.candidate_first_rect = None
             self.candidate_hits = 0
             self.candidate_last_at = 0.0
             presence_cleared = True
@@ -877,9 +1054,12 @@ class D435TurntableBarcodeNode(Node):
                 f"{'on' if self.detector.scanner_detector is not None else 'off'}; "
                 f"wide_roi_fallback="
                 f"{'on' if self.detector.wide_roi_fallback else 'off'}; "
+                f"detail_roi={self.detector.detail_roi}; "
+                f"full_frame_every={self.detector.full_frame_interval}; "
                 f"min_candidate_area="
                 f"{self.detector.yolo_min_candidate_area_ratio:.3f}; "
-                "flat-background rejection=on; parallel-bar verification=on"
+                "flat-background rejection=on; parallel-bar verification=on; "
+                f"moving_stripes={'on' if self.detector.moving_stripes_enabled else 'off'}"
             )
             if self.detector.provider_fallback_reason:
                 self.get_logger().warning(
@@ -892,7 +1072,8 @@ class D435TurntableBarcodeNode(Node):
             if preview:
                 self._publish_status(
                     "D435 integrated preview enabled in the D405 window: "
-                    "left-drag selects ROI; right-click or C restores full frame"
+                    "left-drag limits barcode acceptance ROI without cropping "
+                    "inference; right-click or C restores full frame"
                 )
             while self.running and rclpy.ok():
                 frames = pipeline.wait_for_frames(1000)
@@ -900,6 +1081,7 @@ class D435TurntableBarcodeNode(Node):
                 if not color_frame:
                     continue
                 image = np.asanyarray(color_frame.get_data())
+                self._save_pending_sample(image)
                 with self.roi_lock:
                     self.preview_image_size = (image.shape[1], image.shape[0])
                 with self.state_lock:
@@ -913,9 +1095,9 @@ class D435TurntableBarcodeNode(Node):
                     0.0, float(self.get_parameter("detect_interval_s").value)
                 ):
                     last_detect_at = now
-                    crop, origin = self._configured_roi(image)
+                    allowed_roi, roi_generation = self._roi_bounds_with_generation(image)
                     provider_before = self.detector.active_provider
-                    hit = self.detector.detect(crop)
+                    hit = self.detector.detect(image, allowed_roi)
                     self.detect_rate_count += 1
                     detect_finished_at = time.monotonic()
                     detect_rate_elapsed = (
@@ -933,10 +1115,15 @@ class D435TurntableBarcodeNode(Node):
                             f"{provider_before} -> {self.detector.active_provider}; "
                             f"{self.detector.provider_fallback_reason}"
                         )
-                    if hit is not None:
-                        self._accept_hit(hit, generation)
-                    else:
-                        self._note_continuous_no_hit(now)
+                    with self.roi_lock:
+                        if roi_generation != self.roi_generation:
+                            # An ROI change during inference invalidates the
+                            # old frame's spatial evidence.
+                            hit = None
+                        elif hit is not None:
+                            self._accept_hit(hit, generation)
+                        else:
+                            self._note_continuous_no_hit(now)
                 preview_interval = max(
                     0.02,
                     float(self.get_parameter("preview_publish_interval_s").value),
