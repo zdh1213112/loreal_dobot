@@ -114,7 +114,7 @@ HEIGHT_PERCENTILE = 98.0
 MIN_BOX_HEIGHT_M = 0.005
 MAX_BOX_HEIGHT_M = 0.150
 GRASP_DEPTH_RATIO = 0.75
-GRIP_CLEARANCE_M = 0.020
+GRIP_CLEARANCE_M = 0.030
 MAX_GRIPPER_OPENING_M = 0.095
 # 宽目标下降时需要更大的单侧余量。实测短边严格大于 60 mm 时直接
 # 全开；近方形目标也全开，避免长短轴接近时发生 90 度标签互换而低估宽度。

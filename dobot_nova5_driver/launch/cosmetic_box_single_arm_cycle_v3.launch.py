@@ -372,7 +372,12 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument("offset_grasp_enabled", default_value="true",
-                                  description="Reach offset-high while aligning grasp attitude, then descend and insert"),
+                                  description="Use side offset descent and low-height insertion for top barcode observation"),
+            DeclareLaunchArgument(
+                "turntable_top_grasp_max_tilt_deg",
+                default_value="30.0",
+                description="Maximum raw D405 Tool-Z tilt from downward vertical before levelling",
+            ),
             DeclareLaunchArgument("offset_grasp_clearance_m", default_value="0.020"),
             DeclareLaunchArgument("offset_finger_span_m", default_value="0.060"),
             DeclareLaunchArgument(
@@ -393,10 +398,10 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "offset_high_descent_blend_enabled",
-                default_value="true",
+                default_value="false",
                 description=(
-                    "Queue the vertical offset descent before offset-high stops "
-                    "so the two approach segments are CP blended"
+                    "Queue offset-high to descent only outside turntable mode; "
+                    "turntable mode verifies attitude at offset-high first"
                 ),
             ),
             DeclareLaunchArgument(
@@ -496,6 +501,16 @@ def generate_launch_description() -> LaunchDescription:
                 "bottom_center_first_tool_rx_delta_deg",
                 default_value="70.0",
                 description="Tool-Rx rotation after the first turntable release",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_gripper_cavity_half_length_m",
+                default_value="0.090",
+                description="Available gripper cavity from TCP toward one short end (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_long_box_offset_margin_m",
+                default_value="0.005",
+                description="Extra short-end clearance before the first Tool-Rx roll (m)",
             ),
             DeclareLaunchArgument(
                 "bottom_center_release_tool_rx_delta_deg",
@@ -988,6 +1003,10 @@ def generate_launch_description() -> LaunchDescription:
                             value_type=float,
                         ),
                         "offset_grasp_enabled": ParameterValue(LaunchConfiguration("offset_grasp_enabled"), value_type=bool),
+                        "turntable_top_grasp_max_tilt_deg": ParameterValue(
+                            LaunchConfiguration("turntable_top_grasp_max_tilt_deg"),
+                            value_type=float,
+                        ),
                         "offset_grasp_clearance_m": ParameterValue(LaunchConfiguration("offset_grasp_clearance_m"), value_type=float),
                         "offset_finger_span_m": ParameterValue(LaunchConfiguration("offset_finger_span_m"), value_type=float),
                         "offset_high_clearance_m": ParameterValue(
@@ -1068,6 +1087,14 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "bottom_center_first_tool_rx_delta_deg": ParameterValue(
                             LaunchConfiguration("bottom_center_first_tool_rx_delta_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_center_gripper_cavity_half_length_m": ParameterValue(
+                            LaunchConfiguration("bottom_center_gripper_cavity_half_length_m"),
+                            value_type=float,
+                        ),
+                        "bottom_center_long_box_offset_margin_m": ParameterValue(
+                            LaunchConfiguration("bottom_center_long_box_offset_margin_m"),
                             value_type=float,
                         ),
                         "bottom_center_release_tool_rx_delta_deg": ParameterValue(

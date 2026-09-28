@@ -11,6 +11,7 @@ from dobot_nova5_driver.controller_v3 import (
 )
 from dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3 import (
     CosmeticBoxSingleArmNode,
+    MaterialSuperseded,
 )
 from dobot_nova5_driver.turntable_v3 import (
     PlacementRetreatTrigger,
@@ -156,16 +157,19 @@ def test_place_done_resolves_unknown_and_starts_independent_prescan(monkeypatch)
     assert "fresh stopped-face D435 confirmation" in statuses[-1]
 
 
-def test_place_done_reuses_current_continuous_barcode_without_turntable_thread(
-    monkeypatch,
-):
+def test_place_done_discards_previous_continuous_barcode_and_scans_again(monkeypatch):
     import dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3 as cycle_v3
 
-    monkeypatch.setattr(
-        cycle_v3.threading,
-        "Thread",
-        lambda **_kwargs: pytest.fail("visible barcode must not start a scan thread"),
-    )
+    started = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, name, daemon):
+            self.args = args
+
+        def start(self):
+            started.append(self.args)
+
+    monkeypatch.setattr(cycle_v3.threading, "Thread", FakeThread)
     node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
     node.turntable_lock = threading.RLock()
     node.turntable_condition = threading.Condition(node.turntable_lock)
@@ -191,38 +195,55 @@ def test_place_done_reuses_current_continuous_barcode_without_turntable_thread(
     node._accept_turntable_place_done("test")
 
     assert node.turntable_state == "STOPPED"
-    assert not node.turntable_scan_in_progress
-    assert node.turntable_material_ready
-    assert node.turntable_ready_barcode == "barcode_detected"
-    assert node.turntable_scan_thread is None
-    assert "no turntable pulse is needed" in statuses[-1]
+    assert node.turntable_scan_in_progress
+    assert not node.turntable_material_ready
+    assert node.turntable_ready_barcode == ""
+    assert node.d435_continuous_last_value == ""
+    assert started == [(1,)]
+    assert "fresh stopped-face D435 confirmation" in statuses[-1]
 
 
-def test_duplicate_place_done_is_ignored_while_material_is_ready(monkeypatch):
+def test_new_place_done_replaces_ready_material_and_old_target(monkeypatch):
     import dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3 as cycle_v3
 
-    monkeypatch.setattr(
-        cycle_v3.threading,
-        "Thread",
-        lambda **_kwargs: pytest.fail("duplicate event must not start a thread"),
-    )
+    started = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, name, daemon):
+            self.args = args
+
+        def start(self):
+            started.append(self.args)
+
+    monkeypatch.setattr(cycle_v3.threading, "Thread", FakeThread)
     node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
     node.turntable_lock = threading.RLock()
     node.turntable_condition = threading.Condition(node.turntable_lock)
     node.turntable_state = "STOPPED"
     node.turntable_scan_in_progress = False
     node.turntable_material_ready = True
+    node.turntable_ready_barcode = "old-barcode"
+    node.turntable_scan_error = ""
+    node.turntable_scan_cancel = threading.Event()
+    node.turntable_waiting_for_place = False
     node.turntable_place_done_count = 4
     node.turntable_place_done_consumed = 4
     node.turntable_place_done_duplicate_warned = False
+    node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(0.400, 0.200)
+    node.d435_continuous_last_value = "old-continuous"
+    node.d435_continuous_presence = True
+    node.last_accepted_target = TcpPose(0.5, 0, 0.1, 0, 0, 0)
     statuses = []
     node._publish_status = statuses.append
 
-    node._accept_turntable_place_done("duplicate")
+    node._accept_turntable_place_done("new material")
 
-    assert node.turntable_place_done_count == 4
-    assert node.turntable_place_done_duplicate_warned
-    assert "ignoring duplicate" in statuses[-1]
+    assert node.turntable_place_done_count == 5
+    assert not node.turntable_material_ready
+    assert node.turntable_ready_barcode == ""
+    assert node.last_accepted_target is None
+    assert started == [(5,)]
+    assert "accepted material event #5" in statuses[-1]
 
 
 def test_secondary_tcp_automatic_place_trigger_uses_y_only():
@@ -248,6 +269,36 @@ def test_secondary_tcp_automatic_place_trigger_uses_y_only():
     assert len(accepted) == 1
     assert "Z ignored" in accepted[0]
     assert "TCP Z is not used" in statuses[-1]
+
+
+def test_previous_pickup_does_not_erase_next_102_place_entry():
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    node.get_parameter = lambda name: SimpleNamespace(
+        value={"turntable_auto_place_from_secondary_tcp": True}[name]
+    )
+    node.turntable_lock = threading.RLock()
+    node.turntable_condition = threading.Condition(node.turntable_lock)
+    node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(0.400, 0.0)
+    node.turntable_active_pick_event_number = 3
+    node.turntable_place_done_count = 3
+    node.turntable_material_ready = True
+    node.turntable_ready_barcode = "old-barcode"
+    node.turntable_scan_error = ""
+    node.turntable_waiting_for_place = False
+    node.turntable_place_done_duplicate_warned = False
+    node.d435_continuous_last_value = "old-barcode"
+    node.d435_continuous_presence = True
+    node._publish_status = lambda _message: None
+    accepted = []
+    node._accept_turntable_place_done = accepted.append
+
+    node._update_turntable_place_from_secondary_tcp({"right_y_m": 0.410})
+    assert node.turntable_secondary_retreat_trigger.place_seen
+    node._mark_turntable_material_removed()
+    assert node.turntable_secondary_retreat_trigger.place_seen
+    node._update_turntable_place_from_secondary_tcp({"right_y_m": 0.390})
+    assert len(accepted) == 1
+    assert "automatic 102 TCP place/retreat trigger" in accepted[0]
 
 
 def test_startup_recovery_reset_forgets_previous_turntable_round():
@@ -345,7 +396,7 @@ def _make_turntable_scan_node(
     *,
     stopped_face_barcode: str,
     barcode_after_start: str,
-    continuous_barcode_after_stop: str = "",
+    barcode_after_stop: str = "",
 ):
     node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
     values = {
@@ -381,9 +432,8 @@ def _make_turntable_scan_node(
         node.turntable_state = result
         if purpose == "start":
             node.turntable_barcode_value = barcode_after_start
-        elif continuous_barcode_after_stop:
-            node.d435_continuous_presence = True
-            node.d435_continuous_last_value = continuous_barcode_after_stop
+        elif barcode_after_stop:
+            node.turntable_barcode_value = barcode_after_stop
 
     node._set_turntable_barcode_window = set_window
     node._toggle_turntable = toggle
@@ -416,11 +466,34 @@ def test_turntable_rotates_only_after_stopped_face_has_no_barcode():
     assert any("starting turntable search" in status for status in statuses)
 
 
+def test_replaced_material_cancels_before_rotation_pulse():
+    node, _statuses, toggles = _make_turntable_scan_node(
+        stopped_face_barcode="", barcode_after_start=""
+    )
+    original_get_parameter = node.get_parameter
+    node.get_parameter = lambda name: (
+        SimpleNamespace(value=0.0)
+        if name == "turntable_stationary_barcode_check_s"
+        else original_get_parameter(name)
+    )
+    original_set_window = node._set_turntable_barcode_window
+
+    def set_window(active):
+        original_set_window(active)
+        if active:
+            node.turntable_scan_cancel.set()
+
+    node._set_turntable_barcode_window = set_window
+    with pytest.raises(RuntimeError, match="cancelled before rotation"):
+        node._scan_turntable_for_side_barcode(require_cycle_active=False)
+    assert toggles == []
+
+
 def test_barcode_arriving_during_stop_boundary_is_accepted():
     node, statuses, toggles = _make_turntable_scan_node(
         stopped_face_barcode="",
         barcode_after_start="",
-        continuous_barcode_after_stop="barcode_detected",
+        barcode_after_stop="barcode_detected",
     )
 
     result = node._scan_turntable_for_side_barcode(require_cycle_active=False)
@@ -436,11 +509,15 @@ def _make_prescan_worker_node(scan_result="", scan_error=None):
     node.turntable_condition = threading.Condition(node.turntable_lock)
     node.turntable_state = "STOPPED"
     node.turntable_scan_in_progress = True
+    node.turntable_rescan_pending = False
+    node.turntable_active_pick_event_number = None
+    node.turntable_place_done_count = 3
     node.turntable_material_ready = False
     node.turntable_ready_barcode = ""
     node.turntable_scan_error = ""
     node.turntable_scan_cancel = threading.Event()
     node.running = True
+    node.shutting_down = False
     node.cycle_enabled = True
     node.get_parameter = lambda name: SimpleNamespace(
         value={"turntable_enabled": True, "turntable_place_wait_timeout_s": 0.0}[name]
@@ -469,13 +546,14 @@ def test_no_side_barcode_after_timeout_releases_stopped_material_for_d405():
     assert node.turntable_ready_barcode == ""
     assert node.turntable_scan_error == ""
     assert not node.turntable_scan_in_progress
-    assert node._wait_for_scanned_turntable_material() == ""
+    assert node._wait_for_scanned_turntable_material() == (3, "")
     assert stops == []
     assert "ready for 101 to grasp and check its top surface" in statuses[-1]
 
 
 def test_real_d435_scan_error_still_blocks_left_arm():
     node, _statuses, stops = _make_prescan_worker_node(scan_error="camera unavailable")
+    node.turntable_place_done_count = 4
 
     node._turntable_prescan_worker(4)
 
@@ -484,6 +562,56 @@ def test_real_d435_scan_error_still_blocks_left_arm():
     assert stops
     with pytest.raises(RuntimeError, match="camera unavailable"):
         node._wait_for_scanned_turntable_material()
+
+
+def test_new_placement_during_scan_starts_only_latest_round(monkeypatch):
+    import dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3 as cycle_v3
+
+    started = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, name, daemon):
+            self.args = args
+
+        def start(self):
+            started.append(self.args)
+
+    monkeypatch.setattr(cycle_v3.threading, "Thread", FakeThread)
+    node, statuses, _stops = _make_prescan_worker_node()
+    node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(0.400, 0.200)
+    node.turntable_waiting_for_place = False
+    node.turntable_place_done_consumed = 3
+    node.d435_continuous_last_value = "old-continuous"
+    node.d435_continuous_presence = True
+
+    def scan(**_kwargs):
+        node._accept_turntable_place_done("next box")
+        return "old-barcode"
+
+    node._scan_turntable_for_side_barcode = scan
+    node._turntable_prescan_worker(3)
+
+    assert node.turntable_place_done_count == 4
+    assert node.turntable_scan_in_progress
+    assert not node.turntable_material_ready
+    assert node.turntable_ready_barcode == ""
+    assert not node.turntable_scan_cancel.is_set()
+    assert started == [(4,)]
+    assert "latest material event #4" in statuses[-1]
+
+
+def test_replaced_material_cannot_use_reserved_barcode_or_d405_target():
+    node, _statuses, _stops = _make_prescan_worker_node()
+    node.turntable_scan_in_progress = False
+    node.turntable_material_ready = True
+    node.turntable_ready_barcode = "old-barcode"
+    assert node._wait_for_scanned_turntable_material() == (3, "old-barcode")
+    node.turntable_place_done_count = 4
+    node.turntable_material_ready = False
+    with pytest.raises(MaterialSuperseded, match="latest event=#4"):
+        node._require_current_material_event(3, "left-arm grasp")
+    node._release_active_material_event(3)
+    assert node.turntable_active_pick_event_number is None
 
 
 def test_mouse_roi_is_order_independent_clamped_and_rejects_small_drags():

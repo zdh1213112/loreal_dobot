@@ -90,6 +90,7 @@ def test_turntable_bottom_branch_routes_before_legacy_close_and_transfer():
         "grasp_z_offset_limit_m": 0.010,
         "minimum_safe_tcp_z_m": 0.129,
         "turntable_enabled": True,
+        "turntable_top_grasp_max_tilt_deg": 30.0,
         "turntable_height_safety_enabled": False,
         "bottom_barcode_recovery_enabled": True,
         "dh_max_opening_m": 0.095,
@@ -124,9 +125,11 @@ def test_turntable_bottom_branch_routes_before_legacy_close_and_transfer():
         set_position=lambda *_args, **_kwargs: actions.append("preshape"),
         close=lambda *_args, **_kwargs: actions.append("initial_close"),
     )
-    node._execute_turntable_bottom_center_recovery = (
-        lambda *_args: actions.append("bottom_center_recovery")
-    )
+    def record_bottom_recovery(*_args, length_m):
+        assert length_m == pytest.approx(0.121)
+        actions.append("bottom_center_recovery")
+
+    node._execute_turntable_bottom_center_recovery = record_bottom_recovery
     node._mark_turntable_material_removed = lambda: actions.append("removed")
     node._place_as_top_barcode_box = lambda: actions.append("top_place")
 
@@ -149,6 +152,7 @@ def test_near_cube_bottom_branch_regrasps_in_place_then_routes_as_side():
         "grasp_z_offset_limit_m": 0.010,
         "minimum_safe_tcp_z_m": 0.129,
         "turntable_enabled": True,
+        "turntable_top_grasp_max_tilt_deg": 30.0,
         "turntable_height_safety_enabled": False,
         "bottom_barcode_recovery_enabled": True,
         "bottom_near_cube_flip_enabled": True,
@@ -317,6 +321,8 @@ def make_sequence_node(*, initial_j6=0.0, j6_limit=355.0):
         "bottom_center_first_rz_delta_deg": 40.0,
         "bottom_center_first_tool_rx_delta_deg": 70.0,
         "bottom_center_release_tool_rx_delta_deg": 70.0,
+        "bottom_center_gripper_cavity_half_length_m": 0.090,
+        "bottom_center_long_box_offset_margin_m": 0.005,
         "bottom_start_j6_zero_threshold_deg": 40.0,
         "grasp_lift_m": 0.060,
         "bottom_flip_lift_m": 0.160,
@@ -326,6 +332,8 @@ def make_sequence_node(*, initial_j6=0.0, j6_limit=355.0):
         "dh_grasp_force": 50,
         "barcode_flip_safe_joint_limit_deg": j6_limit,
         "barcode_flip_jog_tolerance_deg": 1.0,
+        "user_index": 0,
+        "command_tool_index": 1,
     }
     node.get_parameter = lambda name: SimpleNamespace(value=params[name])
     node._timed_stage = stage
@@ -418,7 +426,11 @@ def make_sequence_node(*, initial_j6=0.0, j6_limit=355.0):
         set_force=lambda *_args: None,
         close=close,
     )
-    node.controller = SimpleNamespace(current_joint=lambda: joints[0], move_joint=move_joint)
+    node.controller = SimpleNamespace(
+        current_joint=lambda: joints[0],
+        move_joint=move_joint,
+        inverse_kinematics=lambda *_args, **_kwargs: [0.0] * 6,
+    )
     return node, pose[0], events
 
 
@@ -459,6 +471,85 @@ def test_bottom_start_j6_at_threshold_picks_zeros_and_replaces_box():
     ]
     assert result.x == pytest.approx(0.5637)
     assert result.z == pytest.approx(grasp_pose.z)
+
+
+def test_long_box_offset_uses_short_end_nearest_user_origin():
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    params = {
+        "bottom_center_gripper_cavity_half_length_m": 0.090,
+        "bottom_center_long_box_offset_margin_m": 0.005,
+        "bottom_center_first_tool_rx_delta_deg": 70.0,
+        "user_index": 0,
+        "command_tool_index": 1,
+        "dh_timeout_s": 3.0,
+        "jog_tolerance_m": 0.002,
+    }
+    node.get_parameter = lambda name: SimpleNamespace(value=params[name])
+    node._timed_stage = stage
+    node._require_cycle_active = lambda _label: None
+    node._cycle_cancel_requested = lambda: False
+    node._publish_status = lambda _message: None
+    pose = [TcpPose(0.50, -0.10, 0.134, 180.0, 0.0, 180.0)]
+    targets = []
+    events = []
+
+    def move_linear_tcp(target, **_kwargs):
+        targets.append(target)
+        pose[0] = target
+        events.append("shift")
+
+    node._current_command_pose = lambda: pose[0]
+    node.controller = SimpleNamespace(
+        current_joint=lambda: [0.0] * 6,
+        inverse_kinematics=lambda target, **_kwargs: events.append("ik") or [0.0] * 6,
+        move_linear_tcp=move_linear_tcp,
+    )
+    node.gripper = SimpleNamespace(
+        read_position=lambda: 0.6,
+        set_position=lambda position, **_kwargs: events.append(("open", position)),
+        wait_until_stopped=lambda **_kwargs: None,
+    )
+
+    assert node._offset_bottom_long_box_before_first_tool_rx(
+        0.180, {"linear_speed": 20, "linear_acc": 20}
+    ) == 0.0
+    assert events == []
+
+    offset = node._offset_bottom_long_box_before_first_tool_rx(
+        0.200, {"linear_speed": 20, "linear_acc": 20}
+    )
+    assert offset == pytest.approx(0.015)
+    assert (targets[0].x, targets[0].y, targets[0].z) == pytest.approx(
+        (0.50, -0.085, 0.134)
+    )
+    assert events == ["ik", "ik", ("open", 1.0), "shift"]
+
+    pose[0] = TcpPose(0.50, -0.10, 0.134, 180.0, 0.0, 0.0)
+    events.clear()
+    assert node._offset_bottom_long_box_before_first_tool_rx(
+        0.200, {"linear_speed": 20, "linear_acc": 20}
+    ) == pytest.approx(0.015)
+    assert (targets[-1].x, targets[-1].y, targets[-1].z) == pytest.approx(
+        (0.50, -0.085, 0.134)
+    )
+    assert events == ["ik", "ik", ("open", 1.0), "shift"]
+
+    pose[0] = TcpPose(0.50, -0.10, 0.134, 180.0, 0.0, 0.0)
+    events.clear()
+    ik_calls = [0]
+
+    def unreachable_roll(_target, **_kwargs):
+        ik_calls[0] += 1
+        if ik_calls[0] == 2:
+            raise RuntimeError("roll pose unreachable")
+        return [0.0] * 6
+
+    node.controller.inverse_kinematics = unreachable_roll
+    with pytest.raises(RuntimeError, match="roll pose unreachable"):
+        node._offset_bottom_long_box_before_first_tool_rx(
+            0.200, {"linear_speed": 20, "linear_acc": 20}
+        )
+    assert events == []
 
 
 def test_near_cube_bottom_flip_uses_requested_tool_rx_sequence_and_regrasps_in_place():
@@ -550,7 +641,7 @@ def test_bottom_center_sequence_accepts_j6_xy_shift_and_returns_to_absolute_gras
     motion = {"barcode_alignment_speed": 20, "barcode_alignment_acc": 20}
 
     node._execute_turntable_bottom_center_recovery(
-        grasp_pose, 0.6, 0.057, 0.095, motion
+        grasp_pose, 0.6, 0.057, 0.095, motion, length_m=0.120
     )
 
     assert events == [
@@ -569,11 +660,37 @@ def test_bottom_center_sequence_accepts_j6_xy_shift_and_returns_to_absolute_gras
         ("z", 0.174, False, 0.5647),
         ("open", 0.6),
         ("tool_rx", 70.0, 0.174, 0.5647),
+        ("z", 0.174, False, 0.572),
         ("z", 0.134, False, 0.572),
         ("close", 0.134),
         ("confirm", 0.134),
         ("safe_departure", 0.134),
     ]
+
+
+def test_long_box_short_end_shift_precedes_fixed_plus_70_rolls():
+    node, grasp_pose, events = make_sequence_node(initial_j6=-20.0)
+    node._offset_bottom_long_box_before_first_tool_rx = (
+        lambda length, _motion: events.append(("short_end_shift", length)) or 0.015
+    )
+    node._wait_for_bottom_center_tracked_pose = lambda **_kwargs: TcpPose(
+        0.572, -0.160, 0.134, 0.0, 0.0, 0.0
+    )
+
+    node._execute_turntable_bottom_center_recovery(
+        grasp_pose,
+        0.6,
+        0.057,
+        0.095,
+        {"barcode_alignment_speed": 20, "barcode_alignment_acc": 20},
+        length_m=0.200,
+    )
+
+    shift_index = events.index(("short_end_shift", 0.200))
+    first_roll_index = next(i for i, event in enumerate(events) if event[0] == "tool_rx")
+    assert events[shift_index - 1] == ("open", 0.6)
+    assert shift_index < first_roll_index
+    assert [event[1] for event in events if event[0] == "tool_rx"] == [70.0, 70.0]
 
 
 def test_bottom_center_linear_z_preserves_shifted_feedback_xy():
@@ -764,7 +881,7 @@ def test_bottom_center_sequence_blocks_j6_limit_before_turn():
 
     with pytest.raises(RuntimeError, match="J6 limit"):
         node._execute_turntable_bottom_center_recovery(
-            grasp_pose, 0.6, 0.057, 0.095, motion
+            grasp_pose, 0.6, 0.057, 0.095, motion, length_m=0.120
         )
 
     assert not any(event[0] == "j6" for event in events)

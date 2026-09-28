@@ -280,6 +280,10 @@ class SecondaryClearanceRetry(RuntimeError):
     """The left arm must retry a cycle because the right arm is too close."""
 
 
+class MaterialSuperseded(RuntimeError):
+    """A newer 102 placement replaced the material reserved for this pick."""
+
+
 @dataclass
 class CycleTiming:
     """One vision-to-startup cycle with machine-readable stage durations."""
@@ -479,6 +483,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("jog_tolerance_m", 0.002)
         self.declare_parameter("jog_axis_timeout_s", 20.0)
         self.declare_parameter("offset_grasp_enabled", True)
+        self.declare_parameter("turntable_top_grasp_max_tilt_deg", 30.0)
         self.declare_parameter("offset_grasp_clearance_m", 0.020)
         self.declare_parameter("offset_finger_span_m", 0.060)
         # Reach the image-down offset while descending to this clearance above
@@ -489,11 +494,10 @@ class CosmeticBoxSingleArmNode(Node):
         # path.  Move diagonally from startup to this height above the D405
         # grasp target, then use a vertical Cartesian descent.
         self.declare_parameter("side_barcode_direct_hover_clearance_m", 0.120)
-        # The offset-high PTP and the following vertical descent are both
-        # known safe once the gripper pre-shape and target identity checks have
-        # passed.  Queue the MovL descent before the PTP reaches its endpoint
-        # so the controller can blend the two segments without an idle stop.
-        self.declare_parameter("offset_high_descent_blend_enabled", True)
+        # Stop at offset-high and verify the reached gripper attitude before
+        # descending beside the turntable material.  Non-turntable use can
+        # still opt into the continuous queue.
+        self.declare_parameter("offset_high_descent_blend_enabled", False)
         self.declare_parameter("offset_high_descent_blend_cp", 20)
         self.declare_parameter("offset_high_descent_queue_lead_m", 0.030)
         self.declare_parameter("offset_high_descent_command_start_grace_s", 0.30)
@@ -742,6 +746,10 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("bottom_center_first_tool_rx_delta_deg", 70.0)
         self.declare_parameter("bottom_center_release_tool_rx_delta_deg", 70.0)
         self.declare_parameter("bottom_center_tracking_timeout_s", 2.0)
+        # Move toward the short end nearest User origin when half the box
+        # length exceeds the measured gripper cavity from the TCP.
+        self.declare_parameter("bottom_center_gripper_cavity_half_length_m", 0.075)
+        self.declare_parameter("bottom_center_long_box_offset_margin_m", 0.015)
         # Both bottom-face branches start from a stable J6 neighbourhood. If
         # the wrist is farther than this from zero, temporarily pick the box,
         # lift it clear, set J6=0, put it back, and continue from the new centre.
@@ -922,6 +930,8 @@ class CosmeticBoxSingleArmNode(Node):
         self.turntable_place_done_count = 0
         self.turntable_place_done_consumed = 0
         self.turntable_place_done_duplicate_warned = False
+        self.turntable_rescan_pending = False
+        self.turntable_active_pick_event_number: Optional[int] = None
         # V3 pre-scans material as soon as 102 finishes placing it.  The left
         # arm later consumes this ready state; it no longer owns turntable
         # scanning or waits for a fresh place event after Execute is clicked.
@@ -1858,10 +1868,6 @@ class CosmeticBoxSingleArmNode(Node):
         place_seen_now = False
         fired = False
         with self.turntable_lock:
-            if not self.turntable_waiting_for_place:
-                return
-            if self.turntable_place_done_count > self.turntable_place_done_consumed:
-                return
             was_place_seen = self.turntable_secondary_retreat_trigger.place_seen
             fired = self.turntable_secondary_retreat_trigger.update(
                 right_y_m,
@@ -1952,6 +1958,8 @@ class CosmeticBoxSingleArmNode(Node):
                 self.secondary_last_clearance_state = False
                 last_state = False
             except Exception as exc:
+                if not require_cycle_active and self.turntable_scan_cancel.is_set():
+                    raise
                 last_error = str(exc)
                 now = time.monotonic()
                 if now - self.secondary_last_clearance_log_at >= log_period_s:
@@ -2677,23 +2685,17 @@ class CosmeticBoxSingleArmNode(Node):
         self._accept_turntable_place_done("manual/topic place_done")
 
     def _accept_turntable_place_done(self, source: str) -> None:
-        """Accept one placed material and immediately start its D435 scan.
+        """Start a fresh material round for every completed 102 placement.
 
         In the V3 cell contract a place_done event means the material has been
         released and the turntable is stationary.  This is therefore also the
         evidence that resolves an initial UNKNOWN software state to STOPPED.
         """
 
-        direct_barcode = ""
         thread = None
         with self.turntable_condition:
-            busy = self.turntable_scan_in_progress or self.turntable_material_ready
-            if busy:
-                pending_number = self.turntable_place_done_count
-                should_warn = not self.turntable_place_done_duplicate_warned
-                self.turntable_place_done_duplicate_warned = True
-                accepted = False
-            else:
+            scan_running = self.turntable_scan_in_progress
+            if not scan_running:
                 if self.turntable_state == "UNKNOWN":
                     self.turntable_state = "STOPPED"
                 elif self.turntable_state != "STOPPED":
@@ -2701,51 +2703,44 @@ class CosmeticBoxSingleArmNode(Node):
                         "place_done cannot start a new scan while turntable "
                         f"state={self.turntable_state}"
                     )
-                self.turntable_place_done_count += 1
-                event_number = self.turntable_place_done_count
-                self.turntable_place_done_consumed = event_number
-                self.turntable_place_done_duplicate_warned = False
-                self.turntable_waiting_for_place = False
-                self.turntable_scan_error = ""
+            self.turntable_place_done_count += 1
+            event_number = self.turntable_place_done_count
+            self.turntable_place_done_consumed = event_number
+            self.turntable_place_done_duplicate_warned = False
+            self.turntable_waiting_for_place = False
+            self.turntable_material_ready = False
+            self.turntable_ready_barcode = ""
+            self.turntable_scan_error = ""
+            self.d435_continuous_last_value = ""
+            self.d435_continuous_presence = False
+            self.turntable_secondary_retreat_trigger.reset()
+            if scan_running:
+                # Let the old worker stop any active rotation before starting
+                # the latest material's scan.  Never run two scan workers.
+                self.turntable_rescan_pending = True
+                self.turntable_scan_cancel.set()
+            else:
+                self.turntable_rescan_pending = False
                 self.turntable_scan_cancel.clear()
-                self.turntable_secondary_retreat_trigger.reset()
-                if (
-                    self.d435_continuous_detection
-                    and self.d435_continuous_presence
-                    and self.d435_continuous_last_value
-                ):
-                    direct_barcode = str(self.d435_continuous_last_value)
-                    self.turntable_scan_in_progress = False
-                    self.turntable_material_ready = True
-                    self.turntable_ready_barcode = direct_barcode
-                    self.turntable_scan_thread = None
-                    self.turntable_condition.notify_all()
-                else:
-                    self.turntable_scan_in_progress = True
-                    self.turntable_material_ready = False
-                    self.turntable_ready_barcode = ""
-                    thread = threading.Thread(
-                        target=self._turntable_prescan_worker,
-                        args=(event_number,),
-                        name=f"turntable-prescan-{event_number}",
-                        daemon=True,
-                    )
-                    self.turntable_scan_thread = thread
-                accepted = True
-
-        if not accepted:
-            if should_warn:
-                self._publish_status(
-                    "ignoring duplicate 102 place_done; "
-                    f"material event #{pending_number} is already scanning or "
-                    "is stopped and ready for the left arm"
+                self.turntable_scan_in_progress = True
+                thread = threading.Thread(
+                    target=self._turntable_prescan_worker,
+                    args=(event_number,),
+                    name=f"turntable-prescan-{event_number}",
+                    daemon=True,
                 )
-            return
-        if direct_barcode:
+                self.turntable_scan_thread = thread
+            self.turntable_condition.notify_all()
+
+        self.last_accepted_target = None
+        self.last_accepted_width_m = None
+        self.last_accepted_length_m = None
+        self.last_accepted_height_m = None
+        self.last_accepted_aspect_ratio = None
+        if scan_running:
             self._publish_status(
-                f"accepted material event #{event_number} from {source}; "
-                f"D435 already sees {direct_barcode!r} on the stopped material, "
-                "so no turntable pulse is needed and the left arm may pick"
+                f"new material event #{event_number} from {source} replaced the "
+                "previous scan; stopping it before scanning the latest material"
             )
             return
         self._publish_status(
@@ -2761,7 +2756,17 @@ class CosmeticBoxSingleArmNode(Node):
         barcode = ""
         error = ""
         cancelled = False
+        next_thread = None
+        superseded = False
         try:
+            with self.turntable_condition:
+                while (
+                    self.turntable_active_pick_event_number is not None
+                    and self.turntable_active_pick_event_number != event_number
+                ):
+                    if self.turntable_scan_cancel.is_set() or self.shutting_down:
+                        raise RuntimeError("new material scan cancelled while waiting for 101")
+                    self.turntable_condition.wait(timeout=0.05)
             barcode = self._scan_turntable_for_side_barcode(
                 require_cycle_active=False,
             )
@@ -2777,8 +2782,34 @@ class CosmeticBoxSingleArmNode(Node):
         finally:
             self._set_turntable_barcode_window(False)
             with self.turntable_condition:
-                self.turntable_scan_in_progress = False
-                if cancelled:
+                superseded = event_number != self.turntable_place_done_count
+                if superseded and self.turntable_rescan_pending:
+                    self.turntable_rescan_pending = False
+                    if self.turntable_state == "STOPPED" and not self.shutting_down:
+                        next_event = self.turntable_place_done_count
+                        self.turntable_scan_cancel.clear()
+                        next_thread = threading.Thread(
+                            target=self._turntable_prescan_worker,
+                            args=(next_event,),
+                            name=f"turntable-prescan-{next_event}",
+                            daemon=True,
+                        )
+                        self.turntable_scan_thread = next_thread
+                        self.turntable_scan_in_progress = True
+                    else:
+                        self.turntable_scan_in_progress = False
+                        self.turntable_scan_error = (
+                            "new material scan cannot start until the turntable "
+                            f"is confirmed stopped (state={self.turntable_state})"
+                        )
+                    self.turntable_material_ready = False
+                    self.turntable_ready_barcode = ""
+                elif superseded:
+                    # An operator reset owns the state; the old worker must
+                    # never publish a ready result for the replacement box.
+                    self.turntable_scan_in_progress = False
+                elif cancelled:
+                    self.turntable_scan_in_progress = False
                     # An operator recovery owns the next state transition.  Do
                     # not let this obsolete worker publish ready/error state
                     # after the previous round has been abandoned.
@@ -2786,15 +2817,26 @@ class CosmeticBoxSingleArmNode(Node):
                     self.turntable_ready_barcode = ""
                     self.turntable_scan_error = ""
                 elif not error:
+                    self.turntable_scan_in_progress = False
                     self.turntable_material_ready = True
                     self.turntable_ready_barcode = barcode
                     self.turntable_scan_error = ""
                 else:
+                    self.turntable_scan_in_progress = False
                     self.turntable_material_ready = False
                     self.turntable_ready_barcode = ""
                     self.turntable_scan_error = error
                 self.turntable_condition.notify_all()
 
+        if next_thread is not None:
+            self._publish_status(
+                f"previous scan stopped; starting D435 scan for latest material "
+                f"event #{self.turntable_place_done_count}"
+            )
+            next_thread.start()
+            return
+        if superseded:
+            return
         if cancelled:
             return
         if error:
@@ -2814,7 +2856,7 @@ class CosmeticBoxSingleArmNode(Node):
                 "turntable is stopped and the material is ready—click Execute once"
             )
 
-    def _wait_for_scanned_turntable_material(self) -> str:
+    def _wait_for_scanned_turntable_material(self) -> tuple[int, str]:
         """Wait for the independently scanned and stopped material.
 
         An empty barcode is a valid completed scan: D405 will inspect the
@@ -2822,7 +2864,7 @@ class CosmeticBoxSingleArmNode(Node):
         """
 
         if not bool(self.get_parameter("turntable_enabled").value):
-            return ""
+            return 0, ""
         timeout_s = max(
             0.0,
             float(self.get_parameter("turntable_place_wait_timeout_s").value),
@@ -2833,13 +2875,15 @@ class CosmeticBoxSingleArmNode(Node):
             with self.turntable_condition:
                 if self.turntable_material_ready:
                     barcode = self.turntable_ready_barcode
+                    event_number = self.turntable_place_done_count
                     state = self.turntable_state
                     if state != "STOPPED":
                         raise RuntimeError(
                             "scanned material cannot be picked because turntable "
                             f"state={state}, expected=STOPPED"
                         )
-                    return barcode
+                    self.turntable_active_pick_event_number = event_number
+                    return event_number, barcode
                 scan_in_progress = self.turntable_scan_in_progress
                 scan_error = self.turntable_scan_error
                 if scan_error:
@@ -2865,18 +2909,50 @@ class CosmeticBoxSingleArmNode(Node):
                 self.turntable_condition.wait(timeout=wait_s)
         raise RuntimeError("cycle cancelled while waiting for D435-ready material")
 
+    def _require_current_material_event(self, event_number: int, stage: str) -> None:
+        if not bool(self.get_parameter("turntable_enabled").value):
+            return
+        with self.turntable_condition:
+            current = self.turntable_place_done_count
+            ready = self.turntable_material_ready
+            stopped = self.turntable_state == "STOPPED"
+        if current != event_number or not ready or not stopped:
+            raise MaterialSuperseded(
+                f"material event #{event_number} was replaced before {stage}; "
+                f"latest event=#{current}, ready={ready}, stopped={stopped}"
+            )
+
+    def _release_active_material_event(self, event_number: int) -> None:
+        with self.turntable_condition:
+            if self.turntable_active_pick_event_number == event_number:
+                self.turntable_active_pick_event_number = None
+                self.turntable_condition.notify_all()
+
     def _mark_turntable_material_removed(self) -> None:
-        """Re-arm place detection once the lifted box has left the turntable."""
+        """Release the picked material without erasing a newer 102 placement."""
 
         with self.turntable_condition:
+            active_event = self.turntable_active_pick_event_number
+            self.turntable_active_pick_event_number = None
+            if (
+                active_event is not None
+                and active_event != self.turntable_place_done_count
+            ):
+                # A new placement arrived while 101 was completing the old
+                # pickup.  Its scan/ready result belongs to the new box.
+                self.turntable_condition.notify_all()
+                return
             if not self.turntable_material_ready:
+                self.turntable_condition.notify_all()
                 return
             self.turntable_material_ready = False
             self.turntable_ready_barcode = ""
             self.turntable_scan_error = ""
             self.turntable_waiting_for_place = True
             self.turntable_place_done_duplicate_warned = False
-            self.turntable_secondary_retreat_trigger.reset()
+            # 102 may already have entered the next placement region while
+            # 101 is lifting the previous box.  Preserve that entry so its
+            # later stable retreat still creates the new material event.
             # Do not let the barcode on the box that is now in the left
             # gripper satisfy the next material event.  The D435 node will
             # publish a fresh presence edge after the old box leaves view.
@@ -2898,6 +2974,7 @@ class CosmeticBoxSingleArmNode(Node):
 
         self.turntable_scan_cancel.set()
         with self.turntable_condition:
+            self.turntable_rescan_pending = False
             self.turntable_condition.notify_all()
 
         # The scan worker also stops a running table in its finally path.  This
@@ -2923,6 +3000,8 @@ class CosmeticBoxSingleArmNode(Node):
             self.turntable_place_done_count = 0
             self.turntable_place_done_consumed = 0
             self.turntable_place_done_duplicate_warned = False
+            self.turntable_rescan_pending = False
+            self.turntable_active_pick_event_number = None
             self.turntable_scan_thread = None
             self.turntable_secondary_retreat_trigger.reset(
                 require_fresh_entry=True
@@ -3075,6 +3154,8 @@ class CosmeticBoxSingleArmNode(Node):
         self._wait_for_turntable_camera_ready(
             require_cycle_active=require_cycle_active,
         )
+        if self.turntable_scan_cancel.is_set():
+            raise RuntimeError("D435 turntable scan cancelled before camera window")
         self._set_turntable_barcode_window(True)
         barcode = ""
         turntable_was_started = False
@@ -3095,14 +3176,7 @@ class CosmeticBoxSingleArmNode(Node):
 
         def visible_barcode() -> str:
             with self.turntable_lock:
-                workflow_value = str(self.turntable_barcode_value)
-                continuous_value = (
-                    str(self.d435_continuous_last_value)
-                    if self.d435_continuous_detection
-                    and self.d435_continuous_presence
-                    else ""
-                )
-            return workflow_value or continuous_value
+                return str(self.turntable_barcode_value)
 
         try:
             try:
@@ -3130,6 +3204,8 @@ class CosmeticBoxSingleArmNode(Node):
                     time.sleep(0.005)
 
                 if not barcode:
+                    if self.turntable_scan_cancel.is_set():
+                        raise RuntimeError("D435 turntable scan cancelled before rotation")
                     self._publish_status(
                         "no barcode confirmed on the stopped face; starting turntable "
                         f"search for up to {timeout_s:.1f}s"
@@ -3182,6 +3258,8 @@ class CosmeticBoxSingleArmNode(Node):
                         self._require_cycle_active("waiting for turntable to settle")
                     elif not self.running or self.shutting_down:
                         raise RuntimeError("node stopped while turntable was settling")
+                    if self.turntable_scan_cancel.is_set():
+                        raise RuntimeError("turntable scan superseded by a new placement")
                     if not barcode:
                         barcode = visible_barcode()
                     time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
@@ -3332,14 +3410,26 @@ class CosmeticBoxSingleArmNode(Node):
                 # from the independent D435 ready queue.  The value survives
                 # D405/grasp retries so the same box is never scanned again.
                 pending_side_barcode: Optional[str] = None
+                pending_material_event_number: Optional[int] = None
                 while self.running and self.cycle_enabled:
                     cycle_index += 1
                     self._begin_cycle_timing(f"continuous-{cycle_index}")
-                    if pending_side_barcode is None:
+                    if pending_material_event_number is None:
                         with self._timed_stage("turntable_ready_wait"):
-                            pending_side_barcode = (
+                            pending_material_event_number, pending_side_barcode = (
                                 self._wait_for_scanned_turntable_material()
                             )
+                    try:
+                        self._require_current_material_event(
+                            pending_material_event_number, "continuous-cycle startup"
+                        )
+                    except MaterialSuperseded as exc:
+                        self._release_active_material_event(pending_material_event_number)
+                        pending_material_event_number = None
+                        pending_side_barcode = None
+                        self._publish_status(str(exc))
+                        self._finish_cycle_timing("material_replaced")
+                        continue
                     if not startup_prepared:
                         self._wait_for_secondary_y_clearance("startup motion")
                         self._move_startup_and_open(require_cycle_active=True)
@@ -3358,6 +3448,17 @@ class CosmeticBoxSingleArmNode(Node):
                         self._publish_status(str(exc))
                         self._finish_cycle_timing("prevision_secondary_clearance_retry")
                         continue
+                    try:
+                        self._require_current_material_event(
+                            pending_material_event_number, "D405 vision request"
+                        )
+                    except MaterialSuperseded as exc:
+                        self._release_active_material_event(pending_material_event_number)
+                        pending_material_event_number = None
+                        pending_side_barcode = None
+                        self._publish_status(str(exc))
+                        self._finish_cycle_timing("material_replaced")
+                        continue
                     self._publish_status(f"cycle {cycle_index}: detecting minimum-camera-X box")
                     with self._timed_stage("vision_detection"):
                         target_bundle = self._request_vision_target()
@@ -3370,6 +3471,9 @@ class CosmeticBoxSingleArmNode(Node):
                         continue
                     target_pose, width_m, height_m, length_m = target_bundle
                     try:
+                        self._require_current_material_event(
+                            pending_material_event_number, "left-arm grasp"
+                        )
                         self._execute_one_cycle(
                             target_pose,
                             width_m,
@@ -3377,7 +3481,15 @@ class CosmeticBoxSingleArmNode(Node):
                             length_m,
                             pending_side_barcode,
                             self.last_accepted_aspect_ratio,
+                            material_event_number=pending_material_event_number,
                         )
+                    except MaterialSuperseded as exc:
+                        self._release_active_material_event(pending_material_event_number)
+                        pending_material_event_number = None
+                        pending_side_barcode = None
+                        self._publish_status(str(exc))
+                        self._finish_cycle_timing("material_replaced")
+                        continue
                     except SecondaryClearanceRetry as exc:
                         if not self.running or not self.cycle_enabled:
                             self._finish_cycle_timing("cancelled")
@@ -3406,6 +3518,7 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                     self._finish_cycle_timing("success")
                     pending_side_barcode = None
+                    pending_material_event_number = None
             self._publish_status("cycle stopped")
         except Exception as exc:
             self._set_top_surface_barcode_window(False)
@@ -3510,6 +3623,7 @@ class CosmeticBoxSingleArmNode(Node):
                 raise RuntimeError(detail)
         self.turntable_scan_cancel.set()
         with self.turntable_condition:
+            self.turntable_rescan_pending = False
             self.turntable_condition.notify_all()
         self._publish_status(
             "return-to-startup request accepted; cancelling and forgetting the "
@@ -3641,6 +3755,7 @@ class CosmeticBoxSingleArmNode(Node):
             self.cycle_enabled = False
         self.turntable_scan_cancel.set()
         with self.turntable_condition:
+            self.turntable_rescan_pending = False
             self.turntable_condition.notify_all()
         turntable_error = None
         try:
@@ -3712,7 +3827,9 @@ class CosmeticBoxSingleArmNode(Node):
             "stopped turntable material before moving the left arm"
         )
         try:
-            turntable_side_barcode = self._wait_for_scanned_turntable_material()
+            material_event_number, turntable_side_barcode = (
+                self._wait_for_scanned_turntable_material()
+            )
             with self.action_lock:
                 # 单轮流程开始前必须确保夹爪已经打开。
                 self._wait_for_secondary_y_clearance("single-cycle startup motion")
@@ -3725,18 +3842,58 @@ class CosmeticBoxSingleArmNode(Node):
                 while True:
                     attempt_index += 1
                     self._begin_cycle_timing(f"single-{attempt_index}")
+                    try:
+                        self._require_current_material_event(
+                            material_event_number, "single-cycle D405 vision request"
+                        )
+                    except MaterialSuperseded as exc:
+                        self._release_active_material_event(material_event_number)
+                        self._publish_status(str(exc))
+                        self._finish_cycle_timing("material_replaced")
+                        material_event_number, turntable_side_barcode = (
+                            self._wait_for_scanned_turntable_material()
+                        )
+                        grasp_failures = 0
+                        continue
                     with self._timed_stage("vision_detection"):
                         result = self._request_vision_target()
                     if result is None:
+                        try:
+                            self._require_current_material_event(
+                                material_event_number, "single-cycle vision result"
+                            )
+                        except MaterialSuperseded as exc:
+                            self._release_active_material_event(material_event_number)
+                            self._publish_status(str(exc))
+                            self._finish_cycle_timing("material_replaced")
+                            material_event_number, turntable_side_barcode = (
+                                self._wait_for_scanned_turntable_material()
+                            )
+                            grasp_failures = 0
+                            continue
+                        self._release_active_material_event(material_event_number)
                         self._finish_cycle_timing("no_target")
                         raise RuntimeError("no stable D405 target received")
                     try:
+                        self._require_current_material_event(
+                            material_event_number, "single-cycle left-arm grasp"
+                        )
                         self._execute_one_cycle(
                             *result,
                             turntable_side_barcode,
                             self.last_accepted_aspect_ratio,
+                            material_event_number=material_event_number,
                         )
                         break
+                    except MaterialSuperseded as exc:
+                        self._release_active_material_event(material_event_number)
+                        self._publish_status(str(exc))
+                        self._finish_cycle_timing("material_replaced")
+                        material_event_number, turntable_side_barcode = (
+                            self._wait_for_scanned_turntable_material()
+                        )
+                        grasp_failures = 0
+                        continue
                     except SecondaryClearanceRetry as exc:
                         if not self.running or not self.cycle_enabled:
                             self._finish_cycle_timing("cancelled")
@@ -4517,11 +4674,172 @@ class CosmeticBoxSingleArmNode(Node):
         )
         return corrected_target
 
+    def _require_turntable_top_down(self, pose: TcpPose, label: str) -> None:
+        """Require the calibrated Tool Z to point down toward the turntable."""
+
+        max_tilt_deg = float(
+            self.get_parameter("turntable_top_grasp_max_tilt_deg").value
+        )
+        if not math.isfinite(max_tilt_deg) or not 0.0 < max_tilt_deg <= 45.0:
+            raise RuntimeError(
+                "turntable_top_grasp_max_tilt_deg must be in (0, 45]"
+            )
+        rotation = SciPyRot.from_euler(
+            "xyz", [pose.rx, pose.ry, pose.rz], degrees=True
+        )
+        tool_z = rotation.apply([0.0, 0.0, 1.0])
+        downward_cosine = max(-1.0, min(1.0, -float(tool_z[2])))
+        tilt_deg = math.degrees(math.acos(downward_cosine))
+        if tilt_deg > max_tilt_deg:
+            raise RuntimeError(
+                f"{label}: Tool Z is {tilt_deg:.1f}deg from downward User Z; "
+                f"limit={max_tilt_deg:.1f}deg. Check the D405 pose and Tool-1 "
+                "gripper mounting before descending onto the box"
+            )
+
+    def _level_turntable_grasp_pose(self, pose: TcpPose) -> TcpPose:
+        """Keep the measured grasp yaw while making Tool Z vertical."""
+
+        self._require_turntable_top_down(pose, "D405 turntable grasp attitude")
+        rotation = SciPyRot.from_euler(
+            "xyz", [pose.rx, pose.ry, pose.rz], degrees=True
+        )
+        tool_y = rotation.apply([0.0, 1.0, 0.0])
+        horizontal_y = np.array([tool_y[0], tool_y[1], 0.0], dtype=float)
+        norm = float(np.linalg.norm(horizontal_y))
+        if norm < 0.5:
+            raise RuntimeError("D405 grasp Tool Y has no reliable table-plane direction")
+        horizontal_y /= norm
+        downward_z = np.array([0.0, 0.0, -1.0], dtype=float)
+        horizontal_x = np.cross(horizontal_y, downward_z)
+        level_rotation = SciPyRot.from_matrix(
+            np.column_stack((horizontal_x, horizontal_y, downward_z))
+        )
+        rx, ry, rz = level_rotation.as_euler("xyz", degrees=True)
+        correction_deg = math.degrees((rotation.inv() * level_rotation).magnitude())
+        self._publish_status(
+            "turntable offset grasp: level Tool Z downward while preserving "
+            f"the measured top-edge direction; attitude correction={correction_deg:.1f}deg"
+        )
+        return TcpPose(pose.x, pose.y, pose.z, float(rx), float(ry), float(rz))
+
+    def _require_offset_grasp_attitude(
+        self, actual: TcpPose, target: TcpPose, label: str
+    ) -> None:
+        """Reject a lateral insertion if the reached Tool attitude is wrong."""
+
+        if not bool(self.get_parameter("turntable_enabled").value):
+            return
+        self._require_turntable_top_down(actual, label)
+        actual_rotation = SciPyRot.from_euler(
+            "xyz", [actual.rx, actual.ry, actual.rz], degrees=True
+        )
+        target_rotation = SciPyRot.from_euler(
+            "xyz", [target.rx, target.ry, target.rz], degrees=True
+        )
+        error_deg = math.degrees(
+            (actual_rotation.inv() * target_rotation).magnitude()
+        )
+        if error_deg > 3.0:
+            raise RuntimeError(
+                f"{label}: gripper attitude error {error_deg:.1f}deg exceeds 3deg; "
+                "refusing the low-height lateral insert"
+            )
+        self._publish_status(
+            f"{label}: downward gripper attitude verified; "
+            f"orientation error={error_deg:.1f}deg"
+        )
+
+    def _move_turntable_center_hover(
+        self,
+        target: TcpPose,
+        height_m: float,
+        motion: dict[str, int],
+    ) -> None:
+        """Lift, align, and translate above the box before a vertical grasp."""
+
+        self._require_turntable_top_down(target, "turntable centre grasp")
+        if not math.isfinite(height_m) or height_m <= 0.0:
+            raise RuntimeError("turntable centre grasp requires a valid box height")
+        current = self._current_command_pose()
+        tcp_below_m = max(
+            0.0, float(self.get_parameter("turntable_tcp_below_target_m").value)
+        )
+        clearance_m = max(
+            0.050,
+            float(self.get_parameter("pregrasp_min_hover_clearance_m").value),
+            tcp_below_m + 0.030,
+        )
+        hover_z = max(current.z, target.z + height_m + clearance_m)
+        lift = TcpPose(
+            current.x, current.y, hover_z,
+            current.rx, current.ry, current.rz,
+        )
+        aligned = TcpPose(
+            current.x, current.y, hover_z,
+            target.rx, target.ry, target.rz,
+        )
+        hover = TcpPose(
+            target.x, target.y, hover_z,
+            target.rx, target.ry, target.rz,
+        )
+        user = int(self.get_parameter("user_index").value)
+        tool = int(self.get_parameter("command_tool_index").value)
+        joints = self.controller.current_joint()
+        for waypoint in (lift, aligned, hover):
+            self.controller.inverse_kinematics(
+                waypoint, user_index=user, tool_index=tool, joint_near=joints
+            )
+        self._publish_status(
+            "turntable centre grasp: lift at current XY, align Tool at safe "
+            f"Z={hover_z*1000:.1f}mm, then translate above target XY before "
+            "vertical descent"
+        )
+        if hover_z - current.z > 0.001:
+            self._require_cycle_active("before turntable centre approach lift")
+            self.controller.move_linear_tcp(
+                lift,
+                speed=motion["linear_speed"],
+                accel=motion["linear_acc"],
+                user_index=user,
+                tool_index=tool,
+            )
+        current_rotation = SciPyRot.from_euler(
+            "xyz", [current.rx, current.ry, current.rz], degrees=True
+        )
+        target_rotation = SciPyRot.from_euler(
+            "xyz", [target.rx, target.ry, target.rz], degrees=True
+        )
+        angle_deg = math.degrees(
+            (current_rotation.inv() * target_rotation).magnitude()
+        )
+        if angle_deg > 0.5:
+            self._require_cycle_active("before turntable centre attitude alignment")
+            self.controller.move_linear_tcp(
+                aligned,
+                speed=motion["linear_speed"],
+                accel=motion["linear_acc"],
+                user_index=user,
+                tool_index=tool,
+            )
+        if math.hypot(target.x - current.x, target.y - current.y) > 0.001:
+            self._require_cycle_active("before turntable centre XY approach")
+            self.controller.move_linear_tcp(
+                hover,
+                speed=motion["linear_speed"],
+                accel=motion["linear_acc"],
+                user_index=user,
+                tool_index=tool,
+            )
+        self._require_cycle_active("after turntable centre hover")
+
     def _execute_offset_entry(
         self,
         target: TcpPose,
         length_m: float,
         after_offset_high=None,
+        *,
+        box_height_m: float | None = None,
     ) -> None:
         """Move image-down, descend beside the box, then insert to its centre."""
         user = int(self.get_parameter("user_index").value)
@@ -4554,10 +4872,13 @@ class CosmeticBoxSingleArmNode(Node):
                 f"offset_high_clearance_m={high_clearance_m:.4f}m must be at least "
                 f"pregrasp_min_hover_clearance_m={minimum_hover_clearance_m:.4f}m"
             )
-        # Never add an unexpected upward leg when a caller starts below the
-        # configured high point.  Such a start is accepted only when it still
-        # preserves the normal minimum hover clearance.
-        high_z = min(float(current.z), float(low_xyz[2]) + high_clearance_m)
+        high_z = max(float(current.z), float(low_xyz[2]) + high_clearance_m)
+        if box_height_m is not None:
+            if not math.isfinite(box_height_m) or box_height_m <= 0.0:
+                raise RuntimeError("offset approach requires a valid box height")
+            # The TCP grasp point is inside the box height.  Keep the PTP
+            # waypoint above the whole box before lowering beside it.
+            high_z = max(high_z, target.z + box_height_m + 0.050)
         actual_high_clearance_m = high_z - float(low_xyz[2])
         if actual_high_clearance_m < minimum_hover_clearance_m:
             raise RuntimeError(
@@ -4566,6 +4887,15 @@ class CosmeticBoxSingleArmNode(Node):
             )
         high_xyz = low_xyz.copy(); high_xyz[2] = high_z
         waypoints = [TcpPose(*v, target.rx, target.ry, target.rz) for v in (high_xyz, low_xyz, xyz)]
+        lift_pose = TcpPose(
+            current.x, current.y, high_z,
+            current.rx, current.ry, current.rz,
+        )
+        if high_z - current.z > 0.001:
+            self.controller.inverse_kinematics(
+                lift_pose, user_index=user, tool_index=tool,
+                joint_near=self.controller.current_joint(),
+            )
         for pose in waypoints:
             self.controller.inverse_kinematics(pose, user_index=user, tool_index=tool,
                                               joint_near=self.controller.current_joint())
@@ -4577,9 +4907,21 @@ class CosmeticBoxSingleArmNode(Node):
             f"descent/insert speed={motion['linear_speed']}%, "
             f"accel={motion['linear_acc']}%"
         )
+        if high_z - current.z > 0.001:
+            self._require_cycle_active("before offset approach safe lift")
+            with self._timed_stage("offset_safe_lift"):
+                self.controller.move_linear_tcp(
+                    lift_pose,
+                    speed=motion["linear_speed"],
+                    accel=motion["linear_acc"],
+                    user_index=user,
+                    tool_index=tool,
+                )
+            self._require_cycle_active("after offset approach safe lift")
 
-        blend_offset_high_descent = bool(
-            self.get_parameter("offset_high_descent_blend_enabled").value
+        blend_offset_high_descent = (
+            bool(self.get_parameter("offset_high_descent_blend_enabled").value)
+            and not bool(self.get_parameter("turntable_enabled").value)
         )
         if blend_offset_high_descent:
             self._publish_status(
@@ -4605,6 +4947,9 @@ class CosmeticBoxSingleArmNode(Node):
                 )
             ) > 0.003:
                 raise RuntimeError("Offset waypoint position not reached: offset_descent")
+            self._require_offset_grasp_attitude(
+                actual, waypoints[1], "offset descent"
+            )
 
             self._publish_status("top-barcode low offset observation")
             with self._timed_stage("top_barcode_low_observation"):
@@ -4663,6 +5008,8 @@ class CosmeticBoxSingleArmNode(Node):
             actual = self._current_command_pose()
             if np.linalg.norm(np.array([actual.x-pose.x, actual.y-pose.y, actual.z-pose.z])) > 0.003:
                 raise RuntimeError("Offset waypoint position not reached: " + stage)
+            if index < 2:
+                self._require_offset_grasp_attitude(actual, pose, stage)
             if index == 0 and after_offset_high is not None:
                 after_offset_high()
             if index == 1:
@@ -4880,8 +5227,17 @@ class CosmeticBoxSingleArmNode(Node):
         length_m: float,
         turntable_side_barcode: str = "",
         aspect_ratio: Optional[float] = None,
+        material_event_number: Optional[int] = None,
     ) -> None:
         motion = self._motion_profile()
+        if material_event_number is not None:
+            self._require_current_material_event(
+                material_event_number, "grasp planning"
+            )
+        turntable_enabled = bool(self.get_parameter("turntable_enabled").value)
+        side_barcode_preconfirmed = bool(str(turntable_side_barcode).strip())
+        if turntable_enabled and not side_barcode_preconfirmed:
+            target = self._level_turntable_grasp_pose(target)
         if (
             aspect_ratio is not None
             and math.isfinite(float(aspect_ratio))
@@ -4971,13 +5327,13 @@ class CosmeticBoxSingleArmNode(Node):
                 f"{selected_alignment} edge ({selected_travel_deg:.1f}deg)"
             )
         offset_grasp_enabled = bool(self.get_parameter("offset_grasp_enabled").value)
-        side_barcode_preconfirmed = bool(str(turntable_side_barcode).strip())
         # D435 has already classified this material when a side barcode is
         # present.  In that case D405 is needed only for target localization:
         # use a centre hover followed by a vertical descent instead of the
         # offset-high/descent/insert path used for top-surface observation.
         use_offset_grasp_entry = (
-            offset_grasp_enabled and not side_barcode_preconfirmed
+            offset_grasp_enabled
+            and not side_barcode_preconfirmed
         )
         z_offset_m = float(self.get_parameter("grasp_z_offset_m").value)
         z_offset_limit_m = abs(float(self.get_parameter("grasp_z_offset_limit_m").value))
@@ -4994,7 +5350,7 @@ class CosmeticBoxSingleArmNode(Node):
             "vision",
         )
         if (
-            bool(self.get_parameter("turntable_enabled").value)
+            turntable_enabled
             and bool(self.get_parameter("turntable_height_safety_enabled").value)
         ):
             configured_surface_z_m = float(
@@ -5130,6 +5486,10 @@ class CosmeticBoxSingleArmNode(Node):
             if use_offset_grasp_entry
             else "immediately before move-above"
         )
+        if material_event_number is not None:
+            self._require_current_material_event(
+                material_event_number, "left-arm approach motion"
+            )
         # A confirmed D435 side barcode already has priority over the D405
         # top barcode.  Skip the redundant detector and its low-pose wait for
         # this material, while keeping D405 target localization unchanged.
@@ -5175,6 +5535,7 @@ class CosmeticBoxSingleArmNode(Node):
                 target,
                 length_m,
                 after_offset_high=validate_at_offset_high,
+                box_height_m=height_m,
             )
         else:
             if side_barcode_preconfirmed:
@@ -5186,13 +5547,16 @@ class CosmeticBoxSingleArmNode(Node):
             else:
                 self._publish_status("moving above selected box")
             with self._timed_stage("move_above"):
-                self.controller.move_joint_tcp(
-                    planar,
-                    speed=motion["joint_speed"],
-                    accel=motion["joint_pose_acc"],
-                    user_index=int(self.get_parameter("user_index").value),
-                    tool_index=int(self.get_parameter("command_tool_index").value),
-                )
+                if turntable_enabled and not side_barcode_preconfirmed:
+                    self._move_turntable_center_hover(target, height_m, motion)
+                else:
+                    self.controller.move_joint_tcp(
+                        planar,
+                        speed=motion["joint_speed"],
+                        accel=motion["joint_pose_acc"],
+                        user_index=int(self.get_parameter("user_index").value),
+                        tool_index=int(self.get_parameter("command_tool_index").value),
+                    )
             self._require_cycle_active("after move-above")
             target = confirm_preshape_and_revalidate(allow_hover_correction=True)
             if observe_top_barcode:
@@ -5206,6 +5570,35 @@ class CosmeticBoxSingleArmNode(Node):
                     "preconfirmed side-barcode material"
                 )
             self._require_cycle_active("immediately before grasp descent")
+            if turntable_enabled and not side_barcode_preconfirmed:
+                self._require_turntable_top_down(target, "turntable grasp descent")
+                hover_pose = self._current_command_pose()
+                self._require_turntable_top_down(hover_pose, "turntable hover attitude")
+                if math.hypot(hover_pose.x - target.x, hover_pose.y - target.y) > 0.002:
+                    raise RuntimeError(
+                        "turntable grasp descent requires TCP to be above the "
+                        "target XY within 2mm"
+                    )
+                hover_rotation = SciPyRot.from_euler(
+                    "xyz", [hover_pose.rx, hover_pose.ry, hover_pose.rz], degrees=True
+                )
+                target_rotation = SciPyRot.from_euler(
+                    "xyz", [target.rx, target.ry, target.rz], degrees=True
+                )
+                rotation_error_deg = math.degrees(
+                    (hover_rotation.inv() * target_rotation).magnitude()
+                )
+                if rotation_error_deg > 2.0:
+                    raise RuntimeError(
+                        "turntable grasp descent requires the Tool attitude to "
+                        f"match the target within 2deg (actual {rotation_error_deg:.1f}deg)"
+                    )
+                # Use the reached hover XY and attitude exactly so the final
+                # MovL changes only User Z, even with small feedback error.
+                target = TcpPose(
+                    hover_pose.x, hover_pose.y, target.z,
+                    hover_pose.rx, hover_pose.ry, hover_pose.rz,
+                )
             with self._timed_stage("grasp_descend"):
                 self.controller.move_linear_tcp(
                     target,
@@ -5239,7 +5632,6 @@ class CosmeticBoxSingleArmNode(Node):
             + (actual_grasp_pose.y - target.y) ** 2
             + (actual_grasp_pose.z - target.z) ** 2
         )
-        turntable_enabled = bool(self.get_parameter("turntable_enabled").value)
         if turntable_enabled and barcode_face == "bottom":
             if not bool(self.get_parameter("bottom_barcode_recovery_enabled").value):
                 raise RuntimeError(
@@ -5295,6 +5687,7 @@ class CosmeticBoxSingleArmNode(Node):
                 width_m,
                 max_opening,
                 motion,
+                length_m=length_m,
             )
             self._mark_turntable_material_removed()
             self._place_as_top_barcode_box()
@@ -5933,7 +6326,9 @@ class CosmeticBoxSingleArmNode(Node):
             "table return and pickup-attitude restore are reachable"
         )
 
-    def _wait_for_bottom_center_tracked_pose(self) -> TcpPose:
+    def _wait_for_bottom_center_tracked_pose(
+        self, *, reference_xy: Optional[tuple[float, float]] = None
+    ) -> TcpPose:
         """Wait for one fresh D405 target published after the second Tool-Rx."""
 
         timeout_s = max(
@@ -5962,7 +6357,13 @@ class CosmeticBoxSingleArmNode(Node):
                 and age_s <= max_age_s
             ):
                 current = self._current_command_pose()
-                xy_shift_m = math.hypot(pose.x - current.x, pose.y - current.y)
+                reference_x, reference_y = (
+                    (current.x, current.y)
+                    if reference_xy is None else reference_xy
+                )
+                xy_shift_m = math.hypot(
+                    pose.x - reference_x, pose.y - reference_y
+                )
                 max_shift_m = max(
                     0.001,
                     float(self.get_parameter("pregrasp_max_correction_m").value),
@@ -6345,6 +6746,114 @@ class CosmeticBoxSingleArmNode(Node):
         self._reset_barcode_search_travel()
         self._place_as_side_barcode_box(motion)
 
+    def _offset_bottom_long_box_before_first_tool_rx(
+        self,
+        length_m: float,
+        motion: dict[str, int],
+    ) -> float:
+        """Move the open gripper toward the short end nearest User origin."""
+
+        cavity_m = float(
+            self.get_parameter("bottom_center_gripper_cavity_half_length_m").value
+        )
+        margin_m = float(
+            self.get_parameter("bottom_center_long_box_offset_margin_m").value
+        )
+        if not all(math.isfinite(value) for value in (length_m, cavity_m, margin_m)):
+            raise RuntimeError("bottom long-box geometry must be finite")
+        if length_m <= 0.0:
+            raise RuntimeError("bottom long-box length must be positive")
+        if cavity_m <= 0.0 or margin_m < 0.0 or margin_m >= cavity_m:
+            raise RuntimeError("invalid bottom long-box cavity or offset margin")
+        if length_m <= 2.0 * cavity_m:
+            self._publish_status(
+                f"bottom long-box check: measured length={length_m*1000.0:.1f}mm "
+                f"<= cavity threshold={2.0*cavity_m*1000.0:.1f}mm; "
+                "keeping the original Tool-Rx +70deg grasp path"
+            )
+            return 0.0
+
+        offset_m = 0.5 * length_m - cavity_m + margin_m
+        current = self._current_command_pose()
+        rotation = SciPyRot.from_euler(
+            "xyz", [current.rx, current.ry, current.rz], degrees=True
+        )
+        tool_y = rotation.apply([0.0, 1.0, 0.0])
+        horizontal_norm = math.hypot(float(tool_y[0]), float(tool_y[1]))
+        if horizontal_norm < 0.5:
+            raise RuntimeError("bottom long-box Tool Y is not aligned with the table")
+        unit_y_x = float(tool_y[0]) / horizontal_norm
+        unit_y_y = float(tool_y[1]) / horizontal_norm
+        plus_distance = math.hypot(
+            current.x + offset_m * unit_y_x,
+            current.y + offset_m * unit_y_y,
+        )
+        minus_distance = math.hypot(
+            current.x - offset_m * unit_y_x,
+            current.y - offset_m * unit_y_y,
+        )
+        short_end_sign = 1.0 if plus_distance <= minus_distance else -1.0
+        # Tool Y provides the long-edge axis.  Its sign is only a coordinate
+        # convention; select the physical short end closest to User origin.
+        target = TcpPose(
+            current.x + short_end_sign * offset_m * unit_y_x,
+            current.y + short_end_sign * offset_m * unit_y_y,
+            current.z, current.rx, current.ry, current.rz,
+        )
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        joints = self.controller.inverse_kinematics(
+            target,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=self.controller.current_joint(),
+        )
+        next_rx_deg = float(
+            self.get_parameter("bottom_center_first_tool_rx_delta_deg").value
+        )
+        self.controller.inverse_kinematics(
+            self._tool_rx_target_pose(target, next_rx_deg),
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=joints,
+        )
+        current_position = self.gripper.read_position()
+        with self._timed_stage("bottom_center_long_box_full_open"):
+            self.gripper.set_position(1.0, wait=False)
+            self.gripper.wait_until_stopped(
+                timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                target_position=1.0,
+                initial_position=current_position,
+                cancel_check=self._cycle_cancel_requested,
+            )
+        self._publish_status(
+            f"bottom long box {length_m*1000:.1f}mm: open jaws and shift "
+            f"{offset_m*1000:.1f}mm toward the short end nearest User origin "
+            f"({'+' if short_end_sign > 0.0 else '-'}Tool-Y direction); "
+            f"Tool-Rx remains {next_rx_deg:+.0f}deg"
+        )
+        self._require_cycle_active("before bottom long-box short-end shift")
+        with self._timed_stage("bottom_center_long_box_short_end_shift"):
+            self.controller.move_linear_tcp(
+                target,
+                speed=motion["linear_speed"],
+                accel=motion["linear_acc"],
+                user_index=user_index,
+                tool_index=tool_index,
+            )
+        self._require_cycle_active("after bottom long-box short-end shift")
+        actual = self._current_command_pose()
+        tolerance_m = max(
+            0.0005, float(self.get_parameter("jog_tolerance_m").value)
+        ) * 1.5
+        if max(
+            abs(actual.x - target.x),
+            abs(actual.y - target.y),
+            abs(actual.z - target.z),
+        ) > tolerance_m:
+            raise RuntimeError("bottom long-box short-end shift target was not reached")
+        return offset_m
+
     def _execute_turntable_bottom_center_recovery(
         self,
         grasp_pose: TcpPose,
@@ -6352,6 +6861,8 @@ class CosmeticBoxSingleArmNode(Node):
         width_m: float,
         max_opening: float,
         motion: dict[str, int],
+        *,
+        length_m: float,
     ) -> None:
         """Reorient a presumed bottom label through two table regrasp stages."""
 
@@ -6393,6 +6904,8 @@ class CosmeticBoxSingleArmNode(Node):
             )
         if not (0.0 < pre_shape_position <= 1.0 and max_opening > 0.0):
             raise RuntimeError("invalid gripper pre-shape for bottom recovery")
+        if not math.isfinite(length_m) or length_m <= 0.0:
+            raise RuntimeError("bottom recovery requires a valid measured long edge")
 
         def open_to_preshape() -> None:
             current_position = self.gripper.read_position()
@@ -6440,6 +6953,10 @@ class CosmeticBoxSingleArmNode(Node):
             )
         with self._timed_stage("bottom_center_first_release"):
             open_to_preshape()
+
+        long_box_offset_m = self._offset_bottom_long_box_before_first_tool_rx(
+            float(length_m), motion
+        )
 
         # Keep Rz unchanged and rotate only around the current Tool X axis.
         with self._timed_stage("bottom_center_tool_rx_plus_70"):
@@ -6521,14 +7038,56 @@ class CosmeticBoxSingleArmNode(Node):
                 "bottom recovery second Tool-Rx rotation after J6 half-turn",
             )
         with self._timed_stage("bottom_center_latest_target_xy"):
-            latest_target = self._wait_for_bottom_center_tracked_pose()
+            latest_target = (
+                self._wait_for_bottom_center_tracked_pose(
+                    reference_xy=(grasp_pose.x, grasp_pose.y)
+                )
+                if long_box_offset_m > 0.0
+                else self._wait_for_bottom_center_tracked_pose()
+            )
+        current = self._current_command_pose()
+        if current.z <= grasp_pose.z + 0.005:
+            raise RuntimeError(
+                "bottom recovery final XY alignment requires the released TCP "
+                "to remain at least 5mm above the original grasp depth"
+            )
+        aligned = TcpPose(
+            latest_target.x, latest_target.y, current.z,
+            current.rx, current.ry, current.rz,
+        )
+        final_regrasp = TcpPose(
+            latest_target.x, latest_target.y, grasp_pose.z,
+            current.rx, current.ry, current.rz,
+        )
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+        joints = self.controller.current_joint()
+        for waypoint in (aligned, final_regrasp):
+            self.controller.inverse_kinematics(
+                waypoint,
+                user_index=user_index,
+                tool_index=tool_index,
+                joint_near=joints,
+            )
+        self._publish_status(
+            "bottom recovery final regrasp: align to fresh D405 XY at "
+            f"current Z={current.z*1000:.1f}mm without an extra lift, "
+            "then descend vertically at the current Tool attitude"
+        )
+        with self._timed_stage("bottom_center_second_align_xy"):
+            self._bottom_center_linear_z(
+                current.z,
+                motion,
+                "bottom recovery tracked-XY move at current Z",
+                lifting=False,
+                target_xy=(latest_target.x, latest_target.y),
+            )
         with self._timed_stage("bottom_center_second_return_grasp_z"):
             self._bottom_center_linear_z(
                 grasp_pose.z,
                 motion,
-                "bottom recovery tracked-XY return to initial grasp Z",
+                "bottom recovery vertical return to initial grasp Z at tracked XY",
                 lifting=False,
-                target_xy=(latest_target.x, latest_target.y),
             )
         with self._timed_stage("bottom_center_final_close"):
             self.gripper.close(wait=True, cancel_check=self._cycle_cancel_requested)
@@ -9134,6 +9693,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.cycle_enabled = False
         self.turntable_scan_cancel.set()
         with self.turntable_condition:
+            self.turntable_rescan_pending = False
             self.turntable_condition.notify_all()
         self.secondary_auto_resume_requested.clear()
         self.secondary_safety_shutdown.set()
