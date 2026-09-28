@@ -797,8 +797,8 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("face_up_settle_s", 0.0)
 
         self.declare_parameter("dh_max_opening_m", 0.095)
-        self.declare_parameter("dh_force", 30)
-        self.declare_parameter("dh_grasp_force", 30)
+        self.declare_parameter("dh_force", 40)
+        self.declare_parameter("dh_grasp_force", 40)
         self.declare_parameter("dh_slave_id", 1)
         self.declare_parameter("dh_tool_identify", 1)
         self.declare_parameter("dh_timeout_s", 10.0)

@@ -30,7 +30,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_confidence",
-                default_value="0.45",
+                default_value="0.40",
                 description="Presence-only YOLO confidence threshold for D435 barcode detection",
             ),
             DeclareLaunchArgument(
@@ -40,7 +40,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_model_path",
-                default_value="src/Fast-FoundationStereoPose-dul_cam/models/best_barcode_0928.pt",
+                default_value="src/Fast-FoundationStereoPose-dul_cam/models/merge_0928.pt",
                 description="D435 barcode detector weights; best_barcode_0924.pt by default",
             ),
             DeclareLaunchArgument(
@@ -110,7 +110,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_moving_stripes",
-                default_value="true",
+                default_value="false",
                 description="Full-frame moving 1-D stripe fallback when the barcode model misses",
             ),
             DeclareLaunchArgument(
@@ -436,7 +436,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "top_surface_barcode_stable_hits",
-                default_value="1",
+                default_value="2",
                 description="Number of D405 top-surface YOLO barcode detections required",
             ),
             DeclareLaunchArgument(

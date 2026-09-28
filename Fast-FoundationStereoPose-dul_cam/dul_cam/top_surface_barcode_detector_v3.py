@@ -39,7 +39,7 @@ class TopSurfaceBarcodeDetector:
         *,
         minimum_interior_pixels: int = 4,
         model_path: str = "/home/zdh/yolo_one/yolo_train_xense_load_image/outputs/train/obb_demo111/weights/best.pt",
-        model_confidence: float = 0.20,
+        model_confidence: float = 0.50,
     ) -> None:
         self.minimum_interior_pixels = max(1, int(minimum_interior_pixels))
         self.model_path = str(model_path)

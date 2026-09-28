@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover - reported clearly by load_model
     YOLO = None
 
 
-DEFAULT_BARCODE_MODEL = "src/Fast-FoundationStereoPose-dul_cam/models/best_barcode_0928.pt"
+DEFAULT_BARCODE_MODEL = "src/Fast-FoundationStereoPose-dul_cam/models/merge_0928.pt"
 
 
 @dataclass(frozen=True)

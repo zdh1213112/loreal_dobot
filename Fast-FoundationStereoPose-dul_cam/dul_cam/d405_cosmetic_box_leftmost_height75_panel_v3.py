@@ -253,7 +253,7 @@ ros_node.declare_parameter(
 HANDOFF_OVERHEAD_CLEARANCE_ENABLED = bool(
     ros_node.get_parameter("handoff_overhead_clearance_enabled").value
 )
-ros_node.declare_parameter("top_surface_barcode_stable_hits", 1)
+ros_node.declare_parameter("top_surface_barcode_stable_hits", 2)
 TOP_SURFACE_BARCODE_STABLE_HITS = max(
     1, int(ros_node.get_parameter("top_surface_barcode_stable_hits").value)
 )
