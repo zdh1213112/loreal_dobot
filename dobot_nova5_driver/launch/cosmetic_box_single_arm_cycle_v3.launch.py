@@ -30,7 +30,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_confidence",
-                default_value="0.60",
+                default_value="0.45",
                 description="Presence-only YOLO confidence threshold for D435 barcode detection",
             ),
             DeclareLaunchArgument(
@@ -40,8 +40,8 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_model_path",
-                default_value="/home/zdh/tool/data/D405_barcode_labels/model/best.pt",
-                description="D435 barcode detector weights; D405 barcode-label PT weights by default",
+                default_value="src/Fast-FoundationStereoPose-dul_cam/models/best_barcode_0928.pt",
+                description="D435 barcode detector weights; best_barcode_0924.pt by default",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_inference_provider",
@@ -80,28 +80,28 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detail_roi_x",
-                default_value="280",
-                description="Fixed D435 turntable detail-view left coordinate",
+                default_value="0",
+                description="Fixed D435 detail crop left coordinate; unused when crop is disabled",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detail_roi_y",
-                default_value="220",
-                description="Fixed D435 turntable detail-view top coordinate",
+                default_value="0",
+                description="Fixed D435 detail crop top coordinate; unused when crop is disabled",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detail_roi_width",
-                default_value="760",
-                description="Fixed D435 turntable detail-view width",
+                default_value="0",
+                description="Fixed D435 detail crop width; 0 disables the crop",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detail_roi_height",
-                default_value="440",
-                description="Fixed D435 turntable detail-view height",
+                default_value="0",
+                description="Fixed D435 detail crop height; 0 disables the crop",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_full_frame_interval",
-                default_value="6",
-                description="Run one full-frame D435 YOLO pass every N detection frames",
+                default_value="1",
+                description="Run a full-frame D435 YOLO pass every N detection frames; 1 means every frame",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_min_candidate_area_ratio",

@@ -230,11 +230,15 @@ D405仍然根据顶面、物料高度和75%下探比例发布绝对抓取点。�
 ## D435扫码节点
 
 `d435_turntable_barcode_node_v3.py`绑定相机序列号 `254322071102`，默认加载
-`/home/zdh/tool/data/D405_barcode_labels/model/best.pt`。该权重是普通目标检测模型，
+`/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_barcode_0924.pt`。该权重是普通目标检测模型，
 只有class 0，名称为`barcode`。V3只判断“有没有条码”，检测成功后固定发布
 `barcode_detected`，不再调用pyzbar放大、旋转和尝试解码。可通过
 `turntable_d435_model_path`指定其他`.pt`或`.onnx`权重；模型推理尺寸为
 `turntable_d435_image_size:=640`。相机提前取流并预热；4秒计时不包含模型加载和相机启动。
+
+当前默认停用固定细节裁剪：`turntable_d435_detail_roi_width/height`为`0`，并将
+`turntable_d435_full_frame_interval`设为`1`，因此YOLO每帧执行全图检测。恢复固定裁剪时，
+需设置其左上角坐标、宽高，并可将全图检测周期调回较大的数值以减少推理量。
 
 `.pt`默认由Ultralytics/PyTorch运行；`turntable_d435_inference_provider`只在指定
 `.onnx`权重时生效。ONNX模式默认使用`turntable_d435_inference_provider:=cuda`。节点会

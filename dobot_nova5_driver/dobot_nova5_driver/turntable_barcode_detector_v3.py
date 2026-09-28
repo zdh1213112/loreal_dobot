@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover - reported clearly by load_model
     YOLO = None
 
 
-DEFAULT_BARCODE_MODEL = "/home/zdh/tool/data/D405_barcode_labels/model/best.pt"
+DEFAULT_BARCODE_MODEL = "src/Fast-FoundationStereoPose-dul_cam/models/best_barcode_0928.pt"
 
 
 @dataclass(frozen=True)
@@ -169,7 +169,7 @@ class TurntableBarcodeDetector:
     def __init__(
         self,
         model_path: str = DEFAULT_BARCODE_MODEL,
-        confidence: float = 0.45,
+        confidence: float = 0.75,
         image_size: int = 640,
         scanner_assist: bool = True,
         inference_provider: str = "cuda",
