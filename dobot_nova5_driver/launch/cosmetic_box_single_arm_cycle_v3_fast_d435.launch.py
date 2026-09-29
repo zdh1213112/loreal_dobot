@@ -206,26 +206,26 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_pulse_ms",
-                default_value="300",
-                description="High hold duration of each 0->1->0 toggle pulse",
+                default_value="100",
+                description="Fast profile high hold duration of each 0->1->0 toggle pulse",
             ),
             DeclareLaunchArgument(
                 "turntable_scan_timeout_s",
                 default_value="3.6",
                 description=(
-                    "D435 side-barcode search window: measured 3.2s revolution "
-                    "plus 0.4s coverage margin"
+                    "Fast D435 rotating search window; the 100ms start pulse is also "
+                    "scanned, preserving slightly more than one measured 3.2s revolution"
                 ),
             ),
             DeclareLaunchArgument(
                 "turntable_stationary_barcode_check_s",
-                default_value="0.8",
-                description="Check the already-visible stopped face before starting turntable rotation",
+                default_value="0.15",
+                description="Fast check of the already-visible stopped face before rotation",
             ),
             DeclareLaunchArgument(
                 "turntable_settle_s",
-                default_value="0.50",
-                description="Wait after stop pulse before requesting a fresh D405 target",
+                default_value="0.10",
+                description="Fast wait after stop pulse before requesting a fresh D405 target",
             ),
             DeclareLaunchArgument(
                 "turntable_assume_stopped_on_start",
@@ -254,7 +254,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_secondary_safe_z_stable_s",
-                default_value="0.200",
+                default_value="0.080",
                 description="Continuous time with 102 Y below the placement boundary before accepting one event; legacy name retained for compatibility",
             ),
             DeclareLaunchArgument(
