@@ -18,6 +18,7 @@ setup(
                 "launch/cosmetic_box_single_arm_cycle.launch.py",
                 "launch/cosmetic_box_single_arm_cycle_v2.launch.py",
                 "launch/cosmetic_box_single_arm_cycle_v3.launch.py",
+                "launch/cosmetic_box_single_arm_cycle_v3_fast_d435.launch.py",
             ],
         ),
         (
@@ -25,6 +26,7 @@ setup(
             [
                 "README_cosmetic_box_single_arm.md",
                 "README_cosmetic_box_turntable_v3.md",
+                "README_cosmetic_box_turntable_v3_fast_d435.md",
             ],
         ),
         (
@@ -62,6 +64,7 @@ setup(
             "nova5_cosmetic_box_cycle_v2 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v2:main",
             "barcode_scanner_node_v3 = dobot_nova5_driver.barcode_scanner_ros_node_v3:main",
             "d435_turntable_barcode_v3 = dobot_nova5_driver.d435_turntable_barcode_node_v3:main",
+            "d435_turntable_barcode_fast = dobot_nova5_driver.d435_turntable_barcode_node_fast:main",
             "nova5_cosmetic_box_cycle_v3 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3:main",
         ],
     },

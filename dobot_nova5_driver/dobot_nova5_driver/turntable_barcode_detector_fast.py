@@ -1,4 +1,9 @@
-"""Presence-only D435 side-barcode detector for the turntable workflow."""
+"""CUDA/detail-ROI D435 side-barcode detector for the fast V3 fork.
+
+This module is intentionally separate from ``turntable_barcode_detector_v3``.
+The production V3 node keeps its original model and inference path; this copy
+is used only by the opt-in fast-D435 launch file.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ except Exception:  # pragma: no cover - reported clearly by load_model
     YOLO = None
 
 
-DEFAULT_BARCODE_MODEL = "src/Fast-FoundationStereoPose-dul_cam/models/best_0929.pt"
+DEFAULT_BARCODE_MODEL = "/home/zdh/ffs_ws/models/merge_0928_fast.onnx"
 
 
 @dataclass(frozen=True)
@@ -173,6 +178,7 @@ class TurntableBarcodeDetector:
         image_size: int = 640,
         scanner_assist: bool = True,
         inference_provider: str = "cuda",
+        require_cuda: bool = True,
         wide_roi_fallback: bool = True,
         wide_roi_aspect_ratio: float = 2.0,
         wide_roi_tile_fraction: float = 0.70,
@@ -224,6 +230,11 @@ class TurntableBarcodeDetector:
                 "inference_provider must be one of: cuda, cpu, auto"
             )
         self.requested_provider = requested_provider
+        self.require_cuda = bool(require_cuda)
+        if self.require_cuda and self.requested_provider != "cuda":
+            raise ValueError(
+                "fast D435 detector requires inference_provider='cuda'"
+            )
         self.active_provider = "not_loaded"
         self.provider_fallback_reason = ""
         self.model = None
@@ -274,8 +285,9 @@ class TurntableBarcodeDetector:
                         "do_copy_in_default_stream": 1,
                     },
                 ),
-                "CPUExecutionProvider",
             ]
+            if not self.require_cuda:
+                providers.append("CPUExecutionProvider")
         elif "CPUExecutionProvider" in set(ort.get_available_providers()):
             providers = ["CPUExecutionProvider"]
         self.onnx_session = ort.InferenceSession(
@@ -289,6 +301,10 @@ class TurntableBarcodeDetector:
         )
 
     def _fallback_to_cpu(self, reason: str) -> None:
+        if self.require_cuda:
+            raise RuntimeError(
+                "fast D435 CUDA inference is required; " + str(reason)
+            )
         self.provider_fallback_reason = str(reason)
         self.onnx_session = None
         self._create_onnx_session(use_cuda=False)
@@ -308,6 +324,11 @@ class TurntableBarcodeDetector:
             self.onnx_session.run(None, {self.onnx_input_name: tensor})
 
     def load_model(self) -> None:
+        if self.require_cuda and Path(self.model_path).suffix.lower() != ".onnx":
+            raise RuntimeError(
+                "fast D435 CUDA mode requires an ONNX model; "
+                f"received {self.model_path!r}"
+            )
         if Path(self.model_path).suffix.lower() == ".onnx":
             if ort is None:
                 raise RuntimeError(
@@ -322,6 +343,11 @@ class TurntableBarcodeDetector:
             wants_cuda = self.requested_provider in {"cuda", "auto"}
             use_cuda = wants_cuda and "CUDAExecutionProvider" in available
             if wants_cuda and not use_cuda:
+                if self.require_cuda:
+                    raise RuntimeError(
+                        "fast D435 requires CUDAExecutionProvider, but ONNX "
+                        f"Runtime reports available providers={sorted(available)}"
+                    )
                 self.provider_fallback_reason = (
                     "CUDAExecutionProvider is not available; using CPU"
                 )
@@ -332,9 +358,14 @@ class TurntableBarcodeDetector:
                     if self.active_provider != "CUDAExecutionProvider":
                         self._fallback_to_cpu(
                             "CUDA provider initialization selected "
-                            f"{self.active_provider}; using CPU"
+                            f"{self.active_provider}"
                         )
                 except Exception as exc:
+                    if self.require_cuda:
+                        raise RuntimeError(
+                            "fast D435 CUDA provider initialization failed: "
+                            f"{exc}"
+                        ) from exc
                     self._fallback_to_cpu(
                         f"CUDA provider initialization failed: {exc}"
                     )

@@ -1,4 +1,10 @@
-"""V3 turntable-integration baseline forked from the complete V2 launch."""
+"""V3 launch fork with an independent detail-ROI/CUDA D435 scanner.
+
+The regular ``cosmetic_box_single_arm_cycle_v3.launch.py`` is deliberately
+unchanged.  This launch keeps the same V3 arm and D405 processes, but starts
+``d435_turntable_barcode_node_fast`` with the copied detector and its separate
+fast-path parameters.
+"""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
@@ -29,6 +35,21 @@ def generate_launch_description() -> LaunchDescription:
                 description="D435 serial used only for turntable side-barcode detection",
             ),
             DeclareLaunchArgument(
+                "turntable_d435_color_width",
+                default_value="1280",
+                description="Fast-D435 RGB stream width",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_color_height",
+                default_value="720",
+                description="Fast-D435 RGB stream height",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_fps",
+                default_value="30",
+                description="Fast-D435 RGB stream frame rate",
+            ),
+            DeclareLaunchArgument(
                 "turntable_d435_confidence",
                 default_value="0.40",
                 description="Presence-only YOLO confidence threshold for D435 barcode detection",
@@ -40,13 +61,18 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_model_path",
-                default_value="src/Fast-FoundationStereoPose-dul_cam/models/best_0929.pt",
-                description="D435 barcode detector weights; best_barcode_0924.pt by default",
+                default_value="/home/zdh/ffs_ws/models/merge_0928_fast.onnx",
+                description="Fast D435 ONNX barcode detector exported from merge_0928.pt",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_inference_provider",
                 default_value="cuda",
                 description="ONNX provider when using ONNX weights; PT uses Ultralytics/PyTorch",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_require_cuda",
+                default_value="true",
+                description="Require CUDAExecutionProvider and forbid CPU fallback",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_image_size",
@@ -80,28 +106,28 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detail_roi_x",
-                default_value="0",
+                default_value="155",
                 description="Fixed D435 detail crop left coordinate; unused when crop is disabled",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detail_roi_y",
-                default_value="0",
+                default_value="65",
                 description="Fixed D435 detail crop top coordinate; unused when crop is disabled",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detail_roi_width",
-                default_value="0",
+                default_value="1120",
                 description="Fixed D435 detail crop width; 0 disables the crop",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_detail_roi_height",
-                default_value="0",
+                default_value="565",
                 description="Fixed D435 detail crop height; 0 disables the crop",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_full_frame_interval",
-                default_value="1",
-                description="Run a full-frame D435 YOLO pass every N detection frames; 1 means every frame",
+                default_value="6",
+                description="Run a full-frame D435 YOLO pass every N detection frames",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_min_candidate_area_ratio",
@@ -115,8 +141,8 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_preview_interval_s",
-                default_value="0.033",
-                description="D435 integrated-preview publish interval; 0.033 is about 30 FPS",
+                default_value="0.100",
+                description="Fast-D435 preview interval; detection still uses every acquired frame",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_preview_jpeg_quality",
@@ -696,7 +722,7 @@ def generate_launch_description() -> LaunchDescription:
                 cmd=[
                     LaunchConfiguration("vision_python"),
                     "-m",
-                    "dobot_nova5_driver.d435_turntable_barcode_node_v3",
+                    "dobot_nova5_driver.d435_turntable_barcode_node_fast",
                     "--ros-args",
                     "-p",
                     [
@@ -706,6 +732,21 @@ def generate_launch_description() -> LaunchDescription:
                         "serial_number:='",
                         LaunchConfiguration("turntable_d435_serial"),
                         "'",
+                    ],
+                    "-p",
+                    [
+                        "color_width:=",
+                        LaunchConfiguration("turntable_d435_color_width"),
+                    ],
+                    "-p",
+                    [
+                        "color_height:=",
+                        LaunchConfiguration("turntable_d435_color_height"),
+                    ],
+                    "-p",
+                    [
+                        "fps:=",
+                        LaunchConfiguration("turntable_d435_fps"),
                     ],
                     "-p",
                     [
@@ -721,6 +762,11 @@ def generate_launch_description() -> LaunchDescription:
                     [
                         "inference_provider:=",
                         LaunchConfiguration("turntable_d435_inference_provider"),
+                    ],
+                    "-p",
+                    [
+                        "require_cuda:=",
+                        LaunchConfiguration("turntable_d435_require_cuda"),
                     ],
                     "-p",
                     [
