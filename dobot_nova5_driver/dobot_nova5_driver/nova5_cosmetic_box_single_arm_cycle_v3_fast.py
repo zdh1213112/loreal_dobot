@@ -353,9 +353,9 @@ class CosmeticBoxSingleArmNode(Node):
         # to the common 101 User frame as y_102_common = y_102 - 0.725.
         self.declare_parameter("secondary_base_y_offset_m", -0.725)
         self.declare_parameter("secondary_tcp_max_age_s", 0.05)
-        # Two-stage, left-arm-only interlock.  Below 165 mm an active 101
-        # motion is cancelled and held.  Only if the live gap then falls below
-        # 145 mm does 101 execute a monitored User-Y escape away from 102.
+        # Two-stage, left-arm-only interlock. Below the configured 160 mm
+        # gap an active 101 motion is cancelled. Below 142 mm, 101 also makes
+        # a monitored User-Y retreat. Both paths recover at 180 mm.
         # 102 remains feedback-only and never receives a command from here.
         self.declare_parameter("secondary_y_clearance_m", 0.160)
         self.declare_parameter("secondary_emergency_retreat_m", 0.142)
@@ -888,10 +888,10 @@ class CosmeticBoxSingleArmNode(Node):
         self.secondary_protective_stop_latched = threading.Event()
         self.secondary_retreat_active = threading.Event()
         self.secondary_retreat_attempted = threading.Event()
-        # A hard Y-clearance retreat may interrupt a continuous production
-        # cycle.  Remember that intent separately from ``cycle_enabled`` so
-        # the old trajectory can stay cancelled while a fresh cycle is
-        # started after the retreat reaches its recovery distance.
+        self.secondary_recovery_clear_samples = 0
+        # Either Y-clearance Stop or emergency retreat may interrupt a
+        # continuous cycle. Remember that intent separately from cycle_enabled
+        # so a fresh cycle can start after the old trajectory is cancelled.
         self.secondary_auto_resume_requested = threading.Event()
         self.secondary_safety_shutdown = threading.Event()
         self.secondary_safety_reason = ""
@@ -2087,6 +2087,7 @@ class CosmeticBoxSingleArmNode(Node):
             if first_trigger:
                 self.secondary_protective_stop_latched.set()
                 self.secondary_safety_reason = str(detail)
+                self.secondary_recovery_clear_samples = 0
 
         if first_trigger:
             self.get_logger().warning(str(detail))
@@ -2100,7 +2101,7 @@ class CosmeticBoxSingleArmNode(Node):
                 f"101 protective Stop failed after secondary TCP trigger: {exc}"
             )
 
-    def _schedule_continuous_restart_after_secondary_retreat(self) -> None:
+    def _schedule_continuous_restart_after_secondary_clearance(self) -> None:
         """Start a fresh continuous worker after the cancelled worker exits."""
 
         with self.secondary_safety_lock:
@@ -2112,22 +2113,21 @@ class CosmeticBoxSingleArmNode(Node):
             ):
                 return
             resume_thread = threading.Thread(
-                target=self._resume_continuous_after_secondary_retreat,
+                target=self._resume_continuous_after_secondary_clearance,
                 name="secondary-y-continuous-restart",
                 daemon=True,
             )
             self.secondary_resume_thread = resume_thread
         resume_thread.start()
 
-    def _resume_continuous_after_secondary_retreat(self) -> None:
+    def _resume_continuous_after_secondary_clearance(self) -> None:
         """Restart at startup; never continue the interrupted trajectory."""
 
         current_thread = threading.current_thread()
         try:
-            # The emergency retreat could acquire ``action_lock`` as soon as
-            # the cancelled cycle left its robot sequence, while that old
-            # Python thread still had a few log statements to finish.  Do not
-            # let _ensure_worker mistake it for the replacement worker.
+            # The cancelled worker may have released the robot sequence lock
+            # while still writing its final logs. Wait until it has exited so
+            # _ensure_worker starts a replacement rather than keeping the old one.
             while self.running and not self.secondary_safety_shutdown.is_set():
                 if not self.secondary_auto_resume_requested.is_set():
                     return
@@ -2150,7 +2150,7 @@ class CosmeticBoxSingleArmNode(Node):
                 if self.controller.robot_mode != 5:
                     self.secondary_auto_resume_requested.clear()
                     self._publish_status(
-                        "101 retreat completed, but automatic restart was cancelled: "
+                        "101/102 Y clearance recovered, but automatic restart was cancelled: "
                         f"controller is {self.controller.robot_mode_text()}"
                     )
                     return
@@ -2160,7 +2160,7 @@ class CosmeticBoxSingleArmNode(Node):
                 self.cycle_enabled = True
 
             self._publish_status(
-                "101 retreat recovery complete; starting a fresh continuous "
+                "101/102 Y clearance recovered; starting a fresh continuous "
                 "cycle from the startup joint"
             )
             self._ensure_worker()
@@ -2349,7 +2349,7 @@ class CosmeticBoxSingleArmNode(Node):
                     f"TCP Y gap={last_gap_m * 1000.0:.1f}mm; "
                     "returning to startup before automatic continuous restart"
                 )
-                self._schedule_continuous_restart_after_secondary_retreat()
+                self._schedule_continuous_restart_after_secondary_clearance()
             else:
                 self._publish_status(
                     "101 emergency Y retreat completed: "
@@ -2365,6 +2365,42 @@ class CosmeticBoxSingleArmNode(Node):
             )
             self.get_logger().fatal(self.secondary_safety_reason)
             self._publish_status(self.secondary_safety_reason)
+
+    def _recover_secondary_protective_stop_if_clear(
+        self, gap_m: float, robot_mode: int
+    ) -> bool:
+        """Resume a stopped continuous cycle after stable separation returns."""
+
+        _, _, recover_m = self._secondary_interlock_distances()
+        if not self.secondary_protective_stop_latched.is_set():
+            self.secondary_recovery_clear_samples = 0
+            return False
+        if (
+            gap_m < recover_m
+            or int(robot_mode) != 5
+            or self.secondary_retreat_active.is_set()
+        ):
+            self.secondary_recovery_clear_samples = 0
+            return False
+        self.secondary_recovery_clear_samples += 1
+        if self.secondary_recovery_clear_samples < 2:
+            return False
+        with self.secondary_safety_lock:
+            if not self.secondary_protective_stop_latched.is_set():
+                self.secondary_recovery_clear_samples = 0
+                return False
+            self.secondary_protective_stop_latched.clear()
+            self.secondary_retreat_attempted.clear()
+            auto_restart = self.secondary_auto_resume_requested.is_set()
+            self.secondary_recovery_clear_samples = 0
+        self._publish_status(
+            "101/102 Y clearance recovered: "
+            f"gap={gap_m * 1000.0:.1f}mm >= {recover_m * 1000.0:.1f}mm; "
+            + ("restarting continuous cycle" if auto_restart else "cycle remains stopped")
+        )
+        if auto_restart:
+            self._schedule_continuous_restart_after_secondary_clearance()
+        return True
 
     def _secondary_motion_safety_loop(self) -> None:
         """Continuously enforce the two-stage common-Y policy for 101 only."""
@@ -2413,6 +2449,7 @@ class CosmeticBoxSingleArmNode(Node):
                         allow_reconnect=robot_mode not in (7, 8, 10)
                     )
                 except Exception as exc:
+                    self.secondary_recovery_clear_samples = 0
                     if robot_mode in (7, 8, 10):
                         self._latch_secondary_protective_stop(
                             "102 TCP safety feedback failed while 101 was moving; "
@@ -2436,6 +2473,7 @@ class CosmeticBoxSingleArmNode(Node):
                     retreat_m,
                 )
                 if action == "stop":
+                    self.secondary_recovery_clear_samples = 0
                     self._latch_secondary_protective_stop(
                         "101 protective stop: common-Y TCP gap "
                         f"{gap_m * 1000.0:.1f}mm "
@@ -2444,6 +2482,7 @@ class CosmeticBoxSingleArmNode(Node):
                         robot_mode,
                     )
                 elif action == "retreat":
+                    self.secondary_recovery_clear_samples = 0
                     self._latch_secondary_protective_stop(
                         "101 emergency retreat trigger: common-Y TCP gap "
                         f"{gap_m * 1000.0:.1f}mm "
@@ -2454,19 +2493,10 @@ class CosmeticBoxSingleArmNode(Node):
                     if not self.secondary_retreat_attempted.is_set():
                         self.secondary_retreat_attempted.set()
                         self._run_secondary_emergency_retreat()
-                elif (
-                    self.secondary_protective_stop_latched.is_set()
-                    and gap_m >= protective_m
-                    and self.controller.robot_mode == 5
-                ):
-                    # The interrupted cycle remains disabled.  Clearing only
-                    # the monitor latch prevents a later idle 102 motion from
-                    # unexpectedly moving 101 after the incident is over.
-                    self.secondary_protective_stop_latched.clear()
-                    self.secondary_retreat_attempted.clear()
-                    # A warning-band Stop that never required a physical 101
-                    # retreat is intentionally not auto-resumed.
-                    self.secondary_auto_resume_requested.clear()
+                else:
+                    self._recover_secondary_protective_stop_if_clear(
+                        gap_m, self.controller.robot_mode
+                    )
 
                 self.secondary_safety_shutdown.wait(poll_s)
             except Exception as exc:
@@ -2908,9 +2938,15 @@ class CosmeticBoxSingleArmNode(Node):
                 "is ready for 101 to grasp and check its top surface"
             )
         else:
+            if self.secondary_auto_resume_requested.is_set():
+                next_action = "101 will resume automatically after Y clearance recovers"
+            elif self.cycle_enabled:
+                next_action = "101 continuous cycle will pick this material"
+            else:
+                next_action = "click Execute once"
             self._publish_status(
                 f"material event #{event_number} barcode confirmed as {barcode!r}; "
-                "turntable is stopped and the material is ready—click Execute once"
+                f"turntable is stopped and the material is ready—{next_action}"
             )
 
     def _wait_for_scanned_turntable_material(self) -> tuple[int, str]:
@@ -3525,11 +3561,12 @@ class CosmeticBoxSingleArmNode(Node):
                 self.secondary_auto_resume_requested.clear()
                 self.cycle_enabled = True
         if protection_latched:
-            protective_m, _, _ = self._secondary_interlock_distances()
+            _, _, recover_m = self._secondary_interlock_distances()
             self._publish_status(
                 "cycle enable refused: 101/102 Y-clearance protection is still "
                 f"latched; wait for an idle gap of at least "
-                f"{protective_m * 1000.0:.1f}mm, then enable again"
+                f"{recover_m * 1000.0:.1f}mm; an interrupted continuous cycle "
+                "will resume automatically"
             )
             return
         self._publish_status("cycle enabled")
@@ -3689,10 +3726,22 @@ class CosmeticBoxSingleArmNode(Node):
             self._publish_status("cycle stopped")
         except Exception as exc:
             self._set_top_surface_barcode_window(False)
-            self._finish_cycle_timing("fault")
-            self.cycle_enabled = False
-            self._publish_status(f"FAULT: {exc}")
-            self.get_logger().fatal(f"Automatic cycle stopped safely: {exc}")
+            with self.secondary_safety_lock:
+                resume_pending = self.secondary_auto_resume_requested.is_set()
+                self.cycle_enabled = False
+            if resume_pending:
+                self._finish_cycle_timing("safety_pause")
+                self._publish_status(
+                    "101 motion paused by 102 Y-clearance protection; "
+                    f"waiting for automatic continuous restart: {exc}"
+                )
+                self.get_logger().warning(
+                    f"Continuous cycle paused by safety interlock: {exc}"
+                )
+            else:
+                self._finish_cycle_timing("fault")
+                self._publish_status(f"FAULT: {exc}")
+                self.get_logger().fatal(f"Automatic cycle stopped safely: {exc}")
 
     def _move_startup_and_open(
         self,
@@ -3755,11 +3804,11 @@ class CosmeticBoxSingleArmNode(Node):
             self.secondary_auto_resume_requested.clear()
             self.cycle_enabled = False
         if self.secondary_protective_stop_latched.is_set():
-            protective_m, _, _ = self._secondary_interlock_distances()
+            _, _, recover_m = self._secondary_interlock_distances()
             raise RuntimeError(
                 "startup motion refused while 101/102 Y-clearance protection "
                 f"is latched; wait for an idle gap of at least "
-                f"{protective_m * 1000.0:.1f}mm"
+                f"{recover_m * 1000.0:.1f}mm"
             )
         if bool(self.get_parameter("secondary_collision_check_enabled").value):
             try:
@@ -3942,10 +3991,10 @@ class CosmeticBoxSingleArmNode(Node):
             raise RuntimeError("cycle worker is already running")
         with self.secondary_safety_lock:
             if self.secondary_protective_stop_latched.is_set():
-                protective_m, _, _ = self._secondary_interlock_distances()
+                _, _, recover_m = self._secondary_interlock_distances()
                 raise RuntimeError(
                     "101/102 Y-clearance protection is latched; wait for an idle "
-                    f"gap of at least {protective_m * 1000.0:.1f}mm before restarting"
+                    f"gap of at least {recover_m * 1000.0:.1f}mm before restarting"
                 )
             self.secondary_auto_resume_requested.clear()
             self.cycle_enabled = True
@@ -3977,10 +4026,10 @@ class CosmeticBoxSingleArmNode(Node):
             raise RuntimeError("continuous cycle is running")
         with self.secondary_safety_lock:
             if self.secondary_protective_stop_latched.is_set():
-                protective_m, _, _ = self._secondary_interlock_distances()
+                _, _, recover_m = self._secondary_interlock_distances()
                 raise RuntimeError(
                     "101/102 Y-clearance protection is latched; wait for an idle "
-                    f"gap of at least {protective_m * 1000.0:.1f}mm before restarting"
+                    f"gap of at least {recover_m * 1000.0:.1f}mm before restarting"
                 )
             self.secondary_auto_resume_requested.clear()
             self.cycle_enabled = True
@@ -5877,6 +5926,16 @@ class CosmeticBoxSingleArmNode(Node):
         with self._timed_stage("grasp_confirm"):
             self._confirm_grasp_before_lift(max_opening, width_m)
 
+        if barcode_face == "top":
+            self._publish_status(
+                f"top-surface barcode {top_surface_barcode!r} detected; "
+                "clearing the turntable vertically before transferring to the fixed placement pose"
+            )
+            self._place_as_top_barcode_box(
+                turntable_box_height_m=height_m if turntable_enabled else None
+            )
+            return
+
         transfer_precompleted = False
         blend_lift_transfer = (
             not turntable_enabled
@@ -5966,14 +6025,6 @@ class CosmeticBoxSingleArmNode(Node):
         # next material event.
         if not fast_turntable_removed_precompleted:
             self._mark_turntable_material_removed()
-
-        if barcode_face == "top":
-            self._publish_status(
-                f"top-surface barcode {top_surface_barcode!r} detected; "
-                "skipping scanner approach, J6 rotation, Ry/Rz flip and dynamic Z descent"
-            )
-            self._place_as_top_barcode_box()
-            return
 
         if barcode_face == "side":
             self._publish_status(
@@ -6295,15 +6346,81 @@ class CosmeticBoxSingleArmNode(Node):
         )
         return actual_delta
 
-    def _place_as_top_barcode_box(self) -> None:
+    def _place_as_top_barcode_box(
+        self, *, turntable_box_height_m: Optional[float] = None
+    ) -> None:
         """Use the same fixed XYZ and release checks for either top-facing path."""
 
-        with self._timed_stage("top_barcode_fixed_place_ptp"):
-            self._move_to_user_xyz_with_rotation(
-                self._top_surface_barcode_place_xyz(),
-                ry_delta_deg=0.0,
-                rz_delta_deg=0.0,
+        place_xyz = self._top_surface_barcode_place_xyz()
+        if turntable_box_height_m is not None:
+            current = self._current_command_pose()
+            height_m = float(turntable_box_height_m)
+            surface_z_m = float(self.get_parameter("turntable_surface_z_m").value)
+            surface_clearance_m = float(
+                self.get_parameter("turntable_surface_clearance_m").value
             )
+            tcp_extension_m = float(
+                self.get_parameter("turntable_tcp_below_target_m").value
+            )
+            camera_clearance_z_m = float(
+                self.get_parameter("fast_side_camera_clearance_z_m").value
+            )
+            continued_rise_m = float(
+                self.get_parameter("fast_side_rise_after_camera_clearance_m").value
+            )
+            minimum_lift_m = float(self.get_parameter("grasp_lift_m").value)
+            if (
+                not all(math.isfinite(value) for value in (
+                    current.z, height_m, surface_z_m, surface_clearance_m,
+                    tcp_extension_m, camera_clearance_z_m, continued_rise_m,
+                    minimum_lift_m,
+                ))
+                or height_m <= 0.0
+                or surface_z_m < 0.0
+                or surface_clearance_m < 0.0
+                or tcp_extension_m < 0.0
+                or camera_clearance_z_m <= surface_z_m
+                or continued_rise_m < 0.0
+                or minimum_lift_m <= 0.0
+            ):
+                raise RuntimeError("invalid top-barcode turntable clearance geometry")
+            clearance_z_m = max(
+                current.z + minimum_lift_m,
+                camera_clearance_z_m,
+                surface_z_m + height_m + surface_clearance_m + tcp_extension_m,
+            )
+            transfer_z_m = clearance_z_m + continued_rise_m
+            self._publish_status(
+                "top-barcode turntable clearance: blocking vertical MovL "
+                f"{current.z*1000:.1f}->{clearance_z_m*1000:.1f}mm before XY transfer"
+            )
+            with self._timed_stage("top_barcode_turntable_clearance_lift"):
+                self._move_to_user_xyz_with_rotation(
+                    [current.x, current.y, clearance_z_m],
+                    ry_delta_deg=0.0, rz_delta_deg=0.0, linear_tcp=True,
+                )
+            self._publish_status(
+                "top-barcode rising transfer: Cartesian MovL toward placement "
+                f"while TCP Z rises to {transfer_z_m*1000:.1f}mm"
+            )
+            with self._timed_stage("top_barcode_clearance_transfer"):
+                self._move_to_user_xyz_with_rotation(
+                    [place_xyz[0], place_xyz[1], transfer_z_m],
+                    ry_delta_deg=0.0, rz_delta_deg=0.0, linear_tcp=True,
+                )
+            self._mark_turntable_material_removed()
+            with self._timed_stage("top_barcode_fixed_place_descent"):
+                self._move_to_user_xyz_with_rotation(
+                    place_xyz,
+                    ry_delta_deg=0.0, rz_delta_deg=0.0, linear_tcp=True,
+                )
+        else:
+            with self._timed_stage("top_barcode_fixed_place_ptp"):
+                self._move_to_user_xyz_with_rotation(
+                    place_xyz,
+                    ry_delta_deg=0.0,
+                    rz_delta_deg=0.0,
+                )
         self._require_cycle_active("at top-barcode fixed placement pose")
         with self._timed_stage("top_barcode_placement_grasp_check"):
             self._validate_grasp_feedback(
