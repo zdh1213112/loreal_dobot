@@ -133,13 +133,15 @@ D405定位。条码此时已从底面翻到侧面，所以最终夹持确认后�
 保持夹持在当前XYZ执行User Rz +40°，随后保持当前XY下降到本轮
 首次抓取的绝对User 0 Z并松爪。夹爪打开时在固定XYZ绕当前Tool X轴执行
 Rx +70°，重新夹紧后上升160 mm并从吸附后的J6角度+180°。
-若物料长边超过默认180 mm（半长超过夹爪空腔90 mm），第一次松爪后会
+若物料长边超过默认150 mm，第一次松爪后会
 先将夹爪完全张开，再沿物料长边朝**更靠近User原点的短端**移动
-`长边/2 - 90 mm + 5 mm余量`，然后继续固定的Tool Rx +70°和复抓。
+`长边/2 - 80 mm + 10 mm余量`，然后继续固定的Tool Rx +70°和复抓。
 这里用当前Tool Y在User XY平面的投影确定物料长边轴，正负方向由
 两个短端到User原点的距离决定；并不固定取Tool +Y或Tool -Y。
 平移目标及其后+70°姿态先做逆解检查，不可达时在平移前停止。
-空腔深度和余量分别由`bottom_center_gripper_cavity_half_length_m`及
+长度触发阈值、保守空腔深度和余量分别由
+`bottom_center_long_box_length_threshold_m`、
+`bottom_center_gripper_cavity_half_length_m`及
 `bottom_center_long_box_offset_margin_m`配置。
 J6造成的Tool 1反馈TCP XY变化只记录、不阻止流程；随后保持当前XY下降
 120 mm并第二次松爪。由于J6已经转动180°，在固定XYZ继续绕当前Tool X轴
@@ -147,6 +149,8 @@ J6造成的Tool 1反馈TCP XY变化只记录、不阻止流程；随后保持当
 及Tool姿态先移动到该目标最新的User 0 X/Y，不额外抬高；然后保持X/Y和姿态
 垂直下降到本轮首次抓取的绝对Z并重新夹紧。若2秒内没有新鲜跟踪目标，
 保持开爪并停止流程。Rz +40°状态保持不变。
+末次重抓的D405目标与参考XY的水平偏移上限默认为60 mm，由
+`bottom_center_final_regrasp_max_xy_shift_m`单独配置；初次预抓取修正上限不受影响。
 最后直线上升到转盘安全Z
 （默认320 mm），检查夹持反馈，再按顶面分支的固定XYZ放置。每次低位
 姿态变化和Z运动均使用Cartesian MovL，并在下发前检查目标逆解；

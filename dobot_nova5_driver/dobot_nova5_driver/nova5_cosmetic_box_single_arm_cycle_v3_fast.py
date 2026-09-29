@@ -769,10 +769,14 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("bottom_center_first_tool_rx_delta_deg", 70.0)
         self.declare_parameter("bottom_center_release_tool_rx_delta_deg", 70.0)
         self.declare_parameter("bottom_center_tracking_timeout_s", 2.0)
-        # Move toward the short end nearest User origin when half the box
-        # length exceeds the measured gripper cavity from the TCP.
-        self.declare_parameter("bottom_center_gripper_cavity_half_length_m", 0.075)
-        self.declare_parameter("bottom_center_long_box_offset_margin_m", 0.015)
+        # Final D405 regrasp after the second Tool-Rx may shift farther than
+        # the ordinary pregrasp correction; keep its limit independent.
+        self.declare_parameter("bottom_center_final_regrasp_max_xy_shift_m", 0.060)
+        # Shift toward the short end nearest User origin when the box length
+        # exceeds the independent threshold. Use a conservative cavity allowance.
+        self.declare_parameter("bottom_center_long_box_length_threshold_m", 0.150)
+        self.declare_parameter("bottom_center_gripper_cavity_half_length_m", 0.080)
+        self.declare_parameter("bottom_center_long_box_offset_margin_m", 0.010)
         # Both bottom-face branches start from a stable J6 neighbourhood. If
         # the wrist is farther than this from zero, temporarily pick the box,
         # lift it clear, set J6=0, put it back, and continue from the new centre.
@@ -6574,7 +6578,11 @@ class CosmeticBoxSingleArmNode(Node):
                 )
                 max_shift_m = max(
                     0.001,
-                    float(self.get_parameter("pregrasp_max_correction_m").value),
+                    float(
+                        self.get_parameter(
+                            "bottom_center_final_regrasp_max_xy_shift_m"
+                        ).value
+                    ),
                 )
                 if xy_shift_m > max_shift_m:
                     raise RuntimeError(
@@ -6967,21 +6975,34 @@ class CosmeticBoxSingleArmNode(Node):
         margin_m = float(
             self.get_parameter("bottom_center_long_box_offset_margin_m").value
         )
-        if not all(math.isfinite(value) for value in (length_m, cavity_m, margin_m)):
+        threshold_m = float(
+            self.get_parameter("bottom_center_long_box_length_threshold_m").value
+        )
+        if not all(
+            math.isfinite(value)
+            for value in (length_m, cavity_m, margin_m, threshold_m)
+        ):
             raise RuntimeError("bottom long-box geometry must be finite")
         if length_m <= 0.0:
             raise RuntimeError("bottom long-box length must be positive")
-        if cavity_m <= 0.0 or margin_m < 0.0 or margin_m >= cavity_m:
-            raise RuntimeError("invalid bottom long-box cavity or offset margin")
-        if length_m <= 2.0 * cavity_m:
+        if (
+            threshold_m <= 0.0
+            or cavity_m <= 0.0
+            or margin_m < 0.0
+            or margin_m >= cavity_m
+        ):
+            raise RuntimeError("invalid bottom long-box threshold, cavity or margin")
+        if length_m <= threshold_m:
             self._publish_status(
                 f"bottom long-box check: measured length={length_m*1000.0:.1f}mm "
-                f"<= cavity threshold={2.0*cavity_m*1000.0:.1f}mm; "
+                f"<= length threshold={threshold_m*1000.0:.1f}mm; "
                 "keeping the original Tool-Rx +70deg grasp path"
             )
             return 0.0
 
         offset_m = 0.5 * length_m - cavity_m + margin_m
+        if offset_m <= 0.0:
+            raise RuntimeError("bottom long-box offset must be positive above threshold")
         current = self._current_command_pose()
         rotation = SciPyRot.from_euler(
             "xyz", [current.rx, current.ry, current.rz], degrees=True

@@ -547,6 +547,11 @@ def generate_launch_description() -> LaunchDescription:
                 description="Wait for a fresh D405 target before the final regrasp",
             ),
             DeclareLaunchArgument(
+                "bottom_center_final_regrasp_max_xy_shift_m",
+                default_value="0.060",
+                description="Maximum D405 XY shift before the final bottom regrasp (m)",
+            ),
+            DeclareLaunchArgument(
                 "bottom_center_first_rz_delta_deg",
                 default_value="40.0",
                 description="Turntable bottom recovery User-Rz rotation before first release",
@@ -557,13 +562,18 @@ def generate_launch_description() -> LaunchDescription:
                 description="Tool-Rx rotation after the first turntable release",
             ),
             DeclareLaunchArgument(
+                "bottom_center_long_box_length_threshold_m",
+                default_value="0.150",
+                description="Box length above which the short-end shift is applied (m)",
+            ),
+            DeclareLaunchArgument(
                 "bottom_center_gripper_cavity_half_length_m",
-                default_value="0.090",
-                description="Available gripper cavity from TCP toward one short end (m)",
+                default_value="0.080",
+                description="Conservative usable gripper cavity from TCP toward one short end (m)",
             ),
             DeclareLaunchArgument(
                 "bottom_center_long_box_offset_margin_m",
-                default_value="0.005",
+                default_value="0.010",
                 description="Extra short-end clearance before the first Tool-Rx roll (m)",
             ),
             DeclareLaunchArgument(
@@ -1212,12 +1222,24 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration("bottom_center_tracking_timeout_s"),
                             value_type=float,
                         ),
+                        "bottom_center_final_regrasp_max_xy_shift_m": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_center_final_regrasp_max_xy_shift_m"
+                            ),
+                            value_type=float,
+                        ),
                         "bottom_center_first_rz_delta_deg": ParameterValue(
                             LaunchConfiguration("bottom_center_first_rz_delta_deg"),
                             value_type=float,
                         ),
                         "bottom_center_first_tool_rx_delta_deg": ParameterValue(
                             LaunchConfiguration("bottom_center_first_tool_rx_delta_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_center_long_box_length_threshold_m": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_center_long_box_length_threshold_m"
+                            ),
                             value_type=float,
                         ),
                         "bottom_center_gripper_cavity_half_length_m": ParameterValue(
