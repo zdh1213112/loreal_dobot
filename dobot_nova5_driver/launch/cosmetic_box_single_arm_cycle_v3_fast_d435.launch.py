@@ -61,8 +61,8 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_d435_model_path",
-                default_value="/home/zdh/ffs_ws/models/merge_0928_fast.onnx",
-                description="Fast D435 ONNX barcode detector exported from merge_0928.pt",
+                default_value="/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_0929.onnx",
+                description="Fast D435 ONNX barcode detector exported from best_0929.pt",
             ),
             DeclareLaunchArgument(
                 "turntable_d435_inference_provider",
@@ -207,14 +207,42 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "turntable_pulse_ms",
                 default_value="100",
-                description="Fast profile high hold duration of each 0->1->0 toggle pulse",
+                description=(
+                    "Field-calibrated high hold for turntable start, midpoint "
+                    "stop and restart pulses"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_stop_pulse_ms",
+                default_value="300",
+                description=(
+                    "Reliable high hold for final/operator turntable stop pulses; "
+                    "the field input intermittently missed 100ms final stop pulses"
+                ),
             ),
             DeclareLaunchArgument(
                 "turntable_scan_timeout_s",
-                default_value="3.6",
+                default_value="3.0",
                 description=(
-                    "Fast D435 rotating search window; the 100ms start pulse is also "
-                    "scanned, preserving slightly more than one measured 3.2s revolution"
+                    "Fast D435 rotating search window measured after each completed "
+                    "start/restart pulse; 3.6s is one calibrated revolution"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_mid_scan_restart_s",
+                default_value="1.4",
+                description=(
+                    "Fast-only offset inside the rotating scan window for "
+                    "the midpoint stop/start pulse pair; zero disables it"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_mid_scan_low_hold_ms",
+                default_value="100",
+                description=(
+                    "Low-state hold between the Fast midpoint stop and restart "
+                    "rising edges; 50ms was rejected by the field controller, "
+                    "while 100ms keeps about 200ms total edge separation"
                 ),
             ),
             DeclareLaunchArgument(
@@ -655,6 +683,51 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
+                "fast_side_departure_place_blend_enabled",
+                default_value="true",
+                description=(
+                    "Fast-only camera-safe path that keeps XY over the turntable "
+                    "until the configured clearance Z, then blends toward placement"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_departure_place_blend_cp",
+                default_value="20",
+                description="CP ratio for the fast rising-transfer placement path",
+            ),
+            DeclareLaunchArgument(
+                "fast_side_camera_clearance_z_m",
+                default_value="0.260",
+                description=(
+                    "Absolute TCP User-Z at which XY may start moving toward the "
+                    "placement area"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_rise_after_camera_clearance_m",
+                default_value="0.005",
+                description=(
+                    "Additional Z rise while approaching the placement-area high "
+                    "waypoint after clearing the front camera"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_departure_place_queue_lead_m",
+                default_value="0.030",
+                description=(
+                    "Distance before the placement-area high waypoint at which "
+                    "the final placement PTP is queued"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_departure_place_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Wait for controller command-ID feedback before deciding "
+                    "that the fast rising transfer finished without reaching its gate"
+                ),
+            ),
+            DeclareLaunchArgument(
                 "joint_acc",
                 default_value="65",
                 description="Joint acceleration baseline used by move-above/pregrasp PTP",
@@ -897,8 +970,8 @@ def generate_launch_description() -> LaunchDescription:
             ),
             Node(
                 package="dobot_nova5_driver",
-                executable="nova5_cosmetic_box_cycle_v3",
-                name="nova5_cosmetic_box_single_arm_cycle_v3",
+                executable="nova5_cosmetic_box_cycle_v3_fast",
+                name="nova5_cosmetic_box_single_arm_cycle_v3_fast",
                 output="screen",
                 parameters=[
                     {
@@ -910,9 +983,21 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration("turntable_pulse_ms"),
                             value_type=int,
                         ),
+                        "turntable_stop_pulse_ms": ParameterValue(
+                            LaunchConfiguration("turntable_stop_pulse_ms"),
+                            value_type=int,
+                        ),
                         "turntable_scan_timeout_s": ParameterValue(
                             LaunchConfiguration("turntable_scan_timeout_s"),
                             value_type=float,
+                        ),
+                        "turntable_mid_scan_restart_s": ParameterValue(
+                            LaunchConfiguration("turntable_mid_scan_restart_s"),
+                            value_type=float,
+                        ),
+                        "turntable_mid_scan_low_hold_ms": ParameterValue(
+                            LaunchConfiguration("turntable_mid_scan_low_hold_ms"),
+                            value_type=int,
                         ),
                         "turntable_stationary_barcode_check_s": ParameterValue(
                             LaunchConfiguration("turntable_stationary_barcode_check_s"),
@@ -1197,6 +1282,42 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "post_scan_place_command_start_grace_s": ParameterValue(
                             LaunchConfiguration("post_scan_place_command_start_grace_s"),
+                            value_type=float,
+                        ),
+                        "fast_side_departure_place_blend_enabled": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_departure_place_blend_enabled"
+                            ),
+                            value_type=bool,
+                        ),
+                        "fast_side_departure_place_blend_cp": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_departure_place_blend_cp"
+                            ),
+                            value_type=int,
+                        ),
+                        "fast_side_camera_clearance_z_m": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_camera_clearance_z_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "fast_side_rise_after_camera_clearance_m": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_rise_after_camera_clearance_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "fast_side_departure_place_queue_lead_m": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_departure_place_queue_lead_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "fast_side_departure_place_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_departure_place_command_start_grace_s"
+                            ),
                             value_type=float,
                         ),
                         "joint_acc": ParameterValue(

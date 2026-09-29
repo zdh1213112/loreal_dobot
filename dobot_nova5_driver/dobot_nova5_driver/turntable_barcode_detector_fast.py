@@ -24,7 +24,9 @@ except Exception:  # pragma: no cover - reported clearly by load_model
     YOLO = None
 
 
-DEFAULT_BARCODE_MODEL = "/home/zdh/ffs_ws/models/merge_0928_fast.onnx"
+DEFAULT_BARCODE_MODEL = (
+    "/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_0929.onnx"
+)
 
 
 @dataclass(frozen=True)

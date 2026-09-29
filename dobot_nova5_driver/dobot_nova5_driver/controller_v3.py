@@ -879,6 +879,93 @@ class DobotNova5Controller:
                         pass
         return edge_at
 
+    def pulse_digital_output_twice_back_to_back(
+        self,
+        index: int,
+        pulse_ms: int = 100,
+        low_hold_ms: int = 100,
+        *,
+        first_pulse_ms: int | None = None,
+    ) -> tuple[float, float]:
+        """Emit two toggle pulses with a short, explicit low-state dwell.
+
+        This is used by the Fast turntable midpoint retrigger. The first
+        rising edge stops the running table and the second restarts it. The
+        stop and restart high widths may differ. The first falling edge is
+        followed by the configured minimum low hold and then the second
+        rising-edge Dashboard command under the same command lock.
+        """
+
+        self._ensure_dashboard()
+        index = int(index)
+        pulse_ms = int(pulse_ms)
+        first_pulse_ms = (
+            pulse_ms if first_pulse_ms is None else int(first_pulse_ms)
+        )
+        low_hold_ms = int(low_hold_ms)
+        if not 1 <= index <= 8:
+            raise ValueError(f"controller DO index must be in [1, 8], got {index}")
+        if not 50 <= pulse_ms <= 5000:
+            raise ValueError(
+                f"turntable pulse_ms must be in [50, 5000], got {pulse_ms}"
+            )
+        if not 50 <= first_pulse_ms <= 5000:
+            raise ValueError(
+                "turntable first_pulse_ms must be in [50, 5000], "
+                f"got {first_pulse_ms}"
+            )
+        if not 1 <= low_hold_ms <= 5000:
+            raise ValueError(
+                "turntable double-pulse low_hold_ms must be in [1, 5000], "
+                f"got {low_hold_ms}"
+            )
+        delay_s = pulse_ms / 1000.0
+        first_delay_s = first_pulse_ms / 1000.0
+        low_hold_s = low_hold_ms / 1000.0
+        output_high = False
+        first_edge_at = 0.0
+        second_edge_at = 0.0
+        with self._command_lock:
+            try:
+                self._raise_if_error(
+                    self.dashboard.DOInstant(index, 0),
+                    f"DOInstant({index},0) double-pulse reset",
+                )
+                self._raise_if_error(
+                    self.dashboard.DOInstant(index, 1),
+                    f"DOInstant({index},1) double-pulse stop edge",
+                )
+                first_edge_at = time.monotonic()
+                output_high = True
+                time.sleep(first_delay_s)
+                self._raise_if_error(
+                    self.dashboard.DOInstant(index, 0),
+                    f"DOInstant({index},0) double-pulse midpoint",
+                )
+                output_high = False
+                # A real low interval is required for the turntable input to
+                # recognize the next rising edge as a separate toggle pulse.
+                time.sleep(low_hold_s)
+                self._raise_if_error(
+                    self.dashboard.DOInstant(index, 1),
+                    f"DOInstant({index},1) double-pulse restart edge",
+                )
+                second_edge_at = time.monotonic()
+                output_high = True
+                time.sleep(delay_s)
+                self._raise_if_error(
+                    self.dashboard.DOInstant(index, 0),
+                    f"DOInstant({index},0) double-pulse finish",
+                )
+                output_high = False
+            finally:
+                if output_high:
+                    try:
+                        self.dashboard.DOInstant(index, 0)
+                    except Exception:
+                        pass
+        return first_edge_at, second_edge_at
+
     def set_joint_profile(self, speed: Optional[int] = None, accel: Optional[int] = None) -> bool:
         self._ensure_dashboard()
         supported = True

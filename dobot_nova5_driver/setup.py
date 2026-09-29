@@ -66,6 +66,7 @@ setup(
             "d435_turntable_barcode_v3 = dobot_nova5_driver.d435_turntable_barcode_node_v3:main",
             "d435_turntable_barcode_fast = dobot_nova5_driver.d435_turntable_barcode_node_fast:main",
             "nova5_cosmetic_box_cycle_v3 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3:main",
+            "nova5_cosmetic_box_cycle_v3_fast = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3_fast:main",
         ],
     },
 )
