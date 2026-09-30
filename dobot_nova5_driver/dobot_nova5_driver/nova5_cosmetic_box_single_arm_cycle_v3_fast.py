@@ -5910,8 +5910,10 @@ class CosmeticBoxSingleArmNode(Node):
                 motion,
                 length_m=length_m,
             )
-            self._mark_turntable_material_removed()
-            self._place_as_top_barcode_box()
+            # The final bottom-recovery regrasp is still at the original low
+            # grasp Z.  Use the same height-aware vertical departure and
+            # rising transfer as the top-surface barcode path.
+            self._place_as_top_barcode_box(turntable_box_height_m=height_m)
             return
         self._publish_status(
             "at grasp depth; commanding V2-compatible full close: "
@@ -7630,10 +7632,10 @@ class CosmeticBoxSingleArmNode(Node):
             self.gripper.close(wait=True, cancel_check=self._cycle_cancel_requested)
         with self._timed_stage("bottom_center_final_grasp_confirm"):
             self._confirm_grasp_before_lift(max_opening, width_m)
-        with self._timed_stage("turntable_safe_departure_lift"):
-            self._execute_turntable_safe_departure_lift(motion)
-        with self._timed_stage("post_lift_grasp_check"):
-            self._validate_grasp_feedback("after bottom recovery departure", max_opening)
+        self._publish_status(
+            "bottom recovery final grasp confirmed at low pose; handing off to "
+            "the height-aware top-barcode vertical departure and placement path"
+        )
 
     def _execute_bottom_barcode_recovery(
         self,
