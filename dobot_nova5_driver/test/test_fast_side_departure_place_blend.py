@@ -120,6 +120,7 @@ class FastSideDeparturePlaceBlendTest(unittest.TestCase):
             cp_override=None,
             command_start_grace_override_s=None,
             motion_description="",
+            linear_tcp=False,
             queue_gate_callback=None,
         ):
             queued.append(
@@ -134,6 +135,7 @@ class FastSideDeparturePlaceBlendTest(unittest.TestCase):
                     cp_override,
                     command_start_grace_override_s,
                     motion_description,
+                    linear_tcp,
                     queue_gate_callback,
                 )
             )
@@ -172,8 +174,11 @@ class FastSideDeparturePlaceBlendTest(unittest.TestCase):
         self.assertEqual(queued[0][6], 0.030)
         self.assertEqual(queued[0][7], 20)
         self.assertEqual(queued[0][8], 0.30)
-        self.assertEqual(queued[0][9], "fast camera-safe rising transfer")
-        self.assertTrue(callable(queued[0][10]))
+        self.assertEqual(
+            queued[0][9], "fast camera-safe rising transfer (Cartesian MovL)"
+        )
+        self.assertTrue(queued[0][10])
+        self.assertTrue(callable(queued[0][11]))
         self.assertEqual(removed, [True])
         self.assertTrue(node._fast_turntable_removed_precompleted)
         self.assertTrue(node._fast_side_place_precompleted)

@@ -8550,7 +8550,8 @@ class CosmeticBoxSingleArmNode(Node):
                 queue_lead_override_m=lead_m,
                 cp_override=cp,
                 command_start_grace_override_s=start_grace_s,
-                motion_description="fast camera-safe rising transfer",
+                motion_description="fast camera-safe rising transfer (Cartesian MovL)",
+                linear_tcp=True,
                 queue_gate_callback=verify_transfer_gate,
             )
             if not placed:
@@ -8559,7 +8560,7 @@ class CosmeticBoxSingleArmNode(Node):
                 self._publish_status(
                     "fast camera-safe transfer reached the placement-area high "
                     "waypoint before its final queue gate; completing only the "
-                    "final placement PTP"
+                    "final placement MovL"
                 )
                 self._move_to_user_xyz_with_rotation(
                     fixed_place_xyz,
@@ -8568,6 +8569,7 @@ class CosmeticBoxSingleArmNode(Node):
                     rx_delta_deg=float(
                         self.get_parameter("side_barcode_place_rx_delta_deg").value
                     ),
+                    linear_tcp=True,
                 )
             self._fast_side_place_precompleted = True
             self._publish_status(
@@ -8963,9 +8965,10 @@ class CosmeticBoxSingleArmNode(Node):
         cp_override: Optional[int] = None,
         command_start_grace_override_s: Optional[float] = None,
         motion_description: str = "post-scan safe-height transfer",
+        linear_tcp: bool = False,
         queue_gate_callback: Optional[Callable[[], None]] = None,
     ) -> bool:
-        """Queue the fixed placement PTP while the safe-height PTP finishes.
+        """Queue fixed placement while the safe-height motion finishes.
 
         This transition is deliberately narrower than the lift/transfer
         queue.  Barcode acquisition has finished, and both waypoints are
@@ -8974,7 +8977,10 @@ class CosmeticBoxSingleArmNode(Node):
         set ``allow_pending_queue`` while that known straight retreat is still
         in the controller queue; the safe-height command is then allowed to
         remain pending until its TCP gate is reached.  The helper validates the
-        final placement pose before the gripper release stage.
+        final placement pose before the gripper release stage.  The fast
+        side-barcode departure can request Cartesian MovL for both the
+        safe-height transfer and the final placement descent; all other callers
+        retain the original Cartesian MovJ/PTP behavior.
         """
 
         if len(approach_xyz) != 3 or len(fixed_place_xyz) != 3:
@@ -9048,12 +9054,19 @@ class CosmeticBoxSingleArmNode(Node):
 
         combined_speed = motion["post_scan_speed"]
         combined_acc = motion["post_scan_acc"]
+        submit_safe_motion = (
+            self.controller.submit_move_linear_tcp
+            if linear_tcp
+            else self.controller.submit_move_joint_tcp
+        )
+        motion_kind = "Cartesian MovL" if linear_tcp else "Cartesian MovJ/PTP"
         self._publish_status(
             f"{motion_description}: moving directly to the placement-area high "
             "waypoint; fixed placement will be queued "
-            f"near the endpoint (lead {lead_m * 1000.0:.1f}mm, CP={cp})"
+            f"near the endpoint (lead {lead_m * 1000.0:.1f}mm, CP={cp}, "
+            f"mode={motion_kind})"
         )
-        safe_command = self.controller.submit_move_joint_tcp(
+        safe_command = submit_safe_motion(
             approach_pose,
             speed=combined_speed,
             accel=combined_acc,
@@ -9133,8 +9146,8 @@ class CosmeticBoxSingleArmNode(Node):
                     continue
                 self.controller.wait_for_command(safe_command, timeout_s=5.0)
                 self._publish_status(
-                    "post-scan safe-height PTP completed before the queue gate; "
-                    "using the blocking placement path"
+                    f"post-scan safe-height {motion_kind} completed before the "
+                    "queue gate; using the blocking placement path"
                 )
                 return False
             if not active and pending:
@@ -9156,8 +9169,8 @@ class CosmeticBoxSingleArmNode(Node):
                     continue
                 self.controller.wait_for_command(safe_command, timeout_s=5.0)
                 self._publish_status(
-                    "post-scan safe-height PTP completed before the queue gate; "
-                    "using the blocking placement path"
+                    f"post-scan safe-height {motion_kind} completed before the "
+                    "queue gate; using the blocking placement path"
                 )
                 return False
             if time.monotonic() >= gate_deadline:
@@ -9174,9 +9187,12 @@ class CosmeticBoxSingleArmNode(Node):
         self._require_cycle_active("at post-scan safe-height queue gate")
         if queue_gate_callback is not None:
             queue_gate_callback()
-        self._publish_status("queueing fixed placement PTP before safe-height endpoint")
+        self._publish_status(
+            "queueing fixed placement "
+            f"{'MovL' if linear_tcp else 'PTP'} before safe-height endpoint"
+        )
         try:
-            place_command = self.controller.submit_move_joint_tcp(
+            place_command = submit_safe_motion(
                 place_pose,
                 speed=combined_speed,
                 accel=combined_acc,
