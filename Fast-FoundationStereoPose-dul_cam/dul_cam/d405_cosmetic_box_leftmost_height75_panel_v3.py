@@ -25,6 +25,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
+from queue import Queue
 
 import cv2
 import numpy as np
@@ -172,7 +173,7 @@ AUTO_WHITE_BALANCE = True
 # V3保持V2的初始位采集流程并默认打开：每轮第一次视觉触发保存两张
 # 初始位原始RGB，稳定目标形成后再保存两张原始RGB。V3使用独立目录，
 # 不会覆盖或改变V2的图像序列。
-SAVE_INITIAL_POSITION_FRAMES = True
+SAVE_INITIAL_POSITION_FRAMES = False
 INITIAL_POSITION_FRAME_COUNT = 2
 STABLE_TARGET_FRAME_COUNT = 2
 D405_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "d405_output_v3")
@@ -323,7 +324,8 @@ quit_requested = False
 reset_requested = False
 clear_target_display_requested = False
 initial_position_frames_saved_for_startup = False
-stable_target_frames = deque(maxlen=STABLE_TARGET_FRAME_COUNT)
+pending_stable_target_samples = deque(maxlen=STABLE_TARGET_FRAME_COUNT)
+camera_frame_index = 0
 manual_roi = None
 roi_drawing = False
 roi_start = (-1, -1)
@@ -350,6 +352,8 @@ latest_d435_preview = None
 latest_d435_preview_received_at = 0.0
 d435_preview_lock = threading.Lock()
 combined_mouse_owner = None
+d405_output_save_queue = Queue()
+d405_output_save_stop = object()
 
 
 def initialize_initial_position_frame_output() -> None:
@@ -427,6 +431,38 @@ def save_d405_output_frames(frames, stage: str, expected_count: int) -> None:
         )
     for frame in frames_to_save:
         save_d405_output_frame(frame, stage)
+
+
+def enqueue_d405_output_frames(frames, stage: str, expected_count: int) -> None:
+    """Queue copied RGB frames so disk I/O cannot stall camera inference."""
+
+    if not SAVE_INITIAL_POSITION_FRAMES:
+        return
+    frames_to_save = [np.ascontiguousarray(frame).copy() for frame in list(frames)[-expected_count:]]
+    if len(frames_to_save) != expected_count:
+        logging.warning(
+            f"[D405] {stage} capture contained {len(frames_to_save)} frame(s); "
+            f"expected {expected_count}."
+        )
+    if frames_to_save:
+        d405_output_save_queue.put((frames_to_save, stage, len(frames_to_save)))
+
+
+def d405_output_save_worker() -> None:
+    """Write diagnostic RGB frames outside the real-time camera loop."""
+
+    while True:
+        item = d405_output_save_queue.get()
+        try:
+            if item is d405_output_save_stop:
+                return
+            frames, stage, expected_count = item
+            try:
+                save_d405_output_frames(frames, stage, expected_count)
+            except Exception as exc:
+                logging.error(f"[D405] Background frame save failed: {exc}")
+        finally:
+            d405_output_save_queue.task_done()
 
 
 def initialize_fault_snapshot_output() -> None:
@@ -862,7 +898,7 @@ def publish_vision_result(success: bool, reason: str) -> None:
     if not success:
         # 同一初始位的失败重试不清除已保存的初始位图片；下一次触发
         # 仍属于同一轮等待，直到稳定目标成功或机械臂重新回到初始位。
-        stable_target_frames.clear()
+        pending_stable_target_samples.clear()
     message = String()
     message.data = f"{'success' if success else 'failure'}:{reason}"
     vision_result_pub.publish(message)
@@ -1672,6 +1708,12 @@ u_flat, v_flat = u_grid.reshape(-1).astype(np.float32), v_grid.reshape(-1).astyp
 warm_up_ffs_model(ffs_model)
 initialize_initial_position_frame_output()
 initialize_fault_snapshot_output()
+d405_output_save_thread = threading.Thread(
+    target=d405_output_save_worker,
+    name="d405-output-save",
+    daemon=True,
+)
+d405_output_save_thread.start()
 logging.info(
     "[geometry] Tall-box-safe grasp enabled: top plane follows tabletop; "
     "grasp axes use only metric 3-D top-surface points; near-square 90deg "
@@ -1830,7 +1872,7 @@ try:
             last_gripper_side_live_voxels = [None, None]
             handoff_reacquire_required = False
             pregrasp_tracking_deadline = 0.0
-            stable_target_frames.clear()
+            pending_stable_target_samples.clear()
             publish_handoff_clearance("WAIT_TARGET", clear=False)
             flush_frames = 0 if is_fast_reacquire else CAPTURE_FLUSH_FRAMES
             if is_fast_reacquire:
@@ -1856,7 +1898,7 @@ try:
                         initial_followup_frames.get_color_frame().get_data()
                     ).copy()
                 )
-                save_d405_output_frames(
+                enqueue_d405_output_frames(
                     initial_position_frames,
                     "initial-position",
                     INITIAL_POSITION_FRAME_COUNT,
@@ -1907,6 +1949,7 @@ try:
             trigger_requested = False
 
         frames = pipeline.wait_for_frames()
+        camera_frame_index += 1
         # Use the D405 device capture time mapped to the host Unix clock.  The
         # Dobot feedback history uses the controller's Unix-ms TimeStamp, so
         # both sides now refer to the same physical instant rather than the
@@ -1949,7 +1992,22 @@ try:
         if pending_bbox is not None and not sam_initialized:
             sam2_predictor.load_first_frame(color_bgr)
             prompt = np.array([[pending_bbox[0], pending_bbox[1]], [pending_bbox[2], pending_bbox[3]]], dtype=np.float32)
-            sam2_predictor.add_new_prompt(frame_idx=0, obj_id=1, bbox=prompt)
+            _, object_ids, mask_logits = sam2_predictor.add_new_prompt(
+                frame_idx=0, obj_id=1, bbox=prompt
+            )
+            # The prompt call already runs SAM2 inference for this exact RGB
+            # frame. Reuse that mask immediately instead of waiting for the
+            # next tracking iteration to perform an equivalent first pass.
+            current_mask = (
+                (mask_logits[0] > 0.0)
+                .permute(1, 2, 0)
+                .byte()
+                .cpu()
+                .numpy()
+                .squeeze()
+                if len(object_ids)
+                else None
+            )
             sam_initialized = True
             pending_bbox = None
             logging.info("[SAM2] Tracking selected minimum-camera-X target.")
@@ -2777,14 +2835,20 @@ try:
                                                 ),
                                             )
 
-                                        # Publish only after the overhead/right handoff corridor and
-                                        # both gripper-finger descent paths have independently been
-                                        # clear twice. Afterwards SAM2 remains alive for tracking.
-                                        if handoff_clearance_passed and not locked_target_ready:
-                                            if SAVE_INITIAL_POSITION_FRAMES:
-                                                # 这两帧正是形成稳定目标的连续有效帧，
-                                                # 保存原始 RGB，不保存带标注的显示图。
-                                                stable_target_frames.append(color_bgr.copy())
+                                        # Build a candidate on every valid geometry frame,
+                                        # including while the handoff corridor is still being
+                                        # confirmed. The last two consecutive candidates are
+                                        # published together only after the same two-frame LIVE
+                                        # clearance requirement passes. This removes the old
+                                        # extra post-CLEAR pair of camera iterations without
+                                        # relaxing either safety or stability check.
+                                        if not locked_target_ready:
+                                            if (
+                                                pending_stable_target_samples
+                                                and pending_stable_target_samples[-1]["frame_index"]
+                                                != camera_frame_index - 1
+                                            ):
+                                                pending_stable_target_samples.clear()
                                             pose_msg = PoseStamped()
                                             pose_msg.header.stamp = frame_stamp
                                             pose_msg.header.frame_id = "camera_d405_link"
@@ -2792,7 +2856,6 @@ try:
                                             quat = SciPyRot.from_matrix(smooth_rotation).as_quat()
                                             pose_msg.pose.orientation.x, pose_msg.pose.orientation.y = float(quat[0]), float(quat[1])
                                             pose_msg.pose.orientation.z, pose_msg.pose.orientation.w = float(quat[2]), float(quat[3])
-                                            pose_pub.publish(pose_msg)
                                             width_decision = select_gripper_width(
                                                 float(smooth_extent[0]),
                                                 float(smooth_extent[1]),
@@ -2805,37 +2868,51 @@ try:
                                                     GRIPPER_NEAR_SQUARE_ASPECT_RATIO
                                                 ),
                                             )
-                                            width_msg = Float32()
-                                            width_msg.data = width_decision.command_m
-                                            width_pub.publish(width_msg)
-                                            length_msg = Float32()
-                                            # x_axis follows the long side of the segmented
-                                            # top surface.  Publish its physical extent
-                                            # without gripper clearance so the robot can
-                                            # position the near box face relative to the
-                                            # barcode scanner.
-                                            length_msg.data = float(
-                                                max(smooth_extent[0], smooth_extent[1])
+                                            pending_stable_target_samples.append(
+                                                {
+                                                    "frame_index": camera_frame_index,
+                                                    "pose": pose_msg,
+                                                    "width": float(width_decision.command_m),
+                                                    "box_width": float(smooth_extent[1]),
+                                                    "length": float(max(smooth_extent[0], smooth_extent[1])),
+                                                    "aspect": float(width_decision.aspect_ratio),
+                                                    "height": float(last_height_m),
+                                                    "color": color_bgr.copy(),
+                                                    "reason": width_decision.reason,
+                                                }
                                             )
-                                            length_pub.publish(length_msg)
-                                            aspect_ratio_msg = Float32()
-                                            aspect_ratio_msg.data = float(
-                                                width_decision.aspect_ratio
-                                            )
-                                            aspect_ratio_pub.publish(aspect_ratio_msg)
-                                            height_msg = Float32()
-                                            height_msg.data = last_height_m
-                                            height_pub.publish(height_msg)
-                                            published_frames += 1
-                                            if published_frames >= PUBLISH_FRAMES_BEFORE_RESET:
+                                            if (
+                                                handoff_clearance_passed
+                                                and len(pending_stable_target_samples)
+                                                >= PUBLISH_FRAMES_BEFORE_RESET
+                                            ):
+                                                samples_to_publish = list(
+                                                    pending_stable_target_samples
+                                                )[-PUBLISH_FRAMES_BEFORE_RESET:]
+                                                for sample in samples_to_publish:
+                                                    pose_pub.publish(sample["pose"])
+                                                    width_msg = Float32()
+                                                    width_msg.data = sample["width"]
+                                                    width_pub.publish(width_msg)
+                                                    length_msg = Float32()
+                                                    length_msg.data = sample["length"]
+                                                    length_pub.publish(length_msg)
+                                                    aspect_ratio_msg = Float32()
+                                                    aspect_ratio_msg.data = sample["aspect"]
+                                                    aspect_ratio_pub.publish(aspect_ratio_msg)
+                                                    height_msg = Float32()
+                                                    height_msg.data = sample["height"]
+                                                    height_pub.publish(height_msg)
+                                                published_frames += len(samples_to_publish)
+                                                latest_sample = samples_to_publish[-1]
                                                 locked_target_ready = True
-                                                locked_target_height_m = last_height_m
-                                                save_d405_output_frames(
-                                                    stable_target_frames,
+                                                locked_target_height_m = latest_sample["height"]
+                                                enqueue_d405_output_frames(
+                                                    [sample["color"] for sample in samples_to_publish],
                                                     "stable-target",
-                                                    STABLE_TARGET_FRAME_COUNT,
+                                                    len(samples_to_publish),
                                                 )
-                                                stable_target_frames.clear()
+                                                pending_stable_target_samples.clear()
                                                 # 允许机械臂完成本轮抓取、回到初始位后，
                                                 # 下一次视觉触发重新保存初始位两张图。
                                                 initial_position_frames_saved_for_startup = False
@@ -2845,12 +2922,12 @@ try:
                                                 publish_pregrasp_pose(frame_stamp)
                                                 publish_vision_result(True, "stable_target_published")
                                                 logging.info(
-                                                    f"[D405] Published stable target: length={smooth_extent[0]*1000:.1f}mm, "
-                                                    f"width={smooth_extent[1]*1000:.1f}mm, "
-                                                    f"height={last_height_m*1000:.1f}mm, "
-                                                    f"aspect={width_decision.aspect_ratio:.3f}, "
-                                                    f"gripper={width_decision.command_m*1000:.1f}mm "
-                                                    f"({width_decision.reason}), "
+                                                    f"[D405] Published stable target: length={latest_sample['length']*1000:.1f}mm, "
+                                                    f"width={latest_sample['box_width']*1000:.1f}mm, "
+                                                    f"height={latest_sample['height']*1000:.1f}mm, "
+                                                    f"aspect={latest_sample['aspect']:.3f}, "
+                                                    f"gripper={latest_sample['width']*1000:.1f}mm "
+                                                    f"({latest_sample['reason']}), "
                                                     f"depth={GRASP_DEPTH_RATIO*100:.0f}%, evidence={last_height_evidence_mode}; "
                                                     "SAM2 display tracking remains active."
                                                 )
@@ -3191,6 +3268,11 @@ try:
 except KeyboardInterrupt:
     pass
 finally:
+    # Drain queued diagnostic images before terminating the writer thread.
+    d405_output_save_queue.join()
+    d405_output_save_queue.put(d405_output_save_stop)
+    d405_output_save_queue.join()
+    d405_output_save_thread.join(timeout=2.0)
     pipeline.stop()
     if ENABLE_LOCAL_WINDOWS:
         cv2.destroyAllWindows()

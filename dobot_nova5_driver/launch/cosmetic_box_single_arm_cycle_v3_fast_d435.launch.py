@@ -252,7 +252,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "turntable_settle_s",
-                default_value="0.10",
+                default_value="0.05",
                 description="Fast wait after stop pulse before requesting a fresh D405 target",
             ),
             DeclareLaunchArgument(

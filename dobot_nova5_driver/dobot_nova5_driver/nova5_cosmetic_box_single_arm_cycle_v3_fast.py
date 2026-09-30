@@ -842,6 +842,11 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("dh_slave_id", 1)
         self.declare_parameter("dh_tool_identify", 1)
         self.declare_parameter("dh_timeout_s", 10.0)
+        # A full-open command is redundant when the DH feedback already shows
+        # the fingers within this tolerance of the configured maximum opening.
+        # Keep the feedback/state check fail-closed: unknown or GRIPPED state
+        # still performs the blocking open command.
+        self.declare_parameter("startup_gripper_open_skip_tolerance_m", 0.005)
         # 放置时不再等待夹爪完全张到 95 mm；从实际夹持宽度额外张开
         # 15 mm 并确认到位即可释放盒子。所有机械臂点位保持不变。
         self.declare_parameter("place_release_clearance_m", 0.015)
@@ -3792,13 +3797,47 @@ class CosmeticBoxSingleArmNode(Node):
         if require_cycle_active:
             self._require_cycle_active("at startup joint")
         if open_gripper:
-            self.gripper.set_force(int(self.get_parameter("dh_force").value))
-            self.gripper.open(
-                wait=True,
-                cancel_check=self._cycle_cancel_requested
-                if require_cycle_active
-                else None,
+            max_opening_m = max(
+                0.001,
+                float(self.get_parameter("dh_max_opening_m").value),
             )
+            skip_tolerance_m = max(
+                0.0,
+                min(
+                    max_opening_m,
+                    float(
+                        self.get_parameter(
+                            "startup_gripper_open_skip_tolerance_m"
+                        ).value
+                    ),
+                ),
+            )
+            already_open = False
+            try:
+                opening_m = self.gripper.read_position() * max_opening_m
+                grip_state = self.gripper.read_grip_state()
+                already_open = (
+                    grip_state == GRIP_REACHED
+                    and opening_m >= max_opening_m - skip_tolerance_m
+                )
+                if already_open:
+                    self._publish_status(
+                        "gripper already open "
+                        f"({opening_m * 1000.0:.1f}mm/{max_opening_m * 1000.0:.1f}mm); "
+                        "skipping redundant open wait"
+                    )
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"Could not verify gripper open state; executing full open: {exc}"
+                )
+            if not already_open:
+                self.gripper.set_force(int(self.get_parameter("dh_force").value))
+                self.gripper.open(
+                    wait=True,
+                    cancel_check=self._cycle_cancel_requested
+                    if require_cycle_active
+                    else None,
+                )
 
     def move_startup(self) -> None:
         """Recover to startup, forget the old round, and await a fresh place."""
