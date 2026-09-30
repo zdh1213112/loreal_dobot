@@ -351,7 +351,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "bottom_near_cube_preflight_recovery_shift_m",
-                default_value="0.030",
+                default_value="0.060",
                 description=(
                     "Fallback User X- shift used before retrying a near-cube flip"
                 ),

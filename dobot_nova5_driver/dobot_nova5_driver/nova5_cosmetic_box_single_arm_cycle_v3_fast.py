@@ -796,7 +796,7 @@ class CosmeticBoxSingleArmNode(Node):
         # toward User X- while holding it upright, put it back on the table,
         # and retry the normal flip sequence at the new XY.
         self.declare_parameter("bottom_near_cube_preflight_recovery_lift_m", 0.020)
-        self.declare_parameter("bottom_near_cube_preflight_recovery_shift_m", 0.030)
+        self.declare_parameter("bottom_near_cube_preflight_recovery_shift_m", 0.060)
         self.declare_parameter("bottom_near_cube_initial_tool_rx_deg", -45.0)
         self.declare_parameter("bottom_near_cube_flip_tool_rx_deg", 90.0)
         self.declare_parameter("bottom_near_cube_restore_tool_rx_deg", -45.0)
@@ -7087,11 +7087,74 @@ class CosmeticBoxSingleArmNode(Node):
         # here even when the normal measured-width pre-shape is much smaller.
         with self._timed_stage("bottom_near_cube_full_open"):
             open_fully()
-        with self._timed_stage("bottom_near_cube_tool_rx_minus_45_pick"):
-            self._bottom_center_tool_rx(
-                initial_rx_deg,
-                "near-cube bottom flip pickup Tool-Rx rotation",
+
+        recovery_used = False
+
+        def relocate_and_retry(*, restore_upright: bool, reason: str) -> None:
+            """Relocate once toward User X- and retry the -45deg pickup."""
+
+            nonlocal grasp_pose, recovery_used
+            if recovery_used:
+                raise RuntimeError(
+                    "near-cube preflight relocation recovery was already used"
+                )
+            recovery_used = True
+            self._publish_status(
+                f"{reason}; starting one-time User X- relocation recovery"
             )
+            if restore_upright:
+                self._bottom_center_tool_rx(
+                    -initial_rx_deg,
+                    "near-cube preflight failure upright recovery",
+                )
+            recovery_lift_m = float(
+                self.get_parameter(
+                    "bottom_near_cube_preflight_recovery_lift_m"
+                ).value
+            )
+            recovery_shift_m = float(
+                self.get_parameter(
+                    "bottom_near_cube_preflight_recovery_shift_m"
+                ).value
+            )
+            with self._timed_stage("bottom_near_cube_preflight_recovery"):
+                self._relocate_near_cube_after_preflight_failure(
+                    max_opening,
+                    motion,
+                    lift_m=recovery_lift_m,
+                    shift_m=recovery_shift_m,
+                )
+            with self._timed_stage("bottom_near_cube_tool_rx_minus_45_retry"):
+                self._bottom_center_tool_rx(
+                    initial_rx_deg,
+                    "near-cube retry pickup Tool-Rx rotation",
+                )
+            grasp_pose = self._current_command_pose()
+            self._publish_status(
+                "near-cube preflight fallback relocated the box; "
+                "retrying the normal bottom flip at the new XY"
+            )
+
+        with self._timed_stage("bottom_near_cube_tool_rx_minus_45_pick"):
+            try:
+                self._bottom_center_tool_rx(
+                    initial_rx_deg,
+                    "near-cube bottom flip pickup Tool-Rx rotation",
+                )
+            except RuntimeError as exc:
+                # The initial -45deg pose itself may be unreachable at the
+                # detected XY.  At this point the jaws are open and the TCP
+                # is still upright, so the same one-time relocation recovery
+                # is safe to use before retrying the pickup attitude.
+                if "InverseKin failed" not in str(exc):
+                    raise
+                relocate_and_retry(
+                    restore_upright=False,
+                    reason=(
+                        "near-cube initial Tool-Rx -45deg inverse-kinematics "
+                        "preflight failed"
+                    ),
+                )
 
         def run_preflight() -> float:
             requested_lift_m = lift_m
@@ -7127,40 +7190,23 @@ class CosmeticBoxSingleArmNode(Node):
             except RuntimeError as _first_preflight_error:
                 # The jaws are still open. Recover the known upright attitude,
                 # move the box once toward User X-, and retry at the new XY.
-                self._publish_status(
-                    "near-cube flip preflight failed at the original XY; "
-                    "starting one-time User X- relocation recovery"
-                )
-                self._bottom_center_tool_rx(
-                    -initial_rx_deg,
-                    "near-cube preflight failure upright recovery",
-                )
-                recovery_lift_m = float(
-                    self.get_parameter(
-                        "bottom_near_cube_preflight_recovery_lift_m"
-                    ).value
-                )
-                recovery_shift_m = float(
-                    self.get_parameter(
-                        "bottom_near_cube_preflight_recovery_shift_m"
-                    ).value
-                )
-                with self._timed_stage("bottom_near_cube_preflight_recovery"):
-                    self._relocate_near_cube_after_preflight_failure(
-                        max_opening,
-                        motion,
-                        lift_m=recovery_lift_m,
-                        shift_m=recovery_shift_m,
-                    )
-                with self._timed_stage("bottom_near_cube_tool_rx_minus_45_retry"):
-                    self._bottom_center_tool_rx(
-                        initial_rx_deg,
-                        "near-cube retry pickup Tool-Rx rotation",
-                    )
-                grasp_pose = self._current_command_pose()
-                self._publish_status(
-                    "near-cube preflight fallback relocated the box; "
-                    "retrying the normal bottom flip at the new XY"
+                if recovery_used:
+                    # An initial -45deg failure already consumed the one
+                    # relocation attempt.  Do not move the box a second time;
+                    # restore the open-jaw upright attitude before faulting.
+                    try:
+                        self._bottom_center_tool_rx(
+                            -initial_rx_deg,
+                            "near-cube retry preflight failure upright recovery",
+                        )
+                    except RuntimeError:
+                        pass
+                    raise
+                relocate_and_retry(
+                    restore_upright=True,
+                    reason=(
+                        "near-cube flip preflight failed at the original XY"
+                    ),
                 )
                 try:
                     lift_m = run_preflight()
