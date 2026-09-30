@@ -792,6 +792,11 @@ class CosmeticBoxSingleArmNode(Node):
         # rolls through 45 degrees. Keep a modest margin without pushing the
         # tilted Tool-1 pose unnecessarily far toward the reach boundary.
         self.declare_parameter("bottom_near_cube_flip_lift_m", 0.030)
+        # If the tilted near-cube preflight is unreachable, move the box once
+        # toward User X- while holding it upright, put it back on the table,
+        # and retry the normal flip sequence at the new XY.
+        self.declare_parameter("bottom_near_cube_preflight_recovery_lift_m", 0.020)
+        self.declare_parameter("bottom_near_cube_preflight_recovery_shift_m", 0.030)
         self.declare_parameter("bottom_near_cube_initial_tool_rx_deg", -45.0)
         self.declare_parameter("bottom_near_cube_flip_tool_rx_deg", 90.0)
         self.declare_parameter("bottom_near_cube_restore_tool_rx_deg", -45.0)
@@ -6655,6 +6660,147 @@ class CosmeticBoxSingleArmNode(Node):
             "table return and pickup-attitude restore are reachable"
         )
 
+    def _relocate_near_cube_after_preflight_failure(
+        self,
+        max_opening: float,
+        motion: dict[str, int],
+        *,
+        lift_m: float,
+        shift_m: float,
+    ) -> TcpPose:
+        """Move a held near-cube once toward User X- and put it back down.
+
+        This is a recovery for a tilted-flip preflight failure.  The caller has
+        already restored the upright Tool attitude while the jaws are open.
+        The box is grasped upright, moved at a small verified clearance, put
+        back on the table, and released.  The returned pose is the new open,
+        upright TCP pose from which the normal -45 degree pickup is retried.
+        """
+
+        if not math.isfinite(lift_m) or not (0.005 <= lift_m <= 0.100):
+            raise RuntimeError(
+                "near-cube preflight recovery lift must be in [0.005, 0.100]m"
+            )
+        if not math.isfinite(shift_m) or not (0.005 <= shift_m <= 0.100):
+            raise RuntimeError(
+                "near-cube preflight recovery User X- shift must be in [0.005, 0.100]m"
+            )
+        if not math.isfinite(max_opening) or max_opening <= 0.0:
+            raise RuntimeError("invalid gripper maximum opening for near-cube recovery")
+
+        current = self._current_command_pose()
+        lifted_z = current.z + lift_m
+        shifted = TcpPose(
+            current.x - shift_m,
+            current.y,
+            lifted_z,
+            current.rx,
+            current.ry,
+            current.rz,
+        )
+        dropped = TcpPose(
+            shifted.x,
+            shifted.y,
+            current.z,
+            current.rx,
+            current.ry,
+            current.rz,
+        )
+        user_index = int(self.get_parameter("user_index").value)
+        tool_index = int(self.get_parameter("command_tool_index").value)
+
+        # Check the complete recovery chain before closing the jaws.  The
+        # shifted and dropped targets use the joints returned by the preceding
+        # target so the controller keeps one continuous branch.
+        current_joints = self.controller.current_joint()
+        lifted_joints = self.controller.inverse_kinematics(
+            TcpPose(
+                current.x,
+                current.y,
+                lifted_z,
+                current.rx,
+                current.ry,
+                current.rz,
+            ),
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=current_joints,
+        )
+        shifted_joints = self.controller.inverse_kinematics(
+            shifted,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=lifted_joints,
+        )
+        self.controller.inverse_kinematics(
+            dropped,
+            user_index=user_index,
+            tool_index=tool_index,
+            joint_near=shifted_joints,
+        )
+        self._publish_status(
+            "near-cube flip preflight fallback verified: grasp upright, "
+            f"lift {lift_m*1000.0:.1f}mm, User X- shift {shift_m*1000.0:.1f}mm, "
+            "table return and release"
+        )
+
+        with self._timed_stage("bottom_near_cube_preflight_recovery_close"):
+            self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
+            self.gripper.close(
+                wait=True,
+                cancel_check=self._cycle_cancel_requested,
+            )
+        with self._timed_stage("bottom_near_cube_preflight_recovery_grasp_confirm"):
+            self._confirm_grasp_before_lift(max_opening, max_opening)
+        with self._timed_stage("bottom_near_cube_preflight_recovery_lift"):
+            self._bottom_center_linear_z(
+                lifted_z,
+                motion,
+                "near-cube preflight recovery lift",
+                lifting=True,
+            )
+        with self._timed_stage("bottom_near_cube_preflight_recovery_shift"):
+            self._require_cycle_active("before near-cube preflight recovery User X- shift")
+            self.controller.move_linear_tcp(
+                shifted,
+                speed=motion["linear_speed"],
+                accel=motion["linear_acc"],
+                user_index=user_index,
+                tool_index=tool_index,
+            )
+            self._require_cycle_active("after near-cube preflight recovery User X- shift")
+            actual = self._current_command_pose()
+            tolerance_m = max(
+                0.0005,
+                float(self.get_parameter("jog_tolerance_m").value),
+            ) * 1.5
+            if max(
+                abs(actual.x - shifted.x),
+                abs(actual.y - shifted.y),
+                abs(actual.z - shifted.z),
+            ) > tolerance_m:
+                raise RuntimeError(
+                    "near-cube preflight recovery User X- shift target was not reached"
+                )
+        with self._timed_stage("bottom_near_cube_preflight_recovery_lower"):
+            self._bottom_center_linear_z(
+                current.z,
+                motion,
+                "near-cube preflight recovery table return",
+                lifting=False,
+                target_xy=(shifted.x, shifted.y),
+            )
+        with self._timed_stage("bottom_near_cube_preflight_recovery_release"):
+            current_position = self.gripper.read_position()
+            self.gripper.set_position(1.0, wait=False)
+            self.gripper.wait_until_stopped(
+                timeout_s=float(self.get_parameter("dh_timeout_s").value),
+                target_position=1.0,
+                initial_position=current_position,
+                cancel_check=self._cycle_cancel_requested,
+            )
+        return self._current_command_pose()
+
     def _wait_for_bottom_center_tracked_pose(
         self, *, reference_xy: Optional[tuple[float, float]] = None
     ) -> TcpPose:
@@ -6944,44 +7090,89 @@ class CosmeticBoxSingleArmNode(Node):
                 initial_rx_deg,
                 "near-cube bottom flip pickup Tool-Rx rotation",
             )
+
+        def run_preflight() -> float:
+            requested_lift_m = lift_m
+            candidate_lifts_m = [requested_lift_m]
+            while candidate_lifts_m[-1] > 0.020 + 1e-9:
+                candidate_lifts_m.append(
+                    max(0.020, candidate_lifts_m[-1] - 0.005)
+                )
+            last_preflight_error: Optional[RuntimeError] = None
+            for candidate_lift_m in candidate_lifts_m:
+                try:
+                    self._preflight_near_cube_bottom_flip(
+                        grasp_pose.z,
+                        candidate_lift_m,
+                        flip_rx_deg,
+                        restore_rx_deg,
+                    )
+                    if candidate_lift_m < requested_lift_m - 1e-9:
+                        self._publish_status(
+                            "near-cube requested flip lift was unreachable at this XY; "
+                            f"using the preflight-verified clearance "
+                            f"{requested_lift_m*1000:.1f}->{candidate_lift_m*1000:.1f}mm"
+                        )
+                    return candidate_lift_m
+                except RuntimeError as exc:
+                    last_preflight_error = exc
+            assert last_preflight_error is not None
+            raise last_preflight_error
+
         with self._timed_stage("bottom_near_cube_motion_preflight"):
             try:
-                requested_lift_m = lift_m
-                candidate_lifts_m = [requested_lift_m]
-                while candidate_lifts_m[-1] > 0.020 + 1e-9:
-                    candidate_lifts_m.append(
-                        max(0.020, candidate_lifts_m[-1] - 0.005)
-                    )
-                last_preflight_error: Optional[RuntimeError] = None
-                for candidate_lift_m in candidate_lifts_m:
-                    try:
-                        self._preflight_near_cube_bottom_flip(
-                            grasp_pose.z,
-                            candidate_lift_m,
-                            flip_rx_deg,
-                            restore_rx_deg,
-                        )
-                        lift_m = candidate_lift_m
-                        break
-                    except RuntimeError as exc:
-                        last_preflight_error = exc
-                else:
-                    assert last_preflight_error is not None
-                    raise last_preflight_error
-                if lift_m < requested_lift_m - 1e-9:
-                    self._publish_status(
-                        "near-cube requested flip lift was unreachable at this XY; "
-                        f"using the preflight-verified clearance "
-                        f"{requested_lift_m*1000:.1f}->{lift_m*1000:.1f}mm"
-                    )
-            except RuntimeError:
-                # The jaws are still open. Recover the known upright attitude
-                # so an unreachable later pose cannot strand a held object.
+                lift_m = run_preflight()
+            except RuntimeError as _first_preflight_error:
+                # The jaws are still open. Recover the known upright attitude,
+                # move the box once toward User X-, and retry at the new XY.
+                self._publish_status(
+                    "near-cube flip preflight failed at the original XY; "
+                    "starting one-time User X- relocation recovery"
+                )
                 self._bottom_center_tool_rx(
                     -initial_rx_deg,
                     "near-cube preflight failure upright recovery",
                 )
-                raise
+                recovery_lift_m = float(
+                    self.get_parameter(
+                        "bottom_near_cube_preflight_recovery_lift_m"
+                    ).value
+                )
+                recovery_shift_m = float(
+                    self.get_parameter(
+                        "bottom_near_cube_preflight_recovery_shift_m"
+                    ).value
+                )
+                with self._timed_stage("bottom_near_cube_preflight_recovery"):
+                    self._relocate_near_cube_after_preflight_failure(
+                        max_opening,
+                        motion,
+                        lift_m=recovery_lift_m,
+                        shift_m=recovery_shift_m,
+                    )
+                with self._timed_stage("bottom_near_cube_tool_rx_minus_45_retry"):
+                    self._bottom_center_tool_rx(
+                        initial_rx_deg,
+                        "near-cube retry pickup Tool-Rx rotation",
+                    )
+                grasp_pose = self._current_command_pose()
+                self._publish_status(
+                    "near-cube preflight fallback relocated the box; "
+                    "retrying the normal bottom flip at the new XY"
+                )
+                try:
+                    lift_m = run_preflight()
+                except RuntimeError:
+                    # The retry preflight leaves the jaws open at -45deg;
+                    # restore the upright attitude before propagating the fault.
+                    try:
+                        self._bottom_center_tool_rx(
+                            -initial_rx_deg,
+                            "near-cube retry preflight failure upright recovery",
+                        )
+                    except RuntimeError:
+                        pass
+                    raise
         with self._timed_stage("bottom_near_cube_close"):
             self.gripper.set_force(int(self.get_parameter("dh_grasp_force").value))
             self.gripper.close(

@@ -343,6 +343,20 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
+                "bottom_near_cube_preflight_recovery_lift_m",
+                default_value="0.020",
+                description=(
+                    "Fallback lift used after an unreachable near-cube flip preflight"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_preflight_recovery_shift_m",
+                default_value="0.030",
+                description=(
+                    "Fallback User X- shift used before retrying a near-cube flip"
+                ),
+            ),
+            DeclareLaunchArgument(
                 "bottom_start_j6_zero_threshold_deg",
                 default_value="40.0",
                 description=(
@@ -1081,6 +1095,18 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "bottom_near_cube_flip_lift_m": ParameterValue(
                             LaunchConfiguration("bottom_near_cube_flip_lift_m"),
+                            value_type=float,
+                        ),
+                        "bottom_near_cube_preflight_recovery_lift_m": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_near_cube_preflight_recovery_lift_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "bottom_near_cube_preflight_recovery_shift_m": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_near_cube_preflight_recovery_shift_m"
+                            ),
                             value_type=float,
                         ),
                         "bottom_start_j6_zero_threshold_deg": ParameterValue(
