@@ -1,0 +1,1399 @@
+"""V4 launch fork with an independent detail-ROI/CUDA D435 scanner.
+
+The regular ``cosmetic_box_single_arm_cycle_v3.launch.py`` is deliberately
+unchanged.  This launch keeps the same V3 arm and D405 processes, but starts
+``d435_turntable_barcode_node_fast`` with the copied detector and its separate
+fast-path parameters.
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+
+# The V3 D405 process remains beside its SAM2/FFS resources in the vision
+# repository, but has its own entry point so V3 UI behavior cannot alter V2.
+VISION_SCRIPT = (
+    "/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/dul_cam/"
+    "d405_cosmetic_box_leftmost_height75_panel_v4.py"
+)
+
+
+def generate_launch_description() -> LaunchDescription:
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "vision_python",
+                default_value="/home/zdh/miniconda3/envs/ffs_ros/bin/python",
+                description="Python environment containing CUDA FFS, SAM2, RealSense, Open3D and ROS 2",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_serial",
+                default_value="254322071102",
+                description="D435 serial used only for turntable side-barcode detection",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_color_width",
+                default_value="1280",
+                description="Fast-D435 RGB stream width",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_color_height",
+                default_value="720",
+                description="Fast-D435 RGB stream height",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_fps",
+                default_value="30",
+                description="Fast-D435 RGB stream frame rate",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_confidence",
+                default_value="0.40",
+                description="Presence-only YOLO confidence threshold for D435 barcode detection",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_yolo_stable_hits",
+                default_value="2",
+                description="Spatially consistent YOLO frames required before D435 confirms a barcode",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_model_path",
+                default_value="/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_0929.onnx",
+                description="Fast D435 ONNX barcode detector exported from best_0929.pt",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_inference_provider",
+                default_value="cuda",
+                description="ONNX provider when using ONNX weights; PT uses Ultralytics/PyTorch",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_require_cuda",
+                default_value="true",
+                description="Require CUDAExecutionProvider and forbid CPU fallback",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_image_size",
+                default_value="640",
+                description="YOLO inference size; 640 matches training and the fixed ONNX export",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_scanner_assist",
+                default_value="true",
+                description="Use fast camera-scanner pattern detection before the YOLO fallback",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_scanner_assist_hits",
+                default_value="3",
+                description="Spatially stable scanner-pattern frames required for confirmation",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_wide_roi_fallback",
+                default_value="true",
+                description="Retry overlapping sharpened views when full wide-ROI YOLO misses",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_wide_roi_tile_fraction",
+                default_value="0.70",
+                description="Width fraction of each overlapping D435 fallback tile",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_wide_roi_unsharp_amount",
+                default_value="1.0",
+                description="Unsharp strength applied only to D435 fallback tiles",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detail_roi_x",
+                default_value="155",
+                description="Fixed D435 detail crop left coordinate; unused when crop is disabled",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detail_roi_y",
+                default_value="65",
+                description="Fixed D435 detail crop top coordinate; unused when crop is disabled",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detail_roi_width",
+                default_value="1120",
+                description="Fixed D435 detail crop width; 0 disables the crop",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detail_roi_height",
+                default_value="565",
+                description="Fixed D435 detail crop height; 0 disables the crop",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_full_frame_interval",
+                default_value="6",
+                description="Run a full-frame D435 YOLO pass every N detection frames",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_min_candidate_area_ratio",
+                default_value="0.01",
+                description="Reject tiny D435 YOLO boxes below this ROI area fraction",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_moving_stripes",
+                default_value="false",
+                description="Full-frame moving 1-D stripe fallback when the barcode model misses",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_preview_interval_s",
+                default_value="0.100",
+                description="Fast-D435 preview interval; detection still uses every acquired frame",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_preview_jpeg_quality",
+                default_value="92",
+                description="JPEG quality of the local D435 preview only",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_sample_dir",
+                default_value="/home/zdh/ffs_ws/d435_barcode_samples",
+                description="Directory for full-resolution D435 PNGs saved with Space",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_detect_interval_s",
+                default_value="0.0",
+                description="Minimum D435 inference interval; zero processes every acquired frame",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_auto_exposure",
+                default_value="false",
+                description="Use D435 RGB auto exposure; false is recommended for a moving turntable",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_exposure",
+                default_value="120",
+                description="D435 RGB manual exposure for motion-freezing barcode images",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_gain",
+                default_value="128",
+                description="D435 RGB manual gain used to brighten the short-exposure moving image",
+            ),
+            DeclareLaunchArgument("turntable_d435_roi_x", default_value="0"),
+            DeclareLaunchArgument("turntable_d435_roi_y", default_value="0"),
+            DeclareLaunchArgument(
+                "turntable_d435_roi_width",
+                default_value="0",
+                description="D435 ROI width; zero uses the remaining image width",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_roi_height",
+                default_value="0",
+                description="D435 ROI height; zero uses the remaining image height",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_preview",
+                default_value="true",
+                description=(
+                    "Publish D435 into the combined D405 window; left-drag "
+                    "selects ROI and right-click restores full-frame detection"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_continuous_on_start",
+                default_value="true",
+                description="Keep D435 barcode presence detection active from startup",
+            ),
+            DeclareLaunchArgument(
+                "turntable_do_index",
+                default_value="1",
+                description="101 controller-cabinet DO wired to the turntable toggle input",
+            ),
+            DeclareLaunchArgument(
+                "turntable_pulse_ms",
+                default_value="100",
+                description=(
+                    "Field-calibrated high hold for turntable start, midpoint "
+                    "stop and restart pulses"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_stop_pulse_ms",
+                default_value="300",
+                description=(
+                    "Reliable high hold for final/operator turntable stop pulses; "
+                    "the field input intermittently missed 100ms final stop pulses"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_scan_timeout_s",
+                default_value="3.0",
+                description=(
+                    "Fast D435 rotating search window measured after each completed "
+                    "start/restart pulse; 3.6s is one calibrated revolution"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_mid_scan_restart_s",
+                default_value="1.4",
+                description=(
+                    "Fast-only offset inside the rotating scan window for "
+                    "the midpoint stop/start pulse pair; zero disables it"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_mid_scan_low_hold_ms",
+                default_value="100",
+                description=(
+                    "Low-state hold between the Fast midpoint stop and restart "
+                    "rising edges; 50ms was rejected by the field controller, "
+                    "while 100ms keeps about 200ms total edge separation"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_stationary_barcode_check_s",
+                default_value="0.15",
+                description="Fast check of the already-visible stopped face before rotation",
+            ),
+            DeclareLaunchArgument(
+                "turntable_settle_s",
+                default_value="0.05",
+                description="Fast wait after stop pulse before requesting a fresh D405 target",
+            ),
+            DeclareLaunchArgument(
+                "turntable_assume_stopped_on_start",
+                default_value="false",
+                description="Set true only after physically confirming the turntable is stopped",
+            ),
+            DeclareLaunchArgument(
+                "turntable_require_place_done",
+                default_value="true",
+                description="Require either the passive 102 place/retreat trigger or /turntable_place_done",
+            ),
+            DeclareLaunchArgument(
+                "turntable_auto_place_from_secondary_tcp",
+                default_value="true",
+                description="Passively infer right-arm placement and retreat from read-only 102 TCP feedback",
+            ),
+            DeclareLaunchArgument(
+                "turntable_secondary_place_y_m",
+                default_value="0.400",
+                description="102 User-0/Tool-1 TCP Y boundary entered during turntable placement",
+            ),
+            DeclareLaunchArgument(
+                "turntable_secondary_safe_z_m",
+                default_value="0.200",
+                description="Deprecated compatibility argument; 102 TCP Z is not used by the automatic turntable trigger",
+            ),
+            DeclareLaunchArgument(
+                "turntable_secondary_safe_z_stable_s",
+                default_value="0.0",
+                description="Trigger immediately on the first fresh 102 TCP sample with Y below 400 mm after place-side entry",
+            ),
+            DeclareLaunchArgument(
+                "turntable_surface_z_m",
+                default_value="0.164",
+                description="Measured User-0/Tool-1 turntable material-support surface Z (164 mm on this cell)",
+            ),
+            DeclareLaunchArgument(
+                "vision_user_z_bias_m",
+                default_value="0.0287",
+                description="V3-only D405 field correction added to transformed User-0 target Z",
+            ),
+            DeclareLaunchArgument(
+                "near_square_nearest_grasp_enabled",
+                default_value="true",
+                description=(
+                    "For near-square top footprints, choose the Tool-Y edge "
+                    "alignment requiring the least Tool-1 rotation"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "near_square_grasp_aspect_ratio",
+                default_value="1.20",
+                description=(
+                    "Maximum long/short top-edge ratio treated as near-square "
+                    "for nearest-orientation grasping"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "near_square_long_axis_min_clearance_m",
+                default_value="0.005",
+                description=(
+                    "Minimum spare gripper opening required before allowing "
+                    "a near-square grasp that closes across the long edge"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_flip_enabled",
+                default_value="true",
+                description=(
+                    "Use the Tool-Rx -45/+90/-45 bottom-to-side table flip "
+                    "for genuinely cube-like boxes"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_max_dimension_ratio",
+                default_value="1.35",
+                description=(
+                    "Maximum max/min ratio across D405 length, physical width "
+                    "and height for the near-cube bottom flip"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_flip_lift_m",
+                default_value="0.030",
+                description=(
+                    "Short vertical clearance used by the near-cube Tool-Rx flip"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_preflight_recovery_lift_m",
+                default_value="0.020",
+                description=(
+                    "Fallback lift used after an unreachable near-cube flip preflight"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_preflight_recovery_shift_m",
+                default_value="0.060",
+                description=(
+                    "Fallback User X- shift used before retrying a near-cube flip"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_start_j6_zero_threshold_deg",
+                default_value="40.0",
+                description=(
+                    "Re-place a bottom-face box with J6=0 when its initial "
+                    "absolute J6 angle reaches this threshold"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "turntable_surface_tolerance_m",
+                default_value="0.020",
+                description="Maximum D405-derived support-plane error relative to turntable top",
+            ),
+            DeclareLaunchArgument(
+                "turntable_tcp_below_target_m",
+                default_value="0.0",
+                description="Measured gripper/tool extension below the commanded grasp TCP",
+            ),
+            DeclareLaunchArgument(
+                "turntable_surface_clearance_m",
+                default_value="0.003",
+                description="Required gripper clearance above the turntable surface",
+            ),
+            DeclareLaunchArgument(
+                "grasp_z_offset_m",
+                default_value="-0.004",
+                description="V3 grasp TCP Z correction; negative descends deeper while the turntable floor remains enforced",
+            ),
+            DeclareLaunchArgument(
+                "motion_speed_scale_percent",
+                default_value="400",
+                description="Unified motion scale; 100 is the legacy effective-speed baseline and 400 is the current faster default",
+            ),
+            DeclareLaunchArgument(
+                "motion_command_cap_percent",
+                default_value="20",
+                description="V3 commissioning ceiling for every ordinary robot speed and acceleration command",
+            ),
+            DeclareLaunchArgument(
+                "barcode_continuous_rotation",
+                default_value="true",
+                description=(
+                    "Sweep J6 continuously through 270 degrees and snap a detected "
+                    "barcode to the nearest 90-degree face; set false for segmented search"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "scanner_transfer_barcode_grace_s",
+                default_value="0.06",
+                description=(
+                    "Wait briefly at transfer_joint for a late HID callback before "
+                    "starting the monitored scanner approach"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "scanner_retreat_post_scan_blend_enabled",
+                default_value="true",
+                description=(
+                    "Queue the post-scan safe-height motion before the scanner "
+                    "retreat reaches its endpoint"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "scanner_retreat_post_scan_blend_cp",
+                default_value="20",
+                description="Dobot CP blending ratio for scanner retreat to post-scan motion",
+            ),
+            DeclareLaunchArgument(
+                "scanner_retreat_post_scan_queue_lead_m",
+                default_value="0.010",
+                description=(
+                    "Distance before scanner-retreat endpoint at which post-scan "
+                    "motion is queued (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "scanner_retreat_post_scan_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Grace period for first feedback after scanner-retreat queue "
+                    "submission (s)"
+                ),
+            ),
+            DeclareLaunchArgument("offset_grasp_enabled", default_value="true",
+                                  description="Use side offset descent and low-height insertion for top barcode observation"),
+            DeclareLaunchArgument(
+                "turntable_top_grasp_max_tilt_deg",
+                default_value="30.0",
+                description="Maximum raw D405 Tool-Z tilt from downward vertical before levelling",
+            ),
+            DeclareLaunchArgument("offset_grasp_clearance_m", default_value="0.020"),
+            DeclareLaunchArgument("offset_finger_span_m", default_value="0.060"),
+            DeclareLaunchArgument(
+                "offset_high_clearance_m",
+                default_value="0.120",
+                description=(
+                    "Offset-high clearance above grasp depth; lateral motion, "
+                    "orientation alignment and partial descent share one PTP"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "side_barcode_direct_hover_clearance_m",
+                default_value="0.050",
+                description=(
+                    "Clearance above the D405 grasp target for the diagonal "
+                    "side-barcode approach before its vertical descent (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "offset_high_descent_blend_enabled",
+                default_value="false",
+                description=(
+                    "Queue offset-high to descent only outside turntable mode; "
+                    "turntable mode verifies attitude at offset-high first"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "offset_high_descent_blend_cp",
+                default_value="20",
+                description="Dobot CP blending ratio for offset-high to descent",
+            ),
+            DeclareLaunchArgument(
+                "offset_high_descent_queue_lead_m",
+                default_value="0.030",
+                description=(
+                    "Distance before offset-high at which the descent is queued (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "offset_high_descent_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Grace period for first feedback after offset-high submission (s)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "startup_joint_skip_tolerance_deg",
+                default_value="1.0",
+                description=(
+                    "Skip a redundant startup MovJ when every joint is already "
+                    "within this feedback tolerance; zero disables the optimization"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "top_surface_barcode_enabled",
+                default_value="true",
+                description=(
+                    "Check the current target region during approach, hover and descent; "
+                    "when found, place without scanner/J6/Ry/Rz rotation"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "top_surface_barcode_stable_hits",
+                default_value="2",
+                description="Number of D405 top-surface YOLO barcode detections required",
+            ),
+            DeclareLaunchArgument(
+                "top_surface_barcode_wait_s",
+                default_value="0.20",
+                description="Maximum hover time to wait for top-surface barcode confirmation",
+            ),
+            DeclareLaunchArgument(
+                "bottom_barcode_recovery_enabled",
+                default_value="true",
+                description=(
+                    "When top and all side faces have no barcode, place on the table, "
+                    "flip User Ry- and retry the bottom face"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_user_ry_target_deg",
+                default_value="-45.0",
+                description="User-Ry target for the bottom-barcode table flip",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_j6_pre_return_deg",
+                default_value="90.0",
+                description="J6 positive return after an unsuccessful -270deg face sweep",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_table_retract_m",
+                default_value="0.050",
+                description="Extra User-X- clearance before placing the box on the table (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_table_z_offset_m",
+                default_value="0.010",
+                description="Clearance retained when reversing the first grasp lift (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_lift_m",
+                default_value="0.160",
+                description="Vertical lift after bottom-face table regrasp (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_flip_post_turn_descent_m",
+                default_value="0.120",
+                description="Descent after the J6 half-turn before second release (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_tracking_timeout_s",
+                default_value="2.0",
+                description="Wait for a fresh D405 target before the final regrasp",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_final_regrasp_max_xy_shift_m",
+                default_value="0.060",
+                description="Maximum D405 XY shift before the final bottom regrasp (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_first_rz_delta_deg",
+                default_value="40.0",
+                description="Turntable bottom recovery User-Rz rotation before first release",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_first_tool_rx_delta_deg",
+                default_value="70.0",
+                description="Tool-Rx rotation after the first turntable release",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_long_box_length_threshold_m",
+                default_value="0.150",
+                description="Box length above which the short-end shift is applied (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_gripper_cavity_half_length_m",
+                default_value="0.080",
+                description="Conservative usable gripper cavity from TCP toward one short end (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_long_box_offset_margin_m",
+                default_value="0.010",
+                description="Extra short-end clearance before the first Tool-Rx roll (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_center_release_tool_rx_delta_deg",
+                default_value="70.0",
+                description="Tool-Rx rotation after the second release and J6 half-turn",
+            ),
+            DeclareLaunchArgument(
+                "bottom_barcode_place_ry_delta_deg",
+                default_value="-45.0",
+                description=(
+                    "Additional User-Ry rotation at fixed bottom-barcode place pose"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "side_barcode_place_rx_delta_deg",
+                default_value="-20.0",
+                description=(
+                    "User-Rx tilt for side-barcode fixed placement"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "d435_side_face_reference_joint_deg",
+                default_value="0.0",
+                description="J6 reference for the D435 side-barcode 90-degree face grid",
+            ),
+            DeclareLaunchArgument(
+                "handoff_clearance_enabled",
+                default_value="true",
+                description=(
+                    "Enable all D405 handoff/finger obstacle prevention; "
+                    "set false only for controlled commissioning"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "handoff_overhead_clearance_enabled",
+                default_value="true",
+                description=(
+                    "Enable the D405 overhead/right-corridor check (purple overlay); "
+                    "set false to keep finger-path protection while hiding this check"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "secondary_collision_check_enabled",
+                default_value="true",
+                description=(
+                    "Enable the 102 read-only TCP Y-clearance interlock for 101; "
+                    "set false to run without 102 feedback protection"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_speed_factor",
+                default_value="100",
+                description="Effective grasp-lift speed percentage",
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_acc_factor",
+                default_value="100",
+                description="Effective grasp-lift acceleration percentage",
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_transfer_blend_enabled",
+                default_value="false",
+                description=(
+                    "Legacy non-turntable option; turntable pickup always completes "
+                    "a straight safe-height lift before any transfer"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_transfer_blend_cp",
+                default_value="20",
+                description="Dobot CP blending ratio for the grasp-lift to transfer transition",
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_transfer_queue_lead_m",
+                default_value="0.010",
+                description=(
+                    "Distance before the lift endpoint at which the transfer "
+                    "joint is queued (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "grasp_lift_transfer_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Grace period for first feedback after submitting the lift "
+                    "before falling back to the blocking transfer path (s)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "post_scan_place_blend_enabled",
+                default_value="true",
+                description=(
+                    "Queue the fixed placement PTP near the end of the post-scan "
+                    "safe-height PTP when the side-barcode path is active"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "post_scan_place_blend_cp",
+                default_value="20",
+                description="Dobot CP blending ratio for safe-height to fixed-placement transition",
+            ),
+            DeclareLaunchArgument(
+                "post_scan_place_queue_lead_m",
+                default_value="0.020",
+                description=(
+                    "Distance before the post-scan safe-height endpoint at which "
+                    "fixed placement is queued (m)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "post_scan_place_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Grace period for first feedback after submitting the safe-height "
+                    "move before falling back to the blocking placement path (s)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_departure_place_blend_enabled",
+                default_value="true",
+                description=(
+                    "Fast-only camera-safe path that keeps XY over the turntable "
+                    "until the configured clearance Z, then blends toward placement"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_departure_place_blend_cp",
+                default_value="60",
+                description="CP ratio for the fast rising-transfer placement path",
+            ),
+            DeclareLaunchArgument(
+                "fast_side_camera_clearance_z_m",
+                default_value="0.260",
+                description=(
+                    "Absolute TCP User-Z at which XY may start moving toward the "
+                    "placement area"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_rise_after_camera_clearance_m",
+                default_value="0.005",
+                description=(
+                    "Additional Z rise while approaching the placement-area high "
+                    "waypoint after clearing the front camera"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_departure_place_queue_lead_m",
+                default_value="0.100",
+                description=(
+                    "Distance before the placement-area high waypoint at which "
+                    "the final placement PTP is queued"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "fast_side_departure_place_command_start_grace_s",
+                default_value="0.30",
+                description=(
+                    "Wait for controller command-ID feedback before deciding "
+                    "that the fast rising transfer finished without reaching its gate"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "joint_acc",
+                default_value="65",
+                description="Joint acceleration baseline used by move-above/pregrasp PTP",
+            ),
+            DeclareLaunchArgument(
+                "linear_speed",
+                default_value="65",
+                description="Linear grasp-descent speed baseline",
+            ),
+            DeclareLaunchArgument(
+                "linear_acc",
+                default_value="65",
+                description="Linear grasp-descent acceleration baseline",
+            ),
+            DeclareLaunchArgument(
+                "scanner_approach_natural_finish_margin_m",
+                default_value="0.015",
+                description=(
+                    "Allow a safe bounded scanner approach to finish naturally when "
+                    "barcode arrives within this remaining distance"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "placement_surface_z_m",
+                default_value="0.060",
+                description="User-frame placement surface height in meters",
+            ),
+            DeclareLaunchArgument(
+                "placement_safety_margin_m",
+                default_value="0.010",
+                description=(
+                    "Additional User-Z clearance above half the measured material "
+                    "length during barcode-up placement"
+                ),
+            ),
+            ExecuteProcess(
+                cmd=[
+                    LaunchConfiguration("vision_python"),
+                    VISION_SCRIPT,
+                    "--ros-args",
+                    "-p",
+                    [
+                        "handoff_clearance_enabled:=",
+                        LaunchConfiguration("handoff_clearance_enabled"),
+                    ],
+                    "-p",
+                    [
+                        "handoff_overhead_clearance_enabled:=",
+                        LaunchConfiguration("handoff_overhead_clearance_enabled"),
+                    ],
+                    "-p",
+                    [
+                        "top_surface_barcode_stable_hits:=",
+                        LaunchConfiguration("top_surface_barcode_stable_hits"),
+                    ],
+                    "-p",
+                    [
+                        "top_surface_barcode_enabled:=",
+                        LaunchConfiguration("top_surface_barcode_enabled"),
+                    ],
+                ],
+                output="screen",
+            ),
+            ExecuteProcess(
+                cmd=[
+                    LaunchConfiguration("vision_python"),
+                    "-m",
+                    "dobot_nova5_driver.d435_turntable_barcode_node_fast",
+                    "--ros-args",
+                    "-p",
+                    [
+                        # ROS CLI parses an all-digit value as an integer.  The
+                        # RealSense serial is a string parameter, so retain
+                        # literal YAML quotes in the generated argv value.
+                        "serial_number:='",
+                        LaunchConfiguration("turntable_d435_serial"),
+                        "'",
+                    ],
+                    "-p",
+                    [
+                        "color_width:=",
+                        LaunchConfiguration("turntable_d435_color_width"),
+                    ],
+                    "-p",
+                    [
+                        "color_height:=",
+                        LaunchConfiguration("turntable_d435_color_height"),
+                    ],
+                    "-p",
+                    [
+                        "fps:=",
+                        LaunchConfiguration("turntable_d435_fps"),
+                    ],
+                    "-p",
+                    [
+                        "model_path:=",
+                        LaunchConfiguration("turntable_d435_model_path"),
+                    ],
+                    "-p",
+                    [
+                        "model_confidence:=",
+                        LaunchConfiguration("turntable_d435_confidence"),
+                    ],
+                    "-p",
+                    [
+                        "inference_provider:=",
+                        LaunchConfiguration("turntable_d435_inference_provider"),
+                    ],
+                    "-p",
+                    [
+                        "require_cuda:=",
+                        LaunchConfiguration("turntable_d435_require_cuda"),
+                    ],
+                    "-p",
+                    [
+                        "stable_hits:=",
+                        LaunchConfiguration("turntable_d435_yolo_stable_hits"),
+                    ],
+                    "-p",
+                    [
+                        "model_image_size:=",
+                        LaunchConfiguration("turntable_d435_image_size"),
+                    ],
+                    "-p",
+                    [
+                        "scanner_assist_enabled:=",
+                        LaunchConfiguration("turntable_d435_scanner_assist"),
+                    ],
+                    "-p",
+                    [
+                        "scanner_assist_stable_hits:=",
+                        LaunchConfiguration("turntable_d435_scanner_assist_hits"),
+                    ],
+                    "-p",
+                    [
+                        "wide_roi_fallback_enabled:=",
+                        LaunchConfiguration("turntable_d435_wide_roi_fallback"),
+                    ],
+                    "-p",
+                    [
+                        "wide_roi_tile_fraction:=",
+                        LaunchConfiguration("turntable_d435_wide_roi_tile_fraction"),
+                    ],
+                    "-p",
+                    [
+                        "wide_roi_unsharp_amount:=",
+                        LaunchConfiguration("turntable_d435_wide_roi_unsharp_amount"),
+                    ],
+                    "-p",
+                    [
+                        "detail_roi_x:=",
+                        LaunchConfiguration("turntable_d435_detail_roi_x"),
+                    ],
+                    "-p",
+                    [
+                        "detail_roi_y:=",
+                        LaunchConfiguration("turntable_d435_detail_roi_y"),
+                    ],
+                    "-p",
+                    [
+                        "detail_roi_width:=",
+                        LaunchConfiguration("turntable_d435_detail_roi_width"),
+                    ],
+                    "-p",
+                    [
+                        "detail_roi_height:=",
+                        LaunchConfiguration("turntable_d435_detail_roi_height"),
+                    ],
+                    "-p",
+                    [
+                        "full_frame_interval:=",
+                        LaunchConfiguration("turntable_d435_full_frame_interval"),
+                    ],
+                    "-p",
+                    [
+                        "yolo_min_candidate_area_ratio:=",
+                        LaunchConfiguration("turntable_d435_min_candidate_area_ratio"),
+                    ],
+                    "-p",
+                    [
+                        "moving_stripes_enabled:=",
+                        LaunchConfiguration("turntable_d435_moving_stripes"),
+                    ],
+                    "-p",
+                    [
+                        "preview_publish_interval_s:=",
+                        LaunchConfiguration("turntable_d435_preview_interval_s"),
+                    ],
+                    "-p",
+                    [
+                        "preview_jpeg_quality:=",
+                        LaunchConfiguration("turntable_d435_preview_jpeg_quality"),
+                    ],
+                    "-p",
+                    [
+                        "sample_save_dir:=",
+                        LaunchConfiguration("turntable_d435_sample_dir"),
+                    ],
+                    "-p",
+                    [
+                        "detect_interval_s:=",
+                        LaunchConfiguration("turntable_d435_detect_interval_s"),
+                    ],
+                    "-p",
+                    [
+                        "auto_exposure:=",
+                        LaunchConfiguration("turntable_d435_auto_exposure"),
+                    ],
+                    "-p",
+                    [
+                        "exposure:=",
+                        LaunchConfiguration("turntable_d435_exposure"),
+                    ],
+                    "-p",
+                    [
+                        "gain:=",
+                        LaunchConfiguration("turntable_d435_gain"),
+                    ],
+                    "-p",
+                    ["roi_x:=", LaunchConfiguration("turntable_d435_roi_x")],
+                    "-p",
+                    ["roi_y:=", LaunchConfiguration("turntable_d435_roi_y")],
+                    "-p",
+                    [
+                        "roi_width:=",
+                        LaunchConfiguration("turntable_d435_roi_width"),
+                    ],
+                    "-p",
+                    [
+                        "roi_height:=",
+                        LaunchConfiguration("turntable_d435_roi_height"),
+                    ],
+                    "-p",
+                    [
+                        "preview:=",
+                        LaunchConfiguration("turntable_d435_preview"),
+                    ],
+                ],
+                output="screen",
+            ),
+            Node(
+                package="dobot_nova5_driver",
+                executable="nova5_cosmetic_box_cycle_v4",
+                name="nova5_cosmetic_box_single_arm_cycle_v4",
+                output="screen",
+                parameters=[
+                    {
+                        "turntable_do_index": ParameterValue(
+                            LaunchConfiguration("turntable_do_index"),
+                            value_type=int,
+                        ),
+                        "turntable_pulse_ms": ParameterValue(
+                            LaunchConfiguration("turntable_pulse_ms"),
+                            value_type=int,
+                        ),
+                        "turntable_stop_pulse_ms": ParameterValue(
+                            LaunchConfiguration("turntable_stop_pulse_ms"),
+                            value_type=int,
+                        ),
+                        "turntable_scan_timeout_s": ParameterValue(
+                            LaunchConfiguration("turntable_scan_timeout_s"),
+                            value_type=float,
+                        ),
+                        "turntable_mid_scan_restart_s": ParameterValue(
+                            LaunchConfiguration("turntable_mid_scan_restart_s"),
+                            value_type=float,
+                        ),
+                        "turntable_mid_scan_low_hold_ms": ParameterValue(
+                            LaunchConfiguration("turntable_mid_scan_low_hold_ms"),
+                            value_type=int,
+                        ),
+                        "turntable_stationary_barcode_check_s": ParameterValue(
+                            LaunchConfiguration("turntable_stationary_barcode_check_s"),
+                            value_type=float,
+                        ),
+                        "turntable_settle_s": ParameterValue(
+                            LaunchConfiguration("turntable_settle_s"),
+                            value_type=float,
+                        ),
+                        "d435_continuous_on_start": ParameterValue(
+                            LaunchConfiguration("turntable_d435_continuous_on_start"),
+                            value_type=bool,
+                        ),
+                        "turntable_assume_stopped_on_start": ParameterValue(
+                            LaunchConfiguration("turntable_assume_stopped_on_start"),
+                            value_type=bool,
+                        ),
+                        "turntable_require_place_done": ParameterValue(
+                            LaunchConfiguration("turntable_require_place_done"),
+                            value_type=bool,
+                        ),
+                        "turntable_auto_place_from_secondary_tcp": ParameterValue(
+                            LaunchConfiguration("turntable_auto_place_from_secondary_tcp"),
+                            value_type=bool,
+                        ),
+                        "turntable_secondary_place_y_m": ParameterValue(
+                            LaunchConfiguration("turntable_secondary_place_y_m"),
+                            value_type=float,
+                        ),
+                        "turntable_secondary_safe_z_m": ParameterValue(
+                            LaunchConfiguration("turntable_secondary_safe_z_m"),
+                            value_type=float,
+                        ),
+                        "turntable_secondary_safe_z_stable_s": ParameterValue(
+                            LaunchConfiguration("turntable_secondary_safe_z_stable_s"),
+                            value_type=float,
+                        ),
+                        "turntable_surface_z_m": ParameterValue(
+                            LaunchConfiguration("turntable_surface_z_m"),
+                            value_type=float,
+                        ),
+                        "vision_user_z_bias_m": ParameterValue(
+                            LaunchConfiguration("vision_user_z_bias_m"),
+                            value_type=float,
+                        ),
+                        "near_square_nearest_grasp_enabled": ParameterValue(
+                            LaunchConfiguration(
+                                "near_square_nearest_grasp_enabled"
+                            ),
+                            value_type=bool,
+                        ),
+                        "near_square_grasp_aspect_ratio": ParameterValue(
+                            LaunchConfiguration("near_square_grasp_aspect_ratio"),
+                            value_type=float,
+                        ),
+                        "near_square_long_axis_min_clearance_m": ParameterValue(
+                            LaunchConfiguration(
+                                "near_square_long_axis_min_clearance_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "bottom_near_cube_flip_enabled": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_flip_enabled"),
+                            value_type=bool,
+                        ),
+                        "bottom_near_cube_max_dimension_ratio": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_near_cube_max_dimension_ratio"
+                            ),
+                            value_type=float,
+                        ),
+                        "bottom_near_cube_flip_lift_m": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_flip_lift_m"),
+                            value_type=float,
+                        ),
+                        "bottom_near_cube_preflight_recovery_lift_m": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_near_cube_preflight_recovery_lift_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "bottom_near_cube_preflight_recovery_shift_m": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_near_cube_preflight_recovery_shift_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "bottom_start_j6_zero_threshold_deg": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_start_j6_zero_threshold_deg"
+                            ),
+                            value_type=float,
+                        ),
+                        "turntable_surface_tolerance_m": ParameterValue(
+                            LaunchConfiguration("turntable_surface_tolerance_m"),
+                            value_type=float,
+                        ),
+                        "turntable_tcp_below_target_m": ParameterValue(
+                            LaunchConfiguration("turntable_tcp_below_target_m"),
+                            value_type=float,
+                        ),
+                        "turntable_surface_clearance_m": ParameterValue(
+                            LaunchConfiguration("turntable_surface_clearance_m"),
+                            value_type=float,
+                        ),
+                        "grasp_z_offset_m": ParameterValue(
+                            LaunchConfiguration("grasp_z_offset_m"),
+                            value_type=float,
+                        ),
+                        "secondary_collision_check_enabled": ParameterValue(
+                            LaunchConfiguration("secondary_collision_check_enabled"),
+                            value_type=bool,
+                        ),
+                        "motion_speed_scale_percent": ParameterValue(
+                            LaunchConfiguration("motion_speed_scale_percent"),
+                            value_type=int,
+                        ),
+                        "motion_command_cap_percent": ParameterValue(
+                            LaunchConfiguration("motion_command_cap_percent"),
+                            value_type=int,
+                        ),
+                        "barcode_continuous_rotation": ParameterValue(
+                            LaunchConfiguration("barcode_continuous_rotation"),
+                            value_type=bool,
+                        ),
+                        "scanner_transfer_barcode_grace_s": ParameterValue(
+                            LaunchConfiguration("scanner_transfer_barcode_grace_s"),
+                            value_type=float,
+                        ),
+                        "scanner_retreat_post_scan_blend_enabled": ParameterValue(
+                            LaunchConfiguration("scanner_retreat_post_scan_blend_enabled"),
+                            value_type=bool,
+                        ),
+                        "scanner_retreat_post_scan_blend_cp": ParameterValue(
+                            LaunchConfiguration("scanner_retreat_post_scan_blend_cp"),
+                            value_type=int,
+                        ),
+                        "scanner_retreat_post_scan_queue_lead_m": ParameterValue(
+                            LaunchConfiguration("scanner_retreat_post_scan_queue_lead_m"),
+                            value_type=float,
+                        ),
+                        "scanner_retreat_post_scan_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration(
+                                "scanner_retreat_post_scan_command_start_grace_s"
+                            ),
+                            value_type=float,
+                        ),
+                        "offset_grasp_enabled": ParameterValue(LaunchConfiguration("offset_grasp_enabled"), value_type=bool),
+                        "turntable_top_grasp_max_tilt_deg": ParameterValue(
+                            LaunchConfiguration("turntable_top_grasp_max_tilt_deg"),
+                            value_type=float,
+                        ),
+                        "offset_grasp_clearance_m": ParameterValue(LaunchConfiguration("offset_grasp_clearance_m"), value_type=float),
+                        "offset_finger_span_m": ParameterValue(LaunchConfiguration("offset_finger_span_m"), value_type=float),
+                        "offset_high_clearance_m": ParameterValue(
+                            LaunchConfiguration("offset_high_clearance_m"),
+                            value_type=float,
+                        ),
+                        "side_barcode_direct_hover_clearance_m": ParameterValue(
+                            LaunchConfiguration(
+                                "side_barcode_direct_hover_clearance_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "offset_high_descent_blend_enabled": ParameterValue(
+                            LaunchConfiguration("offset_high_descent_blend_enabled"),
+                            value_type=bool,
+                        ),
+                        "offset_high_descent_blend_cp": ParameterValue(
+                            LaunchConfiguration("offset_high_descent_blend_cp"),
+                            value_type=int,
+                        ),
+                        "offset_high_descent_queue_lead_m": ParameterValue(
+                            LaunchConfiguration("offset_high_descent_queue_lead_m"),
+                            value_type=float,
+                        ),
+                        "offset_high_descent_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration(
+                                "offset_high_descent_command_start_grace_s"
+                            ),
+                            value_type=float,
+                        ),
+                        "startup_joint_skip_tolerance_deg": ParameterValue(
+                            LaunchConfiguration("startup_joint_skip_tolerance_deg"),
+                            value_type=float,
+                        ),
+                        "top_surface_barcode_enabled": ParameterValue(
+                            LaunchConfiguration("top_surface_barcode_enabled"),
+                            value_type=bool,
+                        ),
+                        "top_surface_barcode_wait_s": ParameterValue(
+                            LaunchConfiguration("top_surface_barcode_wait_s"),
+                            value_type=float,
+                        ),
+                        "bottom_barcode_recovery_enabled": ParameterValue(
+                            LaunchConfiguration("bottom_barcode_recovery_enabled"),
+                            value_type=bool,
+                        ),
+                        "bottom_flip_user_ry_target_deg": ParameterValue(
+                            LaunchConfiguration("bottom_flip_user_ry_target_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_j6_pre_return_deg": ParameterValue(
+                            LaunchConfiguration("bottom_flip_j6_pre_return_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_table_retract_m": ParameterValue(
+                            LaunchConfiguration("bottom_flip_table_retract_m"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_table_z_offset_m": ParameterValue(
+                            LaunchConfiguration("bottom_flip_table_z_offset_m"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_lift_m": ParameterValue(
+                            LaunchConfiguration("bottom_flip_lift_m"),
+                            value_type=float,
+                        ),
+                        "bottom_flip_post_turn_descent_m": ParameterValue(
+                            LaunchConfiguration("bottom_flip_post_turn_descent_m"),
+                            value_type=float,
+                        ),
+                        "bottom_center_tracking_timeout_s": ParameterValue(
+                            LaunchConfiguration("bottom_center_tracking_timeout_s"),
+                            value_type=float,
+                        ),
+                        "bottom_center_final_regrasp_max_xy_shift_m": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_center_final_regrasp_max_xy_shift_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "bottom_center_first_rz_delta_deg": ParameterValue(
+                            LaunchConfiguration("bottom_center_first_rz_delta_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_center_first_tool_rx_delta_deg": ParameterValue(
+                            LaunchConfiguration("bottom_center_first_tool_rx_delta_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_center_long_box_length_threshold_m": ParameterValue(
+                            LaunchConfiguration(
+                                "bottom_center_long_box_length_threshold_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "bottom_center_gripper_cavity_half_length_m": ParameterValue(
+                            LaunchConfiguration("bottom_center_gripper_cavity_half_length_m"),
+                            value_type=float,
+                        ),
+                        "bottom_center_long_box_offset_margin_m": ParameterValue(
+                            LaunchConfiguration("bottom_center_long_box_offset_margin_m"),
+                            value_type=float,
+                        ),
+                        "bottom_center_release_tool_rx_delta_deg": ParameterValue(
+                            LaunchConfiguration("bottom_center_release_tool_rx_delta_deg"),
+                            value_type=float,
+                        ),
+                        "bottom_barcode_place_ry_delta_deg": ParameterValue(
+                            LaunchConfiguration("bottom_barcode_place_ry_delta_deg"),
+                            value_type=float,
+                        ),
+                        "side_barcode_place_rx_delta_deg": ParameterValue(
+                            LaunchConfiguration("side_barcode_place_rx_delta_deg"),
+                            value_type=float,
+                        ),
+                        "d435_side_face_reference_joint_deg": ParameterValue(
+                            LaunchConfiguration("d435_side_face_reference_joint_deg"),
+                            value_type=float,
+                        ),
+                        "grasp_lift_speed_factor": ParameterValue(
+                            LaunchConfiguration("grasp_lift_speed_factor"),
+                            value_type=int,
+                        ),
+                        "grasp_lift_acc_factor": ParameterValue(
+                            LaunchConfiguration("grasp_lift_acc_factor"),
+                            value_type=int,
+                        ),
+                        "grasp_lift_transfer_blend_enabled": ParameterValue(
+                            LaunchConfiguration("grasp_lift_transfer_blend_enabled"),
+                            value_type=bool,
+                        ),
+                        "grasp_lift_transfer_blend_cp": ParameterValue(
+                            LaunchConfiguration("grasp_lift_transfer_blend_cp"),
+                            value_type=int,
+                        ),
+                        "grasp_lift_transfer_queue_lead_m": ParameterValue(
+                            LaunchConfiguration("grasp_lift_transfer_queue_lead_m"),
+                            value_type=float,
+                        ),
+                        "grasp_lift_transfer_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration("grasp_lift_transfer_command_start_grace_s"),
+                            value_type=float,
+                        ),
+                        "post_scan_place_blend_enabled": ParameterValue(
+                            LaunchConfiguration("post_scan_place_blend_enabled"),
+                            value_type=bool,
+                        ),
+                        "post_scan_place_blend_cp": ParameterValue(
+                            LaunchConfiguration("post_scan_place_blend_cp"),
+                            value_type=int,
+                        ),
+                        "post_scan_place_queue_lead_m": ParameterValue(
+                            LaunchConfiguration("post_scan_place_queue_lead_m"),
+                            value_type=float,
+                        ),
+                        "post_scan_place_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration("post_scan_place_command_start_grace_s"),
+                            value_type=float,
+                        ),
+                        "fast_side_departure_place_blend_enabled": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_departure_place_blend_enabled"
+                            ),
+                            value_type=bool,
+                        ),
+                        "fast_side_departure_place_blend_cp": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_departure_place_blend_cp"
+                            ),
+                            value_type=int,
+                        ),
+                        "fast_side_camera_clearance_z_m": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_camera_clearance_z_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "fast_side_rise_after_camera_clearance_m": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_rise_after_camera_clearance_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "fast_side_departure_place_queue_lead_m": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_departure_place_queue_lead_m"
+                            ),
+                            value_type=float,
+                        ),
+                        "fast_side_departure_place_command_start_grace_s": ParameterValue(
+                            LaunchConfiguration(
+                                "fast_side_departure_place_command_start_grace_s"
+                            ),
+                            value_type=float,
+                        ),
+                        "joint_acc": ParameterValue(
+                            LaunchConfiguration("joint_acc"),
+                            value_type=int,
+                        ),
+                        "linear_speed": ParameterValue(
+                            LaunchConfiguration("linear_speed"),
+                            value_type=int,
+                        ),
+                        "linear_acc": ParameterValue(
+                            LaunchConfiguration("linear_acc"),
+                            value_type=int,
+                        ),
+                        "scanner_approach_natural_finish_margin_m": ParameterValue(
+                            LaunchConfiguration("scanner_approach_natural_finish_margin_m"),
+                            value_type=float,
+                        ),
+                        "placement_surface_z_m": ParameterValue(
+                            LaunchConfiguration("placement_surface_z_m"),
+                            value_type=float,
+                        ),
+                        "placement_safety_margin_m": ParameterValue(
+                            LaunchConfiguration("placement_safety_margin_m"),
+                            value_type=float,
+                        ),
+                    }
+                ],
+            ),
+        ]
+    )
