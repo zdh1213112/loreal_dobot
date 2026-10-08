@@ -508,6 +508,14 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
+                "d405_early_top_barcode_enabled",
+                default_value="true",
+                description=(
+                    "While 101 is at startup, check the D405 selected box top for a barcode; "
+                    "stop the turntable on confirmation and grasp from fresh post-stop vision"
+                ),
+            ),
+            DeclareLaunchArgument(
                 "top_surface_barcode_stable_hits",
                 default_value="2",
                 description="Number of D405 top-surface YOLO barcode detections required",
@@ -587,8 +595,11 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "bottom_center_long_box_offset_margin_m",
-                default_value="0.010",
-                description="Extra short-end clearance before the first Tool-Rx roll (m)",
+                default_value="0.030",
+                description=(
+                    "Extra short-end clearance before the first Tool-Rx roll (m); "
+                    "30mm gives a 39mm shift for a 178mm box"
+                ),
             ),
             DeclareLaunchArgument(
                 "bottom_center_release_tool_rx_delta_deg",
@@ -1210,6 +1221,10 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "top_surface_barcode_enabled": ParameterValue(
                             LaunchConfiguration("top_surface_barcode_enabled"),
+                            value_type=bool,
+                        ),
+                        "d405_early_top_barcode_enabled": ParameterValue(
+                            LaunchConfiguration("d405_early_top_barcode_enabled"),
                             value_type=bool,
                         ),
                         "top_surface_barcode_wait_s": ParameterValue(

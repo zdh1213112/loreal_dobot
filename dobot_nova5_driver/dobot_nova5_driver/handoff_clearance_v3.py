@@ -32,6 +32,8 @@ class GripperSideClearanceResult:
     negative_target_excluded_point_count: int
     positive_target_excluded_point_count: int
     candidate_mask: np.ndarray
+    negative_candidate_mask: np.ndarray
+    positive_candidate_mask: np.ndarray
     # Target-local occupied voxels for each side.  These are exposed so the
     # vision state machine can require spatial persistence across independent
     # LIVE clouds without relying on frame-to-frame point indices.
@@ -146,6 +148,72 @@ def measure_voxel_overlap(
     return int(overlap), float(ratio), bool(confirmed)
 
 
+def find_unsupported_near_depth_points(
+    points_3d: np.ndarray,
+    candidate_mask: np.ndarray,
+    sensor_depth_m: np.ndarray,
+    *,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    min_farther_gap_m: float = 0.010,
+    max_patch_spread_m: float = 0.012,
+) -> np.ndarray:
+    """Find FFS-only near points when a stable sensor-depth patch sees farther.
+
+    A missing or mixed hardware-depth patch never removes an obstacle.  The
+    caller can use the returned mask to repeat its ordinary clearance check.
+    The depth image and FFS cloud must come from the same camera frameset.
+    """
+
+    points = np.asarray(points_3d, dtype=np.float64)
+    candidates = np.asarray(candidate_mask, dtype=bool)
+    depth = np.asarray(sensor_depth_m, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_3d must have shape (N, 3)")
+    if candidates.shape != (len(points),):
+        raise ValueError("candidate_mask must have shape (N,)")
+    if depth.ndim != 2:
+        raise ValueError("sensor_depth_m must be a 2-D image")
+    if min_farther_gap_m <= 0 or max_patch_spread_m <= 0:
+        raise ValueError("depth thresholds must be positive")
+
+    unsupported = np.zeros(len(points), dtype=bool)
+    indices = np.flatnonzero(candidates & np.isfinite(points).all(axis=1) & (points[:, 2] > 0))
+    if len(indices) == 0:
+        return unsupported
+    selected = points[indices]
+    u = np.rint(fx * selected[:, 0] / selected[:, 2] + cx).astype(np.int64)
+    v = np.rint(fy * selected[:, 1] / selected[:, 2] + cy).astype(np.int64)
+    interior = (u >= 1) & (u < depth.shape[1] - 1) & (v >= 1) & (v < depth.shape[0] - 1)
+    indices, selected, u, v = indices[interior], selected[interior], u[interior], v[interior]
+    if len(indices) == 0:
+        return unsupported
+
+    patch = np.stack(
+        [depth[v + dy, u + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)],
+        axis=0,
+    )
+    valid = np.isfinite(patch) & (patch > 0)
+    valid_count = valid.sum(axis=0)
+    stable = valid_count >= 5
+    if not np.any(stable):
+        return unsupported
+    patch_min = np.min(np.where(valid, patch, np.inf), axis=0)
+    patch_max = np.max(np.where(valid, patch, -np.inf), axis=0)
+    sorted_patch = np.sort(np.where(valid, patch, np.inf), axis=0)
+    middle_index = np.maximum(0, (valid_count - 1) // 2)
+    patch_median = sorted_patch[middle_index, np.arange(len(indices))]
+    farther_surface = (
+        stable
+        & (patch_max - patch_min <= max_patch_spread_m)
+        & (patch_median - selected[:, 2] >= min_farther_gap_m)
+    )
+    unsupported[indices[farther_surface]] = True
+    return unsupported
+
+
 def evaluate_target_overhead_clearance(
     points_3d: np.ndarray,
     box_center: np.ndarray,
@@ -222,6 +290,7 @@ def evaluate_gripper_side_clearance(
     box_rotation: np.ndarray,
     *,
     target_point_mask: np.ndarray | None = None,
+    valid_point_mask: np.ndarray | None = None,
     finger_span_m: float,
     target_exclusion_m: float,
     side_check_depth_m: float,
@@ -266,6 +335,12 @@ def evaluate_gripper_side_clearance(
         target_points = np.asarray(target_point_mask, dtype=bool)
         if target_points.shape != (len(points),):
             raise ValueError("target_point_mask must have shape (N,)")
+    if valid_point_mask is None:
+        valid_points = np.ones(len(points), dtype=bool)
+    else:
+        valid_points = np.asarray(valid_point_mask, dtype=bool)
+        if valid_points.shape != (len(points),):
+            raise ValueError("valid_point_mask must have shape (N,)")
     if finger_span_m <= 0.0 or side_check_depth_m <= 0.0:
         raise ValueError("finger_span_m and side_check_depth_m must be positive")
     if target_exclusion_m < 0.0 or vertical_margin_above_m < 0.0:
@@ -284,6 +359,7 @@ def evaluate_gripper_side_clearance(
     upper_height = half_height + float(vertical_margin_above_m)
     common = (
         finite
+        & valid_points
         & (np.abs(local_points[:, 0]) <= corridor_half_length)
         & (local_points[:, 2] >= lower_height)
         & (local_points[:, 2] <= upper_height)
@@ -347,6 +423,8 @@ def evaluate_gripper_side_clearance(
         negative_target_excluded_point_count=target_excluded_counts[0],
         positive_target_excluded_point_count=target_excluded_counts[1],
         candidate_mask=side_masks[0] | side_masks[1],
+        negative_candidate_mask=side_masks[0],
+        positive_candidate_mask=side_masks[1],
         negative_candidate_voxel_indices=candidate_voxels[0],
         positive_candidate_voxel_indices=candidate_voxels[1],
     )

@@ -45,6 +45,7 @@ from dobot_nova5_driver.handoff_clearance_v3 import (
     HandoffClearanceResult,
     evaluate_camera_right_handoff_clearance,
     evaluate_gripper_side_clearance,
+    find_unsupported_near_depth_points,
     measure_voxel_overlap,
 )
 from dobot_nova5_driver.gripper_width_policy_v3 import select_gripper_width
@@ -54,6 +55,7 @@ from dobot_nova5_driver.top_surface_geometry_v3 import (
     select_top_plane_candidate,
 )
 from top_surface_barcode_detector_v3 import TopSurfaceBarcodeDetector
+from sam2_target_mask_v4 import prompt_from_obb, refine_sam_mask
 
 SAM2_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "SAM2_streaming")
 sys.path.insert(0, SAM2_DIR)
@@ -156,6 +158,10 @@ GRIPPER_SIDE_GRASP_BELOW_CENTER_FRACTION = 0.25
 GRIPPER_SIDE_VERTICAL_MARGIN_ABOVE_M = 0.080
 GRIPPER_SIDE_VOXEL_SIZE_M = 0.010
 GRIPPER_SIDE_MIN_CLUSTER_POINTS = 20
+# Reject only a FFS near point for which the same D405 frameset contains a
+# stable, farther hardware-depth patch. Missing/mixed depth still blocks.
+GRIPPER_SIDE_SENSOR_FARTHER_GAP_M = 0.010
+GRIPPER_SIDE_SENSOR_PATCH_SPREAD_M = 0.012
 # A side corridor is confirmed as persistently occupied only when the raw
 # obstacle cluster is present in two independent LIVE clouds and their
 # target-local occupied voxels overlap.  A single frame still inhibits descent
@@ -1089,11 +1095,12 @@ def pretracking_enable_callback(msg: Bool) -> None:
 
 
 def post_stop_revalidate_callback(msg: Bool) -> None:
-    """Invalidate pre-stop clearance and accept only post-stop camera frames."""
+    """Reacquire the stopped box before any pretracked grasp is accepted."""
 
     global post_stop_epoch_s, handoff_clear_streak, handoff_clearance_passed
     global handoff_force_live_cloud, last_handoff_state, handoff_reacquire_required
     global pregrasp_tracking_deadline
+    global trigger_requested, reset_requested, clear_target_display_requested
     if not msg.data:
         return
     post_stop_epoch_s = time.time()
@@ -1105,9 +1112,17 @@ def post_stop_revalidate_callback(msg: Bool) -> None:
     last_handoff_state = "CHECKING"
     if HANDOFF_CLEARANCE_ENABLED:
         publish_handoff_clearance("CHECKING", clear=False)
+    if pretracking_enabled:
+        # The box has rotated since the standby YOLO/SAM2 lock. A fresh YOLO
+        # selection on post-stop frames prevents a plausible but drifted SAM2
+        # track from being used as the next grasp target.
+        reset_requested = True
+        clear_target_display_requested = True
+        trigger_requested = True
     logging.info(
-        "[D405] Post-stop revalidation armed; pre-stop pose/clearance will not "
-        "be accepted for the next grasp"
+        "[D405] Post-stop revalidation armed; reacquiring the stopped box "
+        "before the next grasp" if pretracking_enabled else
+        "[D405] Post-stop revalidation armed; waiting for a fresh vision request"
     )
 
 
@@ -1743,8 +1758,10 @@ camera_config.enable_device(CAMERA_SERIAL)
 camera_config.enable_stream(rs.stream.infrared, 1, IMG_WIDTH, IMG_HEIGHT, rs.format.y8, 30)
 camera_config.enable_stream(rs.stream.infrared, 2, IMG_WIDTH, IMG_HEIGHT, rs.format.y8, 30)
 camera_config.enable_stream(rs.stream.color, IMG_WIDTH, IMG_HEIGHT, rs.format.bgr8, 30)
+camera_config.enable_stream(rs.stream.depth, IMG_WIDTH, IMG_HEIGHT, rs.format.z16, 30)
 profile = pipeline.start(camera_config)
 depth_sensor = profile.get_device().first_depth_sensor()
+sensor_depth_scale_m = float(depth_sensor.get_depth_scale())
 if depth_sensor.supports(rs.option.emitter_enabled):
     depth_sensor.set_option(rs.option.emitter_enabled, 1.0 if IR_PROJECTOR_ON else 0.0)
 
@@ -1871,6 +1888,8 @@ def orthonormalize(rotation: np.ndarray) -> np.ndarray:
 sam_initialized = False
 current_mask = None
 pending_bbox = None
+pending_sam_points = None
+pending_sam_labels = None
 pending_yolo_obbs = None
 last_yolo_obbs = None
 last_best_idx = -1
@@ -1960,6 +1979,7 @@ if ENABLE_LOCAL_WINDOWS:
 try:
     while not quit_requested:
         loop_start = time.time()
+        detection_frames_for_loop = None
 
         # In V4 standby mode the camera keeps trying to acquire a target while
         # 101 is parked at startup.  This overlaps D405 inference with the
@@ -1987,6 +2007,9 @@ try:
             # Reset the previous SAM2 session, then hand the new YOLO box to a
             # fresh tracker after the capture below.
             reset_requested = True
+            pending_bbox = None
+            pending_sam_points = None
+            pending_sam_labels = None
             locked_target_corners = None
             locked_target_id = -1
             locked_target_camera_x = None
@@ -2029,6 +2052,7 @@ try:
             for _ in range(flush_frames):
                 pipeline.wait_for_frames()
             detection_frames = pipeline.wait_for_frames()
+            detection_frames_for_loop = detection_frames
             detection_color = np.asanyarray(detection_frames.get_color_frame().get_data())
             if SAVE_INITIAL_POSITION_FRAMES and not initial_position_frames_saved_for_startup:
                 # 记录并立即保存初始位置的两张原始 RGB 帧。RealSense
@@ -2099,7 +2123,14 @@ try:
                     time.monotonic() + PRETRACK_REACQUIRE_INTERVAL_S
                 )
 
-        frames = pipeline.wait_for_frames()
+        # Use the exact capture that YOLO saw for the first FFS ranking and
+        # SAM2 prompt. A moving turntable can shift the box substantially
+        # between successive RealSense frames.
+        frames = (
+            detection_frames_for_loop
+            if detection_frames_for_loop is not None
+            else pipeline.wait_for_frames()
+        )
         camera_frame_index += 1
         # Use the D405 device capture time mapped to the host Unix clock.  The
         # Dobot feedback history uses the controller's Unix-ms TimeStamp, so
@@ -2140,31 +2171,15 @@ try:
                 clear_target_display_requested = False
             reset_requested = False
 
-        if pending_bbox is not None and not sam_initialized:
-            sam2_predictor.load_first_frame(color_bgr)
-            prompt = np.array([[pending_bbox[0], pending_bbox[1]], [pending_bbox[2], pending_bbox[3]]], dtype=np.float32)
-            _, object_ids, mask_logits = sam2_predictor.add_new_prompt(
-                frame_idx=0, obj_id=1, bbox=prompt
-            )
-            # The prompt call already runs SAM2 inference for this exact RGB
-            # frame. Reuse that mask immediately instead of waiting for the
-            # next tracking iteration to perform an equivalent first pass.
+        if sam_initialized:
+            object_ids, mask_logits = sam2_predictor.track(color_bgr)
             current_mask = (
-                (mask_logits[0] > 0.0)
-                .permute(1, 2, 0)
-                .byte()
-                .cpu()
-                .numpy()
-                .squeeze()
+                refine_sam_mask(
+                    (mask_logits[0] > 0.0).permute(1, 2, 0).byte().cpu().numpy().squeeze()
+                )
                 if len(object_ids)
                 else None
             )
-            sam_initialized = True
-            pending_bbox = None
-            logging.info("[SAM2] Tracking selected minimum-camera-X target.")
-        elif sam_initialized:
-            object_ids, mask_logits = sam2_predictor.track(color_bgr)
-            current_mask = (mask_logits[0] > 0.0).permute(1, 2, 0).byte().cpu().numpy().squeeze() if len(object_ids) else None
             tracking_frames_without_height += 1
 
         # During the robot's move-above window, decode only inside the current
@@ -2265,14 +2280,15 @@ try:
                         f"{top_hit.value}"
                     )
 
-        # YOLO 的相机 X 排序必须使用本次触发刚计算出的 FFS 点云。选中目标后，
-        # 相机和场景在机械臂开始抓取前保持静止，因此 SAM2 的后续稳定帧直接复用
-        # 这份锁定点云，避免为同一个静止场景重复运行昂贵的 FFS 推理。
+        # A moving turntable invalidates the old selection cloud even when
+        # SAM2 still follows the box. Reuse it only for a non-pretracking
+        # request whose scene remains stationary during stable-frame checks.
         reuse_selection_cloud = (
             locked_cloud_points is not None
             and pending_yolo_obbs is None
             and not locked_target_ready
             and not handoff_force_live_cloud
+            and not pretracking_enabled
         )
         if reuse_selection_cloud:
             points_3d = locked_cloud_points
@@ -2334,7 +2350,11 @@ try:
 
             # 锁定完成后恢复 LIVE FFS 以维持点云跟随；若某一帧立体网络临时
             # 丢失深度，仍回退到本次目标的锁定快照，避免点云窗口突然变黑。
-            if len(points_3d) < 40 and locked_cloud_points is not None:
+            if (
+                len(points_3d) < 40
+                and locked_cloud_points is not None
+                and not pretracking_enabled
+            ):
                 points_3d = locked_cloud_points
                 u_rgb = locked_cloud_u_rgb
                 v_rgb = locked_cloud_v_rgb
@@ -2424,15 +2444,54 @@ try:
                     last_handoff_state = "CLEAR"
                     handoff_clearance_passed = True
                     publish_handoff_clearance("CLEAR", clear=True)
-                x1, y1 = np.min(corners, axis=0)
-                x2, y2 = np.max(corners, axis=0)
-                pending_bbox = (int(x1), int(y1), int(x2), int(y2))
-                reset_requested = True
+                pending_bbox, pending_sam_points, pending_sam_labels = (
+                    prompt_from_obb(corners, color_bgr.shape)
+                )
                 logging.info(f"[3-D select] Selected ID={best_index}, the minimum valid camera-X target.")
             else:
                 logging.warning("[3-D select] No YOLO candidate had enough valid stereo points; detection rejected.")
                 publish_vision_result(False, "no_candidate_with_valid_stereo_points")
             pending_yolo_obbs = None
+
+        if pending_bbox is not None and not sam_initialized:
+            # The selected OBB, stereo ranking and RGB image now all describe
+            # this same capture, including while the turntable is moving.
+            sam2_predictor.load_first_frame(color_bgr)
+            _, object_ids, mask_logits = sam2_predictor.add_new_prompt(
+                frame_idx=0,
+                obj_id=1,
+                bbox=pending_bbox,
+                points=pending_sam_points,
+                labels=pending_sam_labels,
+            )
+            mask_binary = (
+                (mask_logits[0] > 0.0)
+                .permute(1, 2, 0)
+                .byte()
+                .cpu()
+                .numpy()
+                .squeeze()
+                if len(object_ids)
+                else None
+            )
+            current_mask = (
+                refine_sam_mask(mask_binary, selected_obb=locked_target_corners)
+                if mask_binary is not None
+                else None
+            )
+            sam_initialized = current_mask is not None
+            if current_mask is None:
+                logging.warning(
+                    "[SAM2] Initial mask was empty or extended too far beyond "
+                    "the selected YOLO box; reacquiring instead of publishing a grasp"
+                )
+                publish_vision_result(False, "invalid_initial_sam_mask")
+                reset_requested = True
+            else:
+                logging.info("[SAM2] Tracking selected minimum-camera-X target.")
+            pending_bbox = None
+            pending_sam_points = None
+            pending_sam_labels = None
 
         display = color_bgr.copy()
         tracked_target_points = None
@@ -2460,7 +2519,12 @@ try:
             # A live cloud may still contain background points while losing the
             # selected box. Prefer the locked snapshot only when it provides a
             # strictly better SAM-mask overlap.
-            if object_point_count < 40 and not using_locked_cloud and locked_cloud_points is not None:
+            if (
+                object_point_count < 40
+                and not using_locked_cloud
+                and locked_cloud_points is not None
+                and not pretracking_enabled
+            ):
                 snapshot_hits = np.zeros(len(locked_cloud_points), dtype=bool)
                 snapshot_hits[locked_cloud_in_bounds] = current_mask[
                     locked_cloud_v_rgb[locked_cloud_in_bounds],
@@ -2745,6 +2809,7 @@ try:
                                                         len(points_3d), dtype=bool
                                                     ),
                                                 )
+                                            sensor_depth_reject_count = 0
                                             side_clearance = evaluate_gripper_side_clearance(
                                                 points_3d,
                                                 smooth_box_center,
@@ -2765,6 +2830,79 @@ try:
                                                     GRIPPER_SIDE_MIN_CLUSTER_POINTS
                                                 ),
                                             )
+                                            if not side_clearance.clear and not using_locked_cloud:
+                                                # A shiny box/table edge may create a
+                                                # coherent FFS near cloud. Check only
+                                                # those side candidates against the
+                                                # independent depth result in this exact
+                                                # RealSense frameset. Uncertain sensor
+                                                # pixels stay blocked.
+                                                sensor_depth_frame = frames.get_depth_frame()
+                                                if sensor_depth_frame:
+                                                    unsupported_side_points = (
+                                                        find_unsupported_near_depth_points(
+                                                            points_3d,
+                                                            side_clearance.candidate_mask,
+                                                            np.asanyarray(
+                                                                sensor_depth_frame.get_data()
+                                                            ).astype(np.float32)
+                                                            * sensor_depth_scale_m,
+                                                            fx=float(fx_ir),
+                                                            fy=float(fy_ir),
+                                                            cx=float(cx_ir),
+                                                            cy=float(cy_ir),
+                                                            min_farther_gap_m=(
+                                                                GRIPPER_SIDE_SENSOR_FARTHER_GAP_M
+                                                            ),
+                                                            max_patch_spread_m=(
+                                                                GRIPPER_SIDE_SENSOR_PATCH_SPREAD_M
+                                                            ),
+                                                        )
+                                                    )
+                                                    sensor_depth_reject_count = int(np.count_nonzero(
+                                                        unsupported_side_points
+                                                    ))
+                                                    if sensor_depth_reject_count:
+                                                        raw_negative = (
+                                                            side_clearance.negative_candidate_point_count
+                                                        )
+                                                        raw_positive = (
+                                                            side_clearance.positive_candidate_point_count
+                                                        )
+                                                        side_clearance = evaluate_gripper_side_clearance(
+                                                            points_3d,
+                                                            smooth_box_center,
+                                                            smooth_extent,
+                                                            smooth_rotation,
+                                                            target_point_mask=object_hits,
+                                                            valid_point_mask=(
+                                                                ~unsupported_side_points
+                                                            ),
+                                                            finger_span_m=GRIPPER_SIDE_FINGER_SPAN_M,
+                                                            target_exclusion_m=GRIPPER_SIDE_TARGET_EXCLUSION_M,
+                                                            side_check_depth_m=GRIPPER_SIDE_CHECK_DEPTH_M,
+                                                            grasp_below_center_fraction=(
+                                                                GRIPPER_SIDE_GRASP_BELOW_CENTER_FRACTION
+                                                            ),
+                                                            vertical_margin_above_m=(
+                                                                GRIPPER_SIDE_VERTICAL_MARGIN_ABOVE_M
+                                                            ),
+                                                            voxel_size_m=GRIPPER_SIDE_VOXEL_SIZE_M,
+                                                            min_obstacle_points=(
+                                                                GRIPPER_SIDE_MIN_CLUSTER_POINTS
+                                                            ),
+                                                        )
+                                                        logging.info(
+                                                            "[handoff-clearance] sensor-depth cross-check: "
+                                                            f"removed={sensor_depth_reject_count} FFS-only near points; "
+                                                            f"-Y={raw_negative}->"
+                                                            f"{side_clearance.negative_candidate_point_count}, "
+                                                            f"+Y={raw_positive}->"
+                                                            f"{side_clearance.positive_candidate_point_count}"
+                                                        )
+                                                        colors[unsupported_side_points] = (
+                                                            np.array([0.35, 0.35, 0.85])
+                                                        )
                                             handoff_candidate_mask = (
                                                 clearance.candidate_mask
                                                 | side_clearance.candidate_mask
@@ -2972,10 +3110,55 @@ try:
                                                     f"overlap="
                                                     f"-Y:{side_overlaps[0]}/{side_overlap_ratios[0]:.2f},"
                                                     f"+Y:{side_overlaps[1]}/{side_overlap_ratios[1]:.2f}, "
+                                                    f"sensor_reject={sensor_depth_reject_count}, "
                                                     f"clear_streak={handoff_clear_streak}/"
                                                     f"{HANDOFF_CLEARANCE_CLEAR_FRAMES}, "
                                                     f"cloud={'LOCKED' if using_locked_cloud else 'LIVE'}"
                                                 )
+                                                if handoff_state in (
+                                                    "VERIFYING_BLOCKED",
+                                                    "BLOCKED",
+                                                ):
+                                                    mask_edge_distance = cv2.distanceTransform(
+                                                        (current_mask == 0).astype(np.uint8),
+                                                        cv2.DIST_L2,
+                                                        3,
+                                                    )
+                                                    for side_name, side_mask in (
+                                                        ("-Y", side_clearance.negative_candidate_mask),
+                                                        ("+Y", side_clearance.positive_candidate_mask),
+                                                    ):
+                                                        if not np.any(side_mask):
+                                                            continue
+                                                        side_local = (
+                                                            points_3d[side_mask] - smooth_box_center
+                                                        ) @ smooth_rotation
+                                                        side_visible = side_mask & in_bounds
+                                                        if np.any(side_visible):
+                                                            side_u = u_rgb[side_visible]
+                                                            side_v = v_rgb[side_visible]
+                                                            rgb_bbox = (
+                                                                f"({side_u.min()},{side_v.min()})-"
+                                                                f"({side_u.max()},{side_v.max()})"
+                                                            )
+                                                            mask_distance_px = float(np.median(
+                                                                mask_edge_distance[side_v, side_u]
+                                                            ))
+                                                        else:
+                                                            rgb_bbox = "outside-image"
+                                                            mask_distance_px = float("nan")
+                                                        above_table_mm = (
+                                                            side_local[:, 2] + 0.5 * smooth_extent[2]
+                                                        ) * 1000.0
+                                                        logging.info(
+                                                            f"[handoff-clearance] {side_name} candidate origin: "
+                                                            f"RGB={rgb_bbox}, "
+                                                            f"mask_edge_median={mask_distance_px:.1f}px, "
+                                                            f"local_Y={side_local[:, 1].min()*1000:.1f}.."
+                                                            f"{side_local[:, 1].max()*1000:.1f}mm, "
+                                                            f"above_table={above_table_mm.min():.1f}.."
+                                                            f"{above_table_mm.max():.1f}mm"
+                                                        )
                                             last_handoff_state = handoff_state
                                             publish_handoff_clearance(
                                                 handoff_state,

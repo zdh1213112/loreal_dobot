@@ -749,6 +749,10 @@ class CosmeticBoxSingleArmNode(Node):
 
         self.declare_parameter("barcode_topic", "/detected_barcodes")
         self.declare_parameter("top_surface_barcode_enabled", True)
+        # While 101 is parked at startup, let D405 inspect the selected box
+        # during the D435 turntable scan. A confirmed top barcode stops the
+        # table early; grasp geometry is still reacquired after the stop.
+        self.declare_parameter("d405_early_top_barcode_enabled", True)
         # Detection remains armed throughout offset-high, descent and insert.
         # Keep only a short dedicated low-pose observation hold between the
         # descent and insert so top-barcode scanning is retained without a
@@ -818,7 +822,7 @@ class CosmeticBoxSingleArmNode(Node):
         # exceeds the independent threshold. Use a conservative cavity allowance.
         self.declare_parameter("bottom_center_long_box_length_threshold_m", 0.150)
         self.declare_parameter("bottom_center_gripper_cavity_half_length_m", 0.080)
-        self.declare_parameter("bottom_center_long_box_offset_margin_m", 0.010)
+        self.declare_parameter("bottom_center_long_box_offset_margin_m", 0.030)
         # Both bottom-face branches start from a stable J6 neighbourhood. If
         # the wrist is farther than this from zero, temporarily pick the box,
         # lift it clear, set J6=0, put it back, and continue from the new centre.
@@ -879,8 +883,8 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("face_up_settle_s", 0.0)
 
         self.declare_parameter("dh_max_opening_m", 0.095)
-        self.declare_parameter("dh_force", 40)
-        self.declare_parameter("dh_grasp_force", 40)
+        self.declare_parameter("dh_force", 55)
+        self.declare_parameter("dh_grasp_force", 60)
         self.declare_parameter("dh_slave_id", 1)
         self.declare_parameter("dh_tool_identify", 1)
         self.declare_parameter("dh_timeout_s", 10.0)
@@ -989,6 +993,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.top_surface_barcode_window_active = False
         self.top_surface_barcode_value = ""
         self.top_surface_barcode_result_count = 0
+        self.early_top_at_startup = False
 
         self.turntable_lock = threading.RLock()
         self.turntable_condition = threading.Condition(self.turntable_lock)
@@ -1018,6 +1023,8 @@ class CosmeticBoxSingleArmNode(Node):
         self.turntable_scan_in_progress = False
         self.turntable_material_ready = False
         self.turntable_ready_barcode = ""
+        self.turntable_ready_top_barcode = ""
+        self.turntable_early_top_barcode = ""
         self.turntable_scan_error = ""
         self.turntable_scan_thread: Optional[threading.Thread] = None
         self.turntable_scan_cancel = threading.Event()
@@ -2864,6 +2871,7 @@ class CosmeticBoxSingleArmNode(Node):
             self.turntable_waiting_for_place = False
             self.turntable_material_ready = False
             self.turntable_ready_barcode = ""
+            self.turntable_ready_top_barcode = ""
             self.turntable_scan_error = ""
             self.d435_continuous_last_value = ""
             self.d435_continuous_presence = False
@@ -2908,6 +2916,7 @@ class CosmeticBoxSingleArmNode(Node):
 
     def _turntable_prescan_worker(self, event_number: int) -> None:
         barcode = ""
+        top_barcode = ""
         error = ""
         cancelled = False
         next_thread = None
@@ -2924,6 +2933,8 @@ class CosmeticBoxSingleArmNode(Node):
             barcode = self._scan_turntable_for_side_barcode(
                 require_cycle_active=False,
             )
+            with self.turntable_lock:
+                top_barcode = self.turntable_early_top_barcode
         except Exception as exc:
             error = str(exc)
             cancelled = self.turntable_scan_cancel.is_set()
@@ -2958,6 +2969,7 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                     self.turntable_material_ready = False
                     self.turntable_ready_barcode = ""
+                    self.turntable_ready_top_barcode = ""
                 elif superseded:
                     # An operator reset owns the state; the old worker must
                     # never publish a ready result for the replacement box.
@@ -2969,16 +2981,21 @@ class CosmeticBoxSingleArmNode(Node):
                     # after the previous round has been abandoned.
                     self.turntable_material_ready = False
                     self.turntable_ready_barcode = ""
+                    self.turntable_ready_top_barcode = ""
                     self.turntable_scan_error = ""
                 elif not error:
                     self.turntable_scan_in_progress = False
                     self.turntable_material_ready = True
                     self.turntable_ready_barcode = barcode
+                    self.turntable_ready_top_barcode = (
+                        top_barcode if not barcode else ""
+                    )
                     self.turntable_scan_error = ""
                 else:
                     self.turntable_scan_in_progress = False
                     self.turntable_material_ready = False
                     self.turntable_ready_barcode = ""
+                    self.turntable_ready_top_barcode = ""
                     self.turntable_scan_error = error
                 self.turntable_condition.notify_all()
 
@@ -2998,6 +3015,12 @@ class CosmeticBoxSingleArmNode(Node):
                 f"material event #{event_number} scan failed: {error}; "
                 "after checking the stopped table, click simulated place_done to retry"
             )
+        elif top_barcode and not barcode:
+            self._publish_status(
+                f"material event #{event_number}: D405 confirmed a top barcode "
+                "while 101 was at startup; turntable stopped for a direct "
+                "top-face grasp"
+            )
         elif not barcode:
             self._publish_status(
                 f"material event #{event_number}: D435 found no side barcode "
@@ -3016,15 +3039,15 @@ class CosmeticBoxSingleArmNode(Node):
                 f"turntable is stopped and the material is ready—{next_action}"
             )
 
-    def _wait_for_scanned_turntable_material(self) -> tuple[int, str]:
+    def _wait_for_scanned_turntable_material(self) -> tuple[int, str, str]:
         """Wait for the independently scanned and stopped material.
 
-        An empty barcode is a valid completed scan: D405 will inspect the
-        material's top after the left arm starts its normal grasp cycle.
+        An empty side/top result is a valid completed scan: D405 will inspect
+        the material's top during the normal approach.
         """
 
         if not bool(self.get_parameter("turntable_enabled").value):
-            return 0, ""
+            return 0, "", ""
         timeout_s = max(
             0.0,
             float(self.get_parameter("turntable_place_wait_timeout_s").value),
@@ -3035,6 +3058,7 @@ class CosmeticBoxSingleArmNode(Node):
             with self.turntable_condition:
                 if self.turntable_material_ready:
                     barcode = self.turntable_ready_barcode
+                    top_barcode = self.turntable_ready_top_barcode
                     event_number = self.turntable_place_done_count
                     state = self.turntable_state
                     if state != "STOPPED":
@@ -3043,7 +3067,7 @@ class CosmeticBoxSingleArmNode(Node):
                             f"state={state}, expected=STOPPED"
                         )
                     self.turntable_active_pick_event_number = event_number
-                    return event_number, barcode
+                    return event_number, barcode, top_barcode
                 scan_in_progress = self.turntable_scan_in_progress
                 scan_error = self.turntable_scan_error
                 if scan_error:
@@ -3107,6 +3131,7 @@ class CosmeticBoxSingleArmNode(Node):
                 return
             self.turntable_material_ready = False
             self.turntable_ready_barcode = ""
+            self.turntable_ready_top_barcode = ""
             self.turntable_scan_error = ""
             self.turntable_waiting_for_place = True
             self.turntable_place_done_duplicate_warned = False
@@ -3155,6 +3180,7 @@ class CosmeticBoxSingleArmNode(Node):
             self.turntable_scan_in_progress = False
             self.turntable_material_ready = False
             self.turntable_ready_barcode = ""
+            self.turntable_ready_top_barcode = ""
             self.turntable_scan_error = ""
             self.turntable_waiting_for_place = True
             self.turntable_place_done_count = 0
@@ -3369,7 +3395,11 @@ class CosmeticBoxSingleArmNode(Node):
         if self.turntable_scan_cancel.is_set():
             raise RuntimeError("D435 turntable scan cancelled before camera window")
         self._set_turntable_barcode_window(True)
+        with self.turntable_lock:
+            self.turntable_early_top_barcode = ""
         barcode = ""
+        top_barcode = ""
+        top_window_armed = False
         turntable_was_started = False
         stationary_check_s = max(
             0.0,
@@ -3394,6 +3424,28 @@ class CosmeticBoxSingleArmNode(Node):
             with self.turntable_lock:
                 return str(self.turntable_barcode_value)
 
+        def visible_top_barcode() -> str:
+            return self._current_top_surface_barcode() if top_window_armed else ""
+
+        def update_early_top_window() -> None:
+            nonlocal top_window_armed
+            with self.turntable_lock:
+                at_startup = self.early_top_at_startup
+            should_observe = (
+                at_startup
+                and bool(self.get_parameter("d405_early_top_barcode_enabled").value)
+                and bool(self.get_parameter("top_surface_barcode_enabled").value)
+            )
+            if should_observe and not top_window_armed:
+                self._set_top_surface_barcode_window(True)
+                top_window_armed = True
+                self._publish_status(
+                    "D405 early top-barcode observation armed while 101 is at startup"
+                )
+            elif not should_observe and top_window_armed:
+                self._set_top_surface_barcode_window(False)
+                top_window_armed = False
+
         try:
             try:
                 stationary_deadline = time.monotonic() + stationary_check_s
@@ -3410,6 +3462,7 @@ class CosmeticBoxSingleArmNode(Node):
                         raise RuntimeError(
                             "D435 turntable scan cancelled by operator stop"
                         )
+                    update_early_top_window()
                     barcode = visible_barcode()
                     if barcode:
                         self._publish_status(
@@ -3417,9 +3470,16 @@ class CosmeticBoxSingleArmNode(Node):
                             "stopped face; skipping turntable rotation"
                         )
                         break
+                    top_barcode = visible_top_barcode()
+                    if top_barcode:
+                        self._publish_status(
+                            "D405 confirmed a top barcode on the stopped face; "
+                            "skipping turntable rotation"
+                        )
+                        break
                     time.sleep(0.005)
 
-                if not barcode:
+                if not barcode and not top_barcode:
                     if self.turntable_scan_cancel.is_set():
                         raise RuntimeError("D435 turntable scan cancelled before rotation")
                     self._publish_status(
@@ -3444,7 +3504,7 @@ class CosmeticBoxSingleArmNode(Node):
                     timeout_s - mid_scan_restart_s,
                 )
                 mid_scan_restart_completed = False
-                while not barcode and time.monotonic() < deadline:
+                while not barcode and not top_barcode and time.monotonic() < deadline:
                     if require_cycle_active:
                         self._require_cycle_active(
                             "during D435 turntable side scan"
@@ -3455,10 +3515,18 @@ class CosmeticBoxSingleArmNode(Node):
                         raise RuntimeError(
                             "D435 turntable scan cancelled by operator stop"
                         )
+                    update_early_top_window()
                     barcode = visible_barcode()
                     if barcode:
                         self._publish_status(
                             f"D435 detected side barcode {barcode!r}; stopping turntable"
+                        )
+                        break
+                    top_barcode = visible_top_barcode()
+                    if top_barcode:
+                        self._publish_status(
+                            "D405 confirmed a top barcode during rotation; "
+                            "stopping turntable for the top-face grasp"
                         )
                         break
                     if (
@@ -3474,6 +3542,7 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                         self._restart_turntable_back_to_back()
                         mid_scan_restart_completed = True
+                        update_early_top_window()
                         # Restart the second calibrated rotation interval only
                         # after the restart pulse has completed.
                         deadline = time.monotonic() + remaining_scan_after_restart_s
@@ -3482,6 +3551,13 @@ class CosmeticBoxSingleArmNode(Node):
                             self._publish_status(
                                 f"D435 detected side barcode {barcode!r} during "
                                 "the midpoint pulse pair; stopping turntable"
+                            )
+                            break
+                        top_barcode = visible_top_barcode()
+                        if top_barcode:
+                            self._publish_status(
+                                "D405 confirmed a top barcode during the midpoint "
+                                "pulse pair; stopping turntable"
                             )
                             break
                         if self.turntable_scan_cancel.is_set():
@@ -3497,7 +3573,7 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                         continue
                     time.sleep(0.005)
-                if not barcode and turntable_was_started:
+                if not barcode and not top_barcode and turntable_was_started:
                     self._publish_status(
                         f"no side barcode detected within {timeout_s:.1f}s; "
                         "stopping turntable but keeping D435 armed through settling"
@@ -3528,11 +3604,17 @@ class CosmeticBoxSingleArmNode(Node):
                         raise RuntimeError("node stopped while turntable was settling")
                     if self.turntable_scan_cancel.is_set():
                         raise RuntimeError("turntable scan superseded by a new placement")
-                    if not barcode:
+                    update_early_top_window()
+                    if not barcode and not top_barcode:
                         barcode = visible_barcode()
+                    if not barcode and not top_barcode:
+                        top_barcode = visible_top_barcode()
                     time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-            if not barcode:
+            update_early_top_window()
+            if not barcode and not top_barcode:
                 barcode = visible_barcode()
+            if not barcode and not top_barcode:
+                top_barcode = visible_top_barcode()
             if not turntable_was_started:
                 # The table was already stopped for this scan.  Invalidate any
                 # pre-stop tracker/clearance result (with or without barcode)
@@ -3544,8 +3626,14 @@ class CosmeticBoxSingleArmNode(Node):
                 self._publish_status(
                     f"D435 barcode {barcode!r} confirmed before or during final stop/settle"
                 )
+            with self.turntable_lock:
+                self.turntable_early_top_barcode = (
+                    top_barcode if not barcode else ""
+                )
             return barcode
         finally:
+            if top_window_armed:
+                self._set_top_surface_barcode_window(False)
             self._set_turntable_barcode_window(False)
 
     def _stop_turntable_if_running(self, reason: str) -> None:
@@ -3685,7 +3773,15 @@ class CosmeticBoxSingleArmNode(Node):
     def _set_d405_pretracking(self, enabled: bool) -> None:
         """Enable/disable V4 D405 standby tracking without requesting a pick."""
 
-        if not bool(self.get_parameter("d405_pretracking_enabled").value):
+        early_top_enabled = (
+            bool(self.get_parameter("turntable_enabled").value)
+            and bool(self.get_parameter("top_surface_barcode_enabled").value)
+            and bool(self.get_parameter("d405_early_top_barcode_enabled").value)
+        )
+        if not (
+            bool(self.get_parameter("d405_pretracking_enabled").value)
+            or early_top_enabled
+        ):
             enabled = False
         message = Bool()
         message.data = bool(enabled)
@@ -3834,26 +3930,43 @@ class CosmeticBoxSingleArmNode(Node):
                 # from the independent D435 ready queue.  The value survives
                 # D405/grasp retries so the same box is never scanned again.
                 pending_side_barcode: Optional[str] = None
+                pending_top_barcode: Optional[str] = None
                 pending_material_event_number: Optional[int] = None
+                early_top_enabled = (
+                    bool(self.get_parameter("turntable_enabled").value)
+                    and bool(self.get_parameter("top_surface_barcode_enabled").value)
+                    and bool(self.get_parameter("d405_early_top_barcode_enabled").value)
+                )
                 while self.running and self.cycle_enabled:
                     cycle_index += 1
                     self._begin_cycle_timing(f"continuous-{cycle_index}")
-                    # Optional warm tracking starts only when explicitly enabled.
+                    # Warm tracking also supplies the selected top-face ROI
+                    # while 101 waits at startup for the next material.
                     if not startup_prepared:
                         self._wait_for_secondary_y_clearance("startup motion")
                         self._move_startup_and_open(require_cycle_active=True)
                         startup_prepared = True
                     if (
                         not d405_pretracking_armed
-                        and bool(self.get_parameter("d405_pretracking_enabled").value)
+                        and (
+                            bool(self.get_parameter("d405_pretracking_enabled").value)
+                            or early_top_enabled
+                        )
                     ):
                         self._set_d405_pretracking(True)
                         d405_pretracking_armed = True
+                    with self.turntable_lock:
+                        self.early_top_at_startup = bool(
+                            d405_pretracking_armed
+                            and early_top_enabled
+                        )
                     if pending_material_event_number is None:
                         with self._timed_stage("turntable_ready_wait"):
-                            pending_material_event_number, pending_side_barcode = (
-                                self._wait_for_scanned_turntable_material()
-                            )
+                            (
+                                pending_material_event_number,
+                                pending_side_barcode,
+                                pending_top_barcode,
+                            ) = self._wait_for_scanned_turntable_material()
                     try:
                         self._require_current_material_event(
                             pending_material_event_number, "continuous-cycle startup"
@@ -3862,6 +3975,7 @@ class CosmeticBoxSingleArmNode(Node):
                         self._release_active_material_event(pending_material_event_number)
                         pending_material_event_number = None
                         pending_side_barcode = None
+                        pending_top_barcode = None
                         self._publish_status(str(exc))
                         self._finish_cycle_timing("material_replaced")
                         continue
@@ -3887,11 +4001,15 @@ class CosmeticBoxSingleArmNode(Node):
                         self._release_active_material_event(pending_material_event_number)
                         pending_material_event_number = None
                         pending_side_barcode = None
+                        pending_top_barcode = None
                         self._publish_status(str(exc))
                         self._finish_cycle_timing("material_replaced")
                         continue
                     with self._timed_stage("vision_detection"):
-                        if bool(self.get_parameter("d405_pretracking_enabled").value):
+                        if (
+                            bool(self.get_parameter("d405_pretracking_enabled").value)
+                            or early_top_enabled
+                        ):
                             self._publish_status(
                                 f"cycle {cycle_index}: using post-stop D405 target"
                             )
@@ -3917,6 +4035,8 @@ class CosmeticBoxSingleArmNode(Node):
                         self._require_current_material_event(
                             pending_material_event_number, "left-arm grasp"
                         )
+                        with self.turntable_lock:
+                            self.early_top_at_startup = False
                         self._execute_one_cycle(
                             target_pose,
                             width_m,
@@ -3925,11 +4045,13 @@ class CosmeticBoxSingleArmNode(Node):
                             pending_side_barcode,
                             self.last_accepted_aspect_ratio,
                             material_event_number=pending_material_event_number,
+                            turntable_top_barcode=pending_top_barcode or "",
                         )
                     except MaterialSuperseded as exc:
                         self._release_active_material_event(pending_material_event_number)
                         pending_material_event_number = None
                         pending_side_barcode = None
+                        pending_top_barcode = None
                         self._publish_status(str(exc))
                         self._finish_cycle_timing("material_replaced")
                         continue
@@ -3961,6 +4083,7 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                     self._finish_cycle_timing("success")
                     pending_side_barcode = None
+                    pending_top_barcode = None
                     pending_material_event_number = None
             self._publish_status("cycle stopped")
         except Exception as exc:
@@ -3981,6 +4104,9 @@ class CosmeticBoxSingleArmNode(Node):
                 self._finish_cycle_timing("fault")
                 self._publish_status(f"FAULT: {exc}")
                 self.get_logger().fatal(f"Automatic cycle stopped safely: {exc}")
+        finally:
+            with self.turntable_lock:
+                self.early_top_at_startup = False
 
     def _move_startup_and_open(
         self,
@@ -4243,6 +4369,8 @@ class CosmeticBoxSingleArmNode(Node):
             self.secondary_auto_resume_requested.clear()
             self.cycle_enabled = False
         self.turntable_scan_cancel.set()
+        with self.turntable_lock:
+            self.early_top_at_startup = False
         with self.turntable_condition:
             self.turntable_rescan_pending = False
             self.turntable_condition.notify_all()
@@ -4278,6 +4406,8 @@ class CosmeticBoxSingleArmNode(Node):
         with self.secondary_safety_lock:
             self.secondary_auto_resume_requested.clear()
             self.cycle_enabled = False
+        with self.turntable_lock:
+            self.early_top_at_startup = False
         self._publish_status("continuous cycle will stop after the current blocking motion")
 
     def sample_vision_only(self) -> tuple[TcpPose, float, float, float]:
@@ -4306,23 +4436,33 @@ class CosmeticBoxSingleArmNode(Node):
                 )
             self.secondary_auto_resume_requested.clear()
             self.cycle_enabled = True
-        # Publish this before taking the action lock so a click that is waiting
-        # for a previous action is visible immediately in the GUI/status topic.
-        # The target-dependent motion still begins only after the fresh D405
-        # pose is available; this status separates that vision wait from a
-        # controller idle delay.
+        # Publish this before taking the action lock so a queued click is
+        # visible immediately. The startup move prepares the D405 top-face
+        # observation, but target-dependent motion still waits for a stopped
+        # table and a fresh post-stop D405 pose.
+        early_top_enabled = (
+            bool(self.get_parameter("turntable_enabled").value)
+            and bool(self.get_parameter("top_surface_barcode_enabled").value)
+            and bool(self.get_parameter("d405_early_top_barcode_enabled").value)
+        )
         self._publish_status(
-            "single cycle request accepted; waiting for the already-scanned, "
-            "stopped turntable material before moving the left arm"
+            "single cycle request accepted; moving 101 to startup and watching "
+            "the selected box top while the turntable scan runs"
+            if early_top_enabled else
+            "single cycle request accepted; preparing 101 at startup before vision"
         )
         try:
-            material_event_number, turntable_side_barcode = (
-                self._wait_for_scanned_turntable_material()
-            )
             with self.action_lock:
                 # 单轮流程开始前必须确保夹爪已经打开。
                 self._wait_for_secondary_y_clearance("single-cycle startup motion")
                 self._move_startup_and_open(require_cycle_active=True)
+                if early_top_enabled:
+                    self._set_d405_pretracking(True)
+                with self.turntable_lock:
+                    self.early_top_at_startup = early_top_enabled
+                material_event_number, turntable_side_barcode, turntable_top_barcode = (
+                    self._wait_for_scanned_turntable_material()
+                )
                 retry_limit = max(
                     0, int(self.get_parameter("single_cycle_grasp_retry_limit").value)
                 )
@@ -4339,13 +4479,18 @@ class CosmeticBoxSingleArmNode(Node):
                         self._release_active_material_event(material_event_number)
                         self._publish_status(str(exc))
                         self._finish_cycle_timing("material_replaced")
-                        material_event_number, turntable_side_barcode = (
+                        material_event_number, turntable_side_barcode, turntable_top_barcode = (
                             self._wait_for_scanned_turntable_material()
                         )
                         grasp_failures = 0
                         continue
                     with self._timed_stage("vision_detection"):
-                        result = self._request_vision_target()
+                        result = (
+                            self._wait_for_pretracked_target_after_stop(
+                                require_cycle_enabled=True
+                            )
+                            if early_top_enabled else self._request_vision_target()
+                        )
                     if result is None:
                         try:
                             self._require_current_material_event(
@@ -4355,7 +4500,7 @@ class CosmeticBoxSingleArmNode(Node):
                             self._release_active_material_event(material_event_number)
                             self._publish_status(str(exc))
                             self._finish_cycle_timing("material_replaced")
-                            material_event_number, turntable_side_barcode = (
+                            material_event_number, turntable_side_barcode, turntable_top_barcode = (
                                 self._wait_for_scanned_turntable_material()
                             )
                             grasp_failures = 0
@@ -4367,18 +4512,21 @@ class CosmeticBoxSingleArmNode(Node):
                         self._require_current_material_event(
                             material_event_number, "single-cycle left-arm grasp"
                         )
+                        with self.turntable_lock:
+                            self.early_top_at_startup = False
                         self._execute_one_cycle(
                             *result,
                             turntable_side_barcode,
                             self.last_accepted_aspect_ratio,
                             material_event_number=material_event_number,
+                            turntable_top_barcode=turntable_top_barcode,
                         )
                         break
                     except MaterialSuperseded as exc:
                         self._release_active_material_event(material_event_number)
                         self._publish_status(str(exc))
                         self._finish_cycle_timing("material_replaced")
-                        material_event_number, turntable_side_barcode = (
+                        material_event_number, turntable_side_barcode, turntable_top_barcode = (
                             self._wait_for_scanned_turntable_material()
                         )
                         grasp_failures = 0
@@ -4422,6 +4570,10 @@ class CosmeticBoxSingleArmNode(Node):
             raise
         finally:
             self.cycle_enabled = False
+            with self.turntable_lock:
+                self.early_top_at_startup = False
+            if early_top_enabled:
+                self._set_d405_pretracking(False)
 
     def _request_vision_target(self, require_cycle_enabled: bool = True) -> Optional[tuple[TcpPose, float, float, float]]:
         with self.data_lock:
@@ -5207,7 +5359,7 @@ class CosmeticBoxSingleArmNode(Node):
         rx, ry, rz = level_rotation.as_euler("xyz", degrees=True)
         correction_deg = math.degrees((rotation.inv() * level_rotation).magnitude())
         self._publish_status(
-            "turntable offset grasp: level Tool Z downward while preserving "
+            "turntable grasp: level Tool Z downward while preserving "
             f"the measured top-edge direction; attitude correction={correction_deg:.1f}deg"
         )
         return TcpPose(pose.x, pose.y, pose.z, float(rx), float(ry), float(rz))
@@ -5717,6 +5869,7 @@ class CosmeticBoxSingleArmNode(Node):
         turntable_side_barcode: str = "",
         aspect_ratio: Optional[float] = None,
         material_event_number: Optional[int] = None,
+        turntable_top_barcode: str = "",
     ) -> None:
         motion = self._motion_profile()
         if material_event_number is not None:
@@ -5725,6 +5878,11 @@ class CosmeticBoxSingleArmNode(Node):
             )
         turntable_enabled = bool(self.get_parameter("turntable_enabled").value)
         side_barcode_preconfirmed = bool(str(turntable_side_barcode).strip())
+        top_barcode_preconfirmed = (
+            turntable_enabled
+            and not side_barcode_preconfirmed
+            and bool(str(turntable_top_barcode).strip())
+        )
         if turntable_enabled and not side_barcode_preconfirmed:
             target = self._level_turntable_grasp_pose(target)
         if (
@@ -5837,6 +5995,7 @@ class CosmeticBoxSingleArmNode(Node):
         use_offset_grasp_entry = (
             offset_grasp_enabled
             and not side_barcode_preconfirmed
+            and not top_barcode_preconfirmed
         )
         z_offset_m = float(self.get_parameter("grasp_z_offset_m").value)
         z_offset_limit_m = abs(float(self.get_parameter("grasp_z_offset_limit_m").value))
@@ -5996,7 +6155,9 @@ class CosmeticBoxSingleArmNode(Node):
         # A confirmed D435 side barcode already has priority over the D405
         # top barcode.  Skip the redundant detector and its low-pose wait for
         # this material, while keeping D405 target localization unchanged.
-        observe_top_barcode = not side_barcode_preconfirmed
+        observe_top_barcode = (
+            not side_barcode_preconfirmed and not top_barcode_preconfirmed
+        )
         self._set_top_surface_barcode_window(observe_top_barcode)
         with self.data_lock:
             pregrasp_reference_count = self.pregrasp_pose_count
@@ -6047,6 +6208,12 @@ class CosmeticBoxSingleArmNode(Node):
                     "offset descent, offset insert and top-surface observation; "
                     "moving directly above the D405 grasp centre"
                 )
+            elif top_barcode_preconfirmed:
+                self._publish_status(
+                    "D405 top barcode already confirmed before the turntable stop; "
+                    "skipping offset-high, offset descent and lateral insert; "
+                    "moving above the fresh post-stop D405 grasp centre"
+                )
             else:
                 self._publish_status("moving above selected box")
             with self._timed_stage("move_above"):
@@ -6070,7 +6237,11 @@ class CosmeticBoxSingleArmNode(Node):
             else:
                 self._publish_status(
                     "descending vertically to the D405 grasp centre for the "
-                    "preconfirmed side-barcode material"
+                    + (
+                        "preconfirmed side-barcode material"
+                        if side_barcode_preconfirmed
+                        else "preconfirmed top-barcode material"
+                    )
                 )
             self._require_cycle_active("immediately before grasp descent")
             if turntable_enabled and not side_barcode_preconfirmed:
@@ -6115,7 +6286,8 @@ class CosmeticBoxSingleArmNode(Node):
         # the distant hover pose a portrait label can be only a few pixels wide;
         # the closer grasp-depth frames provide the resolution needed by YOLO.
         top_surface_barcode = (
-            self._current_top_surface_barcode() if observe_top_barcode else ""
+            self._current_top_surface_barcode()
+            if observe_top_barcode else str(turntable_top_barcode).strip()
         )
         self._set_top_surface_barcode_window(False)
         barcode_face = classify_barcode_face(
