@@ -1,0 +1,174 @@
+# D405 + Nova5 101 化妆品盒自动循环 V5
+
+V5 独立于已提交的 V4 节点和启动文件。双臂避障需要配合
+`python -m examples.dobot_nova5_dh_v5.main ... --args.turntable-interlock`
+启动 102；101 使用下方 V5 launch。原 V4 launch 和原 VLA 入口保持原逻辑。
+
+101 转盘抓取或翻底期间，102 User 0 / Tool 1 TCP **同时**满足
+`Y>325 mm、X<535 mm、Z>75 mm` 时进入危险区。102 对每条动作的整段
+Cartesian 路径作保守检查，命令边界留 5 mm；路径可能穿过危险区时先在
+当前 X/Z 下退至 `Y<=320 mm`，随后再移动 X/Z。101 读取 102 实测 TCP
+复核危险区，且等待 102 释放放料许可。放料仍须原有转盘租约；放料后抓
+下一件经过 `Y>400 mm` 时，仅在 `X>=545 mm` 的安全侧才可免除放料许可，
+此经过不会触发新的 `place_done`。保护切换时 102 排空旧动作并确认，101
+才进入转盘抓取区。上述边界是 TCP 坐标条件，夹爪、物料及连杆净空仍须实机验证。
+101 在 D405 给出目标、即将执行抓取时才开启该保护；如果等待 102 撤离
+超过 0.3 秒，会重新获取 D405 目标后再运动。
+
+本流程控制 `192.168.111.101`；对 `192.168.111.102` 只打开 `30004` feedback
+读取 TCP 做 X/Y/Z 安全联锁，不打开 `29999` Dashboard，也不发送 102 运动指令。
+
+## 流程
+
+1. 操作员在 Qt 界面点击执行；101 回到初始关节角并打开夹爪。若实时反馈显示六个关节都已在初始角度的 `startup_joint_skip_tolerance_deg` 容差内，则跳过重复 MovJ，但仍保证夹爪完全打开。
+2. 触发序列号 `409122274792` 的 D405。
+3. YOLO 同时检测到多个盒子时，使用每个检测框内的双目三维点比较相机光学坐标 X，抓取 X 最小的有效目标。
+   视觉窗口中的候选框短暂显示，最终选中的目标会持续显示红色粗框、中心十字和 `NEXT GRASP`，直到下一次检测请求或人工按 `r` 清除，便于操作员确认机械臂即将抓取哪个盒子。
+4. SAM2 分割后先拟合目标周围桌面，并从物体候选平面中选择与桌面平行的真实顶面；夹爪方向和短边宽度只由这个顶面的 3D 米制点拟合，不再使用包含正面/侧面的完整 2D 轮廓。近方形顶面发生 90° 边标签互换时保持上一帧边方向，避免滤波得到对角抓取姿态。短边宽度不大于 60 mm 且长宽比不小于 1.2 时，夹爪按“实测宽度 + 20 mm”预张开；短边严格大于 60 mm 或长宽比小于 1.2 时直接全开到 95 mm。同时保留未做聚类裁剪的原始分割点作为高度证据；桌面平面不可用时依次尝试近似垂直的 RANSAC 侧平面和 SAM 轮廓边缘下方点。发布的 TCP 尖端目标在顶面向下 75% 高度处。点击后状态会立即显示“请求已接受”；随后约 1 秒的 `vision_detection` 是眼在手 D405 刷新、YOLO/SAM2 和交接通道确认，不能在目标位姿未知时安全地提前发送目标相关运动。
+   连续循环在触发视觉前先读取 102 TCP 联锁；102 尚未退出时不启动 YOLO/SAM2，避免锁定搬运中的盒子。发布抓取目标前还会用完整 FFS 场景点云检查盒子自身轮廓正上方、右侧三维交接通道，以及目标局部 `-Y/+Y` 两侧的手指垂直下探通道。任意一侧存在连通障碍簇都不允许下降，不要求必须两侧同时阻塞才停机。两侧通道只覆盖夹爪中央 60 mm 工作段，从目标侧壁外 4 mm 起向外检查 30 mm，并在 75% 抓取深度处截止；SAM2 选中目标自身的点云会被显式剔除，避免宽度瞬时低估时把盒子侧壁误判为障碍，桌面则由高度边界排除。若点云仍检测到交接阻塞，障碍退出后的第一份 LIVE 点云会在同一个机器人视觉请求内立即重启 YOLO/SAM2/FFS，不经过失败响应、100 ms 重试延时或两帧刷新；受遮挡的轨迹连续 4 帧无有效高度时也立即重启。最终仍需两份独立点云 CLEAR 才向 101 发布姿态。
+5. 视觉同时发布点云包围盒长边。偏置抓取时，横移/调姿到 `offset_high` 后不再等到高位完全停稳才提交下降：在距离高位终点默认 30 mm 时，先完成夹爪预张开和目标复检，再把垂直 `MovL` 以 CP=20 追加到同一控制器队列。高位和下降由控制器连续衔接，速度仍分别使用归一化的关节/直线速度；若首个反馈延迟、复检失败或控制器拒绝队列，程序会停止或回退到原来的安全阻塞路径。抓取并确认夹持后，先沿 User Z 抬升；默认在距离抬升终点 10 mm 时把中转关节角 `(14, -29, -99, 39, 88, 10)` 追加到同一运动队列，并用 CP=20 平滑连接。这样抬升和前往中转位不再经过一次空闲停顿；若控制器不接受队列，程序自动等待抬升完成后退回原来的阻塞式中转动作。到达中转关节后再沿 User 0 的 X+ 自动靠近扫码器。位移使用 `中转中心距离 - 盒长/2 - 扫码间隙`；默认即 `120 mm - 盒长/2 - 30 mm`。例如盒长 100 mm 时向 X+ 移动 40 mm，使盒子近侧面距扫码器约 30 mm。
+6. 抬升确认成功后、开始前往中转关节之前就打开扫码窗口，因此前往 `transfer_joint` 途中读到的条码不会丢失。到达中转点后立即检查：已经扫到稳定条码时跳过 User X+ 靠近和全部 J6 找码，直接进入安全退让；尚未扫到时才自适应靠近扫码器并沿 J6 负方向点动找码。J6 旋转途中约每 20 ms 检查一次条码，成功后立即停止并对齐到最近的标准 90° 面位；四个面都未读到条码时记录告警，但仍继续安全退让、姿态运动、放置并回到初始位。
+7. 扫码成功并完成 J6 标准面对齐后，盒子仍处于靠近扫码器的位置。程序先保持当前姿态沿 User X− 退回本轮实际 X+ 靠近距离，再额外退让 30 mm；只有核对实际退让量正确后才允许大范围姿态运动。
+8. 以退让后的实际姿态为起点，按固定 User 轴顺序合成 `Ry -90°`、再 `Rz +50°`，并与 User XYZ `(560, 375, 320) mm` 组成安全高度目标位姿。侧面条码分支先移动到固定放置位 `XYZ=(531,328,180) mm`，再执行 `User Rx=-20°`，不再下降到按物料长度计算的低 Z；结束后检查姿态和夹爪状态。
+9. 侧面条码分支到达固定放置位 `XYZ=(531, 328, 180) mm` 后执行 `User Rx=-20°`；不再下降到按物料长度计算的低 Z。夹爪从实际夹持宽度额外张开 15 mm，确认到位并释放盒子。
+   底面恢复分支在固定放置 PTP 中会在桌面翻转得到的 `User Ry=-45°` 基础上再执行 `User Ry=-45°`，同时执行 `User Rz=+50°`，最终累计 `User Ry` 约为 `-90°`。
+10. 回初始关节位，触发下一轮检测。
+
+## 构建与启动
+
+```bash
+cd /home/zdh/ffs_ws
+colcon build --packages-select dobot_nova5_driver --symlink-install
+source install/setup.bash
+ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle_v5_d435.launch.py
+```
+
+启动文件当前默认使用统一比例 `400`，抓取上方动作会钳位到 100%，抓取下降约为 94%；
+后半段的抬升、中转、扫码后组合 PTP、放置和回初始位另有独立兼容基准参数。
+需要临时恢复原基线或继续试调时，可以从启动命令覆盖，例如：
+
+```bash
+ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle_v5_d435.launch.py \
+  motion_speed_scale_percent:=100
+```
+
+D405 的障碍防抓取默认开启。若要在受控调试时关闭图像中紫色的“目标上方/右侧交接通道”候选点，可只关闭该子检查，夹爪两侧手指通道保护仍然保留：
+
+```bash
+ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle_v5_d435.launch.py \
+  handoff_overhead_clearance_enabled:=false
+```
+
+若要关闭整套 handoff/手指通道防抓取检查（包括紫色通道和两侧手指检测），使用：
+
+```bash
+ros2 launch dobot_nova5_driver cosmetic_box_single_arm_cycle_v5_d435.launch.py \
+  handoff_clearance_enabled:=false
+```
+
+整套关闭只适合确认误检来源或低速空载调试；关闭后程序仍会发布 `DISABLED`/`clear=true` 握手状态，因此不会因等待 CLEAR 而超时，但机械臂不会再由 D405 这套点云检查阻止危险下降。
+
+启动文件默认使用 `/home/zdh/miniconda3/envs/ffs_ros/bin/python` 运行视觉节点；该环境已包含当前机器上的 CUDA、FFS、SAM2、RealSense、Open3D、Ultralytics 和 ROS 2 依赖。若环境位置变化，可传入 `vision_python:=...`。
+
+D405 本地显示使用一个组合窗口，左侧为 RGB、右侧为点云；鼠标 ROI 框选只作用于左侧 RGB。远程面板的 RGB 和点云 ROS 图像话题仍保持独立。D405 默认启用自动曝光；本地组合窗口或远程面板获得键盘焦点后，按 `a` 可以实时切换自动/手动曝光，左上角显示 `AE` 或 `M Exp:... G:...`。切换到手动模式时使用曝光 `11000`、增益 `8`，并可通过 `[`、`]` 调整曝光、`-`、`+` 调整增益。
+
+扫码器需要读取 `/dev/input/event*`。临时授权脚本已包含在本项目中。构建并 `source install/setup.bash` 后执行：
+
+```bash
+sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/grant_cosmetic_barcode_access.sh"
+```
+
+该脚本会自动找到稳定的 `/dev/input/by-id/...BTW_Hid_Device-event-kbd` 链接，并将权限授予执行 `sudo` 的实际登录用户；正在运行的扫码节点会在 2 秒内自动连接。
+
+扫码枪拔插后 Linux 会创建新的 `event*` 节点，临时 ACL 会随旧节点消失。建议在部署机器上一次性安装本项目的 udev 规则，然后拔插一次扫码枪：
+
+```bash
+"$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/install_cosmetic_barcode_udev_rule.sh"
+```
+
+扫码节点每 2 秒自动重连；设备不存在与设备存在但无权限会分别打印不同提示。
+
+## 重要参数
+
+- `handeye_flange_to_cam`：当前默认继承原节点矩阵。101 与 D405 `409122274792` 上机前必须确认或重新标定。
+- `command_tool_index=1`：放置点、用户坐标点动和视觉抓取都按 Tool 1 下发。
+- `user_index=0`：用户坐标为 User 0。
+- `auto_start=false`：默认只打开控制界面，不自动运动。可点击“执行完整一轮”或“开始连续循环”。
+- `barcode_stable_hits=1`：HID 扫码器每次完整解码只输出一条数据，默认一条即成功。
+- `scanner_center_distance_m=0.120`：`transfer_joint` 处 TCP 夹持中心到扫码器的 User-X 距离。
+- `scanner_face_clearance_m=0.030`：自适应靠近后盒子侧面与扫码器之间保留的间隙。
+- `scanner_approach_negative_tolerance_m=0.005`：盒长/距离测量造成的轻微负靠近量容差。默认允许不超过 5 mm 的负值直接将 X+ 靠近量钳制为 0；更大的负值仍然安全拒绝，避免长盒子继续靠近扫码器。
+- `motion_speed_scale_percent=400`：抓取上方和抓取下降等兼容动作的统一提速比例。`100` 表示修改前多层速度比例相乘后的理论有效速度基线；当前默认使用 GUI 上限 400%。按当前兼容基准，抓取上方钳位到 100%，抓取下降约为 94%；后半段独立阶段参数直接表示单条指令有效百分比，不再被 `joint_speed` 二次压低。
+- `joint_speed=65`、`joint_acc=55`：保留原界面的兼容基准值。程序会在软件中把旧版 `SpeedFactor × VelJ/AccJ × 指令 v/a` 合成为单条指令百分比，控制器的全局回放比例固定为 100，避免重复相乘。
+- `linear_speed=60`、`linear_acc=50`：抓取下降的兼容基准值，同样只合成为一组单条 `MovL v/a`。
+- 偏置抓取的 `offset_descent` 和 `offset_insert` 使用同一组归一化 `linear_speed/linear_acc`，不再受独立的 10% 速度和 25% 上限限制。
+- 偏置抓取默认用 `offset_high_clearance_m=0.120`，在一次 PTP 中同时执行横移、抓取姿态调整和部分下降；启用 `offset_high_descent_blend_enabled=true` 后，在高位终点前默认 30 mm 排队垂直 `MovL`，以 `offset_high_descent_blend_cp=20` 连续衔接下降。夹爪预张开确认和目标复核仍是下降前的门槛；队列不可用时自动使用原来的分段阻塞路径。
+- `top_surface_barcode_wait_s` 默认 0.20 秒；检测窗口在偏置高位、下降、观察和插入期间持续开启。
+- 后半段阶段默认单条指令有效值为：抓取后抬升 90%、中转位 100%、扫码后组合 PTP 100%、放置 100%、回初始位 100%、扫码靠近/退让 100%、J6 MoveJog 100%（已达到控制器 Jog 比例上限）。抓取抬升仍保持 90%/85% 的速度/加速度，避免改变已验证的抓取动作。
+- `grasp_lift_speed_factor`、`transfer_speed_factor`、`place_speed_factor`、`return_startup_speed_factor` 分别控制抓取后抬升、中转、放置和回初始位；`jog_speed_factor` 控制扫码后的 XYZ+Ry/Rz 组合 PTP；对应的 `*_acc_factor` 控制阶段加速度。
+- `grasp_lift_transfer_blend_enabled=true`：启用抬升接近终点时提前排队 `transfer_joint` 的连续路径；`grasp_lift_transfer_blend_cp=20` 为 Dobot CP 平滑比例，`grasp_lift_transfer_queue_lead_m=0.010` 表示距离抬升终点 10 mm 时提交中转动作。若现场控制器不支持连续队列，程序会自动退回阻塞式顺序动作。
+- `grasp_lift_transfer_command_start_grace_s=0.30`：提交抬升后，等待控制器首个运动反馈包的宽限时间；避免反馈包尚未切换到当前命令时误判为不能连续队列。超过该时间仍没有活动反馈，才退回阻塞式顺序动作。
+- `offset_high_descent_blend_enabled=true`：偏置高位到垂直下降的连续队列开关；`offset_high_descent_blend_cp=20` 为 Dobot CP 平滑比例，`offset_high_descent_queue_lead_m=0.030` 表示距离 `offset_high` 终点 30 mm 时提交下降。夹爪预张开和目标复检完成后才会提交下一段；若控制器不支持 `MovL` 队列或高位已经完成，则自动退回阻塞式下降。
+- `offset_high_descent_command_start_grace_s=0.30`：提交高位 PTP 后等待首个运动反馈包的宽限时间，避免反馈切换延迟造成误回退。
+- `post_scan_place_blend_enabled=true`：侧面条码路径中，在扫码器退让完成后，将“扫码后安全高度”与“固定放置位”作为两个已知安全的 PTP 目标连续排队；`post_scan_place_blend_cp=20`、`post_scan_place_queue_lead_m=0.020` 分别控制 CP 平滑比例和距离安全高度终点的提前排队距离。若控制器拒绝队列，程序会保留安全高度并退回单独放置 PTP；扫码、夹爪确认和底面恢复分支不使用该队列。
+- `post_scan_place_command_start_grace_s=0.30`：提交安全高度动作后，等待控制器首个运动反馈包的宽限时间，避免启动反馈延迟造成误回退。
+- `scanner_retreat_post_scan_blend_enabled=true`：侧面条码路径中，在扫码器退让还剩默认 10 mm 时提前排队扫码后安全高度；该安全高度动作继续在接近终点时排队固定放置位，减少退让结束后的停顿。`scanner_retreat_post_scan_blend_cp=20` 控制连续过渡的 CP 比例，`scanner_retreat_post_scan_queue_lead_m=0.010` 保留默认 20 mm 的额外 X- 退让余量。控制器拒绝跨段队列时自动完成退让并回到原来的阻塞路径；顶面条码和底面恢复分支不使用此队列。
+- `scan_exit_user_xyz=[0.557,0.200,0.320]`：扫码后组合 PTP 的 User XYZ 目标，单位为米。
+- `face_up_user_ry_deg=-90`、`post_scan_user_rz_deg=50`：组合目标相对扫码姿态的固定 User 轴旋转；先 Ry，后 Rz。
+- `side_barcode_place_xyz=[0.531,0.328,0.180]`：四周侧面条码分支使用的独立固定放置位，单位为米；不改动顶面条码和底面恢复分支的 `Z=215 mm`。
+- `side_barcode_place_rx_delta_deg=-20`：四周侧面条码分支移动到固定放置 XYZ 时，在同一条 PTP 中完成的 User Rx 负向倾斜角；避免下降到动态低位时 J4/J5 接近桌面。
+- `bottom_barcode_place_ry_delta_deg=-45`：底面恢复分支到固定放置位时，在桌面翻转得到的 User Ry 基础上再绕 User Y 负向旋转 45°；配合 `post_scan_user_rz_deg=50`，最终累计 User Ry 通常约为 -90°。
+- `jog_speed_factor=100`：扫码后 XYZ+Ry+Rz 单条组合 PTP 的有效速度百分比。
+- `scanner_approach_speed_factor=100`、`scanner_approach_acc_factor=100`：中转点后沿 User X+ 靠近扫码器的有效速度和加速度百分比。当前采用有界 `RelMovJUser`；没有扫码时精确到达目标距离，扫码消息到达时主动停止当前运动并立即跳过 J6。
+- `scanner_approach_natural_finish_margin_m=0.005`：如果扫码时距离目标点不超过 5 mm，则让当前有界靠近指令自然完成，避免短距离 Stop 停机确认；距离较大时仍立即停止。
+- `scanner_retreat_speed_factor=100`、`scanner_retreat_acc_factor=100`：扫码成功后沿 User X− 安全退让的有效速度和加速度百分比。
+- `scanner_retreat_extra_m=0.030`：退回实际靠近距离后继续远离扫码器的额外安全余量。
+- `barcode_j6_speed_factor=100`：J6 连续点动和标准面对齐的比例上限。当前使用 `MoveJog`，已经钳位到控制器允许的 100%；若实机仍慢，应提高 Dobot 控制器的 Jog 基准速度或改用可监控的 MovJ 找码方式。
+- `handoff_clearance_enabled=true`：D405 handoff 与夹爪两侧手指下探通道的总开关。默认开启；仅受控调试时可设为 `false`。
+- `handoff_overhead_clearance_enabled=true`：D405 目标上方/图像右侧交接通道检查开关。设为 `false` 时隐藏该通道的紫色候选点，但仍保留两侧手指通道检查；若 `handoff_clearance_enabled=false`，此项自动不参与。
+- `scanner_approach_monitor_period_s=0.005`：有界 X+ 扫码靠近的条码检查周期；收到条码后立即停止当前 RelMovJUser。
+- `barcode_alignment_acc_factor=100`：J6 扫到码后吸附到最近 90°标准面的加速度。
+- `vision_samples=2`：机器人仍使用两帧结果检查 SAM2 目标稳定性；眼在手相机到达初始位后只刷新 2 帧，并复用本次目标选择时的锁定 FFS 点云，避免静止场景重复计算立体深度。
+- `pregrasp_use_live_pose_for_descent=true`：到达抓取上方后不新增等待，直接消费 move-above 期间已经到达的预抓取帧。只有最新悬停附近实测位置已超过 7 mm、且至少两个连续实测位置在 6 mm 内一致时，才先在安全高度水平修正再垂直下降；否则完整保留首次稳定抓点。运动中的平滑趋势只记录诊断，不再做位置外推。`pregrasp_live_orientation_enabled=false` 默认锁定首次稳定姿态，避免平放盒子的 OBB 90°跳变或小角度偏差导致斜插；只有确认现场允许目标旋转时才开启姿态跟随，开启后仍需至少 3 帧共识且平面法向一致。
+- `pregrasp_hover_frame_window_s=0.25`：悬停前可复用的已采集稳定帧时间窗，约一个 D405 帧周期；只改变取样范围，不增加等待。
+- `pregrasp_prediction_horizon_s=0.0`：旧 launch 兼容参数；当前不再把视觉趋势外推到未来抓取点。
+- `pregrasp_position_consensus_m=0.006`：最新帧结尾的连续位置共识半径。单帧跳点和移动相机产生的旧趋势不能触发修正；真实移动并稳定到新位置的目标仍会触发一次安全悬停修正。
+- `pregrasp_unconfirmed_shift_reject_m=0.020`：悬停复检出现超过 20 mm 的位置跳变、但没有达到两帧位置共识时，按目标丢失或 SAM 掩膜漂移中止本次下降并重新检测。
+- `vision_pose_max_time_skew_s=0.30`：D405 设备时间映射到主机 Unix 时间；101 feedback 的 `TimeStamp` 若是 Unix 时钟则直接使用，若是控制器相对时钟则根据 8 ms 周期映射到主机时间，无法识别时回退到主机收包时间。只允许帧时间落在反馈历史首尾附近，避免把当前机器人位姿错误套到旧图像上。
+- `secondary_base_y_offset_m=-0.725`：将 102 User-Y 换算到 101 公共坐标系；本联锁比较的是公共坐标系 Y 差，不是三维欧氏距离。整个节点只控制 101，对 102 始终只读 feedback。
+- V5 双臂自动运行要求 102 使用已接入 ROS 放料区许可的 VLA。101 初始位等待首件时，或确认上一件物料和 TCP 已完成转盘净空离开、抓取/翻底保护结束后，通过 `/dual_arm_102_turntable_lease` 授予 102 放料许可；不再要求 101 的 User-Y 达到 250 mm，上一件撤离后的许可只发放一次。确认离开转盘后，101 也不再因单独的 TCP Y 间距触发停机。`0.400 m` 仍是 102 放料进入/退回和租约释放边界。101 准备抓取转盘物料时，通过 `/dual_arm_102_guard_xyz` 发布三维危险区，并等待实测 102 TCP 离开该区域、旧动作排空且许可释放后才开始；该保护覆盖转盘抓取与底面条码翻转，直到 101 已将物料抬离转盘并开始放置。101 每 100 ms 重发保护状态。VLA/RTC 推理继续运行；400 mm 租约申请/释放异步处理。VLA 每 100 ms 发布 `/dual_arm_102_interlock_heartbeat`，默认超过 0.5 s 未收到时 101 不进入抓取区。近距离保护触发后，只有控制器空闲、102 已退出且许可已释放，101 才从初始位自动开始新一轮；控制器进入 `COLLISION` 时不会自动清除故障。`secondary_vla_interlock_required=true` 为默认值。
+- 101 通过 `/dual_arm_102_post_place_fetch` 报告 102 的放料后撤离阶段：只在实际观测到 102 先进入 Y≥0.400 m、再退出到 Y<0.400 m 后置为 true；下一次危险 X 侧进入放料区、手动 `place_done` 或恢复重置时清零。这个阶段信号单独不能放行；102 实测、目标与上一个目标均在 `X>=545 mm`，才能在抓下一件时免除 400 mm 放料许可。其余放料动作仍需许可。
+- `secondary_y_clearance_m=0.160`：101 运动时两臂 TCP 公共 Y 间距小于 160 mm 会取消 101 轨迹；101 尚未运动则保持等待。这是冗余保护，不是放料许可。
+- `secondary_emergency_retreat_m=0.142`、`secondary_emergency_recover_m=0.180`：低于 142 mm 时仍停 101，但 V5 不再在 102 继续运动时自动执行 101 的 Y 向 MoveJog。两臂退出后可按上述许可条件自动重新开始完整循环。
+- `secondary_motion_monitor_poll_s=0.010`、`secondary_tcp_max_age_s=0.05`：每 10 ms 检查 102 feedback，超过 50 ms 视为失效。该 Python/ROS/TCP 互锁不是硬实时或安全认证功能，仍需在控制器或安全 PLC 中设置双臂共享区互斥及实机低速轨迹验证。
+- `vision_result_topic=/d405_vision_result`：视觉端会明确返回本次请求成功或失败；ROI 内无目标、YOLO 无目标、立体点不足时会立即返回。目标正上方、右侧交接通道或手指通道有障碍时先等待其退出；退出后保持同一个请求并立即基于静止目标重新执行 YOLO/SAM2/FFS。控制端上限为 `vision_timeout_s=20.0`，正常 CLEAR 流程不会固定等待该时长。
+- `/d405_handoff_zone_clear`：只有目标正上方、右侧交接通道和两条手指下探通道连续两份独立完整点云均清空时才发布 `true`。
+- `/d405_handoff_zone_state`：JSON 状态，包含 `BLOCKED/VERIFYING_CLEAR/REACQUIRE_TARGET/CLEAR`、禁入区候选点数、最大连通簇点数、清空连续帧数，以及 `-Y/+Y` 两侧候选点数、连通簇、从通道剔除的目标自身点数和 CLEAR 状态。
+- `vision_retry_delay_s=0.1`：连续模式一次检测明确失败后，到发起下一次检测之间的等待时间。
+- `place_release_clearance_m=0.015`：放置点位保持不变；夹爪到达放置点后，从实际夹持宽度额外张开 15 mm 并确认到位，不再等待完全张到 95 mm。
+- `barcode_face_wait_s=0.05`：每个 J6 标准面等待扫码的最长时间。
+- `scanner_transfer_barcode_grace_s=0.06`：到达扫码中转位后给 HID 回调保留 60 ms；在窗口内读到条码时直接跳过 User X+ 靠近及其 Stop 等待。
+- `grasp_close_settle_s=0.05`：夹爪闭合命令完成后、第一次反馈确认前的原位稳定时间；仍保留两次夹持反馈确认。
+- `grasp_min_closure_from_preshape_m=0.005`：即使 DH 返回 `state=2`，相对预张开至少闭合 5 mm 才允许抬升；闭合量不足表示手指可能顶在盒顶/边缘，程序会先开爪、垂直退出并重新检测。
+- `barcode_max_face_rotations=4`：界面固定检查四个面（当前面加三次 J6 旋转）；仍未扫码时记录告警，并继续安全退让、姿态运动和放置，不在中转点停机。
+- `grasp_z_offset_m=0.010`：根据当前实机日志默认将视觉抓取 Z 上移 10 mm，用于补偿手眼高度偏差；界面中正值表示抓得更浅。
+- `minimum_safe_tcp_z_m=0.010`：抓取命令不会低于 10 mm；低于该值时自动钳位并打印警告。
+
+界面中可以修改统一提速比例、抓取后抬升/中转/扫码后组合/放置/回初始位的阶段速度和加速度、初始关节、中转关节、扫码后用户 XYZ、组合 User Ry/Rz 增量、最终放置位姿、抓取下降速度、扫码器靠近速度、J6 找码速度、夹爪力、抓取 Z 修正、TCP 最低安全 Z、抬升高度及扫码稳定参数。接受视觉目标后，启用偏置抓取时，顶面条码检测窗口先开启；程序根据目标抓取姿态预先推算调姿后的相机方向，并用一条 PTP 同时完成抓取姿态调整和到达 `offset_high`，不经过物料中心上方。夹爪预张开与这段运动并行，并在 `offset_high` 确认停止和复检目标后执行 `offset_descent`、低位顶面观察及 `offset_insert`。关闭偏置抓取时仍使用中心上方悬停和垂直下降路径。下降到位后，程序会在原位等待夹爪完成闭合并检查 `state=2`，确认夹持后才允许抬升；抬升后会再次检查是否掉落。建议先“只采样视觉”，确认结果后再执行完整一轮。
+
+观察状态：
+
+```bash
+ros2 topic echo /cosmetic_pick_cycle_status
+ros2 topic echo /cosmetic_pick_cycle_timing
+ros2 topic echo /cosmetic_box_height
+ros2 topic echo /detected_barcodes
+ros2 topic echo /d405_handoff_zone_state
+```
+
+`/cosmetic_pick_cycle_timing` 使用 JSON 字符串发布两类数据：每个阶段完成时发布
+`event=stage`，每轮结束时发布 `event=cycle_summary`。成功轮次从触发视觉开始计时，
+到放置后回到初始关节位结束；视觉无目标、空抓重试和故障轮次也会分别以
+`no_target`、`grasp_retry`、`fault` 结算，便于直接统计平均值和 P95。
+
+首次实机验证建议将机械臂速度参数降低，并确认：手眼矩阵、Tool 1、User 0、75% 深度方向以及最终放置点均与现场一致。

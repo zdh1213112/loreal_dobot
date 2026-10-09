@@ -20,12 +20,14 @@ setup(
                 "launch/cosmetic_box_single_arm_cycle_v3.launch.py",
                 "launch/cosmetic_box_single_arm_cycle_v3_fast_d435.launch.py",
                 "launch/cosmetic_box_single_arm_cycle_v4_d435.launch.py",
+                "launch/cosmetic_box_single_arm_cycle_v5_d435.launch.py",
             ],
         ),
         (
             f"share/{package_name}",
             [
                 "README_cosmetic_box_single_arm.md",
+                "README_cosmetic_box_single_arm_v5.md",
                 "README_cosmetic_box_turntable_v3.md",
                 "README_cosmetic_box_turntable_v3_fast_d435.md",
             ],
@@ -69,6 +71,7 @@ setup(
             "nova5_cosmetic_box_cycle_v3 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3:main",
             "nova5_cosmetic_box_cycle_v3_fast = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3_fast:main",
             "nova5_cosmetic_box_cycle_v4 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v4:main",
+            "nova5_cosmetic_box_cycle_v5 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v5:main",
         ],
     },
 )
