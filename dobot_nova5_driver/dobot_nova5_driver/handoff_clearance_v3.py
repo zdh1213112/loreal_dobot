@@ -214,6 +214,39 @@ def find_unsupported_near_depth_points(
     return unsupported
 
 
+def find_support_plane_points(
+    points_3d: np.ndarray,
+    candidate_mask: np.ndarray,
+    plane_model: np.ndarray,
+    *,
+    max_distance_m: float,
+) -> np.ndarray:
+    """Identify side candidates lying on a separately fitted support plane.
+
+    This only removes measured surface points, not arbitrary low obstacles.
+    Callers must first validate that the plane is the box's support surface.
+    """
+
+    points = np.asarray(points_3d, dtype=np.float64)
+    candidates = np.asarray(candidate_mask, dtype=bool)
+    plane = np.asarray(plane_model, dtype=np.float64).reshape(-1)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_3d must have shape (N, 3)")
+    if candidates.shape != (len(points),):
+        raise ValueError("candidate_mask must have shape (N,)")
+    if plane.shape != (4,) or not np.isfinite(plane).all():
+        raise ValueError("plane_model must have four finite coefficients")
+    normal_length = float(np.linalg.norm(plane[:3]))
+    if normal_length <= 0.0 or max_distance_m <= 0.0:
+        raise ValueError("plane normal and max_distance_m must be positive")
+    signed_distance = (points @ plane[:3] + plane[3]) / normal_length
+    return (
+        candidates
+        & np.isfinite(points).all(axis=1)
+        & (np.abs(signed_distance) <= float(max_distance_m))
+    )
+
+
 def evaluate_target_overhead_clearance(
     points_3d: np.ndarray,
     box_center: np.ndarray,

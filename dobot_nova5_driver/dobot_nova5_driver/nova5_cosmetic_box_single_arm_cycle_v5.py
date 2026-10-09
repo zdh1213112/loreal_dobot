@@ -306,6 +306,14 @@ class RecoverableGraspError(RuntimeError):
         self.needs_vertical_retreat = needs_vertical_retreat
 
 
+class BottomRegraspTargetLost(RuntimeError):
+    """The released box cannot be located for the final bottom-face regrasp."""
+
+
+class EmptyTurntableConfirmed(RuntimeError):
+    """D405 confirmed no box while 101 was still waiting at startup."""
+
+
 class SecondaryClearanceRetry(RuntimeError):
     """The left arm must retry a cycle because the right arm is too close."""
 
@@ -636,6 +644,12 @@ class CosmeticBoxSingleArmNode(Node):
         # 视觉请求内部会等待 102 从目标上方退出。延长的上限只影响真正
         # 被遮挡的请求；正常 CLEAR 流程仍在第二份新鲜点云到达后立即继续。
         self.declare_parameter("vision_timeout_s", 20.0)
+        # Only an explicit full-frame D405 no-box result may cancel a stale
+        # material event.  Timeouts, ROI misses and blocked handoff are not
+        # evidence that the turntable is empty.
+        self.declare_parameter("empty_turntable_confirm_samples", 2)
+        self.declare_parameter("empty_turntable_result_timeout_s", 2.0)
+        self.declare_parameter("empty_turntable_guard_probe_interval_s", 2.0)
         # Detect after the turntable stops, as in V3 fast. During rotation a
         # single moving-box YOLO miss or a drifting SAM2 lock is not a useful
         # starting point for the next grasp. Warm pretracking remains opt-in.
@@ -913,6 +927,7 @@ class CosmeticBoxSingleArmNode(Node):
         # 仅当抬升后反馈仍为“运动中”时使用，并非每轮固定等待。
         self.declare_parameter("grasp_feedback_wait_s", 0.7)
         self.declare_parameter("single_cycle_grasp_retry_limit", 3)
+        self.declare_parameter("bottom_regrasp_auto_rescan_max_retries", 2)
         self.declare_parameter("grasp_success_min_opening_m", 0.003)
         # A correct side grasp starts with roughly 20 mm clearance and must
         # visibly close before state=GRIPPED is trusted.  If the fingers land
@@ -2158,6 +2173,7 @@ class CosmeticBoxSingleArmNode(Node):
                         self.secondary_zone_held_by_102
                         or (
                             self.secondary_zone_open_for_102
+                            and self.turntable_waiting_for_place
                             and not self.secondary_pick_guard_active
                             and (self.controller.robot_mode == 5 or departure_clear)
                             and (
@@ -2202,11 +2218,14 @@ class CosmeticBoxSingleArmNode(Node):
 
     def _open_secondary_zone_for_placement(self) -> None:
         self._set_secondary_pick_guard(False)
+        with self.turntable_condition:
+            waiting_for_place = self.turntable_waiting_for_place
         with self.secondary_safety_lock:
             self.secondary_material_removed_for_handoff = False
             self.secondary_departure_grant_consumed = False
             self.secondary_zone_open_for_102 = (
                 self.cycle_enabled
+                and waiting_for_place
                 and not self.secondary_zone_held_by_102
                 and not self.secondary_protective_stop_latched.is_set()
                 and self.controller.robot_mode == 5
@@ -2233,7 +2252,9 @@ class CosmeticBoxSingleArmNode(Node):
                 "pick/flip guard; 102 may place while 101 finishes at the fixed pose"
             )
 
-    def _close_secondary_zone_for_pick(self) -> None:
+    def _close_secondary_zone_for_pick(
+        self, material_event_number: Optional[int] = None
+    ) -> None:
         self.secondary_pick_motion_active = False
         self._set_secondary_pick_guard(True)
         with self.secondary_safety_lock:
@@ -2243,7 +2264,38 @@ class CosmeticBoxSingleArmNode(Node):
         if not bool(self.get_parameter("secondary_vla_interlock_required").value):
             return
         clear_since = None
+        empty_probe_interval_s = max(
+            0.2,
+            float(self.get_parameter("empty_turntable_guard_probe_interval_s").value),
+        ) if material_event_number is not None else 0.0
+        next_empty_probe_at = (
+            time.monotonic() + empty_probe_interval_s
+            if material_event_number is not None else float("inf")
+        )
         while self.running and self.cycle_enabled:
+            if time.monotonic() >= next_empty_probe_at:
+                next_empty_probe_at = time.monotonic() + empty_probe_interval_s
+                with self.secondary_safety_lock:
+                    leased_for_probe = self.secondary_zone_held_by_102
+                if not leased_for_probe and self._secondary_vla_heartbeat_fresh():
+                    try:
+                        probe_pose = self._read_secondary_y_clearance()
+                        _, _, recover_m = self._secondary_interlock_distances()
+                        right_clear = (
+                            float(probe_pose["right_y_m"])
+                            < float(self.get_parameter("secondary_pick_guard_y_m").value)
+                            and float(probe_pose["gap_y_m"]) >= recover_m
+                        )
+                    except Exception:
+                        right_clear = False
+                    # Never use an occluded D405 view as evidence of an empty
+                    # table while 102 is still inside its guarded Y corridor.
+                    if right_clear and self._confirm_empty_turntable(
+                        material_event_number
+                    ):
+                        raise EmptyTurntableConfirmed(
+                            "D405 confirmed an empty turntable before 101 pick motion"
+                        )
             if not self._secondary_vla_heartbeat_fresh():
                 # 101 is still at startup. Wait for the VLA to reconnect;
                 # restarting it must not require an operator to re-enable 101.
@@ -3308,7 +3360,9 @@ class CosmeticBoxSingleArmNode(Node):
         self._set_secondary_post_place_fetch(False)
         self._accept_turntable_place_done("manual/topic place_done")
 
-    def _accept_turntable_place_done(self, source: str) -> None:
+    def _accept_turntable_place_done(
+        self, source: str, *, expected_current_event_number: Optional[int] = None
+    ) -> Optional[int]:
         """Start a fresh material round for every completed 102 placement.
 
         In the V3 cell contract a place_done event means the material has been
@@ -3318,6 +3372,11 @@ class CosmeticBoxSingleArmNode(Node):
 
         thread = None
         with self.turntable_condition:
+            if (
+                expected_current_event_number is not None
+                and self.turntable_place_done_count != expected_current_event_number
+            ):
+                return None
             scan_running = self.turntable_scan_in_progress
             if not scan_running:
                 if self.turntable_state == "UNKNOWN":
@@ -3367,7 +3426,7 @@ class CosmeticBoxSingleArmNode(Node):
                 f"new material event #{event_number} from {source} replaced the "
                 "previous scan; stopping it before scanning the latest material"
             )
-            return
+            return event_number
         self._publish_status(
             f"accepted material event #{event_number} from {source}; "
             "place_done confirms the turntable is stopped, starting a fresh "
@@ -3376,6 +3435,7 @@ class CosmeticBoxSingleArmNode(Node):
         if thread is None:
             raise RuntimeError("turntable pre-scan worker was not created")
         thread.start()
+        return event_number
 
     def _turntable_prescan_worker(self, event_number: int) -> None:
         barcode = ""
@@ -3574,6 +3634,122 @@ class CosmeticBoxSingleArmNode(Node):
             if self.turntable_active_pick_event_number == event_number:
                 self.turntable_active_pick_event_number = None
                 self.turntable_condition.notify_all()
+
+    def _confirm_empty_turntable(self, event_number: int) -> bool:
+        """Require separate explicit D405 no-box replies for this stopped event."""
+
+        def unobstructed_view() -> bool:
+            if not bool(self.get_parameter("secondary_vla_interlock_required").value):
+                return True
+            with self.secondary_safety_lock:
+                if self.secondary_zone_held_by_102:
+                    return False
+            try:
+                measurement = self._read_secondary_y_clearance()
+                _, _, recover_m = self._secondary_interlock_distances()
+                return (
+                    float(measurement["right_y_m"])
+                    < float(self.get_parameter("secondary_pick_guard_y_m").value)
+                    and float(measurement["gap_y_m"]) >= recover_m
+                )
+            except Exception:
+                return False
+
+        samples = max(
+            2, int(self.get_parameter("empty_turntable_confirm_samples").value)
+        )
+        timeout_s = max(
+            0.2,
+            float(self.get_parameter("empty_turntable_result_timeout_s").value),
+        )
+        for index in range(samples):
+            if not unobstructed_view():
+                return False
+            with self.turntable_condition:
+                if (
+                    self.turntable_place_done_count != event_number
+                    or not self.turntable_material_ready
+                    or self.turntable_state != "STOPPED"
+                    or self.turntable_scan_in_progress
+                ):
+                    return False
+            with self.data_lock:
+                previous_result = self.vision_result_count
+            trigger = Bool()
+            trigger.data = True
+            self.trigger_publisher.publish(trigger)
+            deadline = time.monotonic() + timeout_s
+            result = None
+            while self.running and self.cycle_enabled and time.monotonic() < deadline:
+                with self.data_lock:
+                    if self.vision_result_count > previous_result:
+                        result = self.latest_vision_result
+                        break
+                time.sleep(VISION_REQUEST_POLL_S)
+            if result != "failure:no_cosmetic_box":
+                if result is not None:
+                    self._publish_status(
+                        f"empty-turntable check rejected: D405 returned {result}"
+                    )
+                return False
+            if index + 1 < samples:
+                time.sleep(0.10)
+        return unobstructed_view()
+
+    def _release_confirmed_empty_turntable_event(self, event_number: int) -> bool:
+        """Reopen 102 placement only if 101 is physically idle at startup."""
+
+        if self.controller.robot_mode != 5:
+            return False
+        try:
+            current = self.controller.current_joint()
+            startup = self._six_values("startup_joint")
+            tolerance_deg = max(
+                0.5,
+                float(self.get_parameter("startup_joint_skip_tolerance_deg").value),
+            )
+            at_startup = len(current) == len(startup) and all(
+                math.isfinite(float(actual))
+                and abs(float(actual) - float(expected)) <= tolerance_deg
+                for actual, expected in zip(current, startup)
+            )
+        except Exception:
+            at_startup = False
+        if not at_startup:
+            self._publish_status(
+                "D405 reports no box, but 101 startup pose is not verified; "
+                "keeping the 102 placement lease closed"
+            )
+            return False
+        with self.turntable_condition:
+            if (
+                self.turntable_place_done_count != event_number
+                or not self.turntable_material_ready
+                or self.turntable_state != "STOPPED"
+                or self.turntable_scan_in_progress
+            ):
+                return False
+            self.turntable_active_pick_event_number = None
+            self.turntable_material_ready = False
+            self.turntable_ready_barcode = ""
+            self.turntable_ready_top_barcode = ""
+            self.turntable_scan_error = ""
+            self.turntable_waiting_for_place = True
+            self.turntable_place_done_duplicate_warned = False
+            self.turntable_secondary_retreat_trigger.reset(require_fresh_entry=True)
+            self.turntable_condition.notify_all()
+        self.last_accepted_target = None
+        self.last_accepted_width_m = None
+        self.last_accepted_length_m = None
+        self.last_accepted_height_m = None
+        self.last_accepted_aspect_ratio = None
+        self._set_top_surface_barcode_window(False)
+        self._open_secondary_zone_for_placement()
+        self._publish_status(
+            f"material event #{event_number} was empty in repeated D405 checks; "
+            "101 remains at startup and 102 may place a fresh box"
+        )
+        return True
 
     def _mark_turntable_material_removed(self) -> None:
         """Release the picked material without erasing a newer 102 placement."""
@@ -4393,6 +4569,48 @@ class CosmeticBoxSingleArmNode(Node):
             return self._request_vision_target(require_cycle_enabled=require_cycle_enabled)
         return None
 
+    def _recover_bottom_regrasp_target_loss(
+        self, event_number: int, *, rescan: bool = True
+    ) -> Optional[int]:
+        """Return home with the 102 guard held, then rescan the released box."""
+
+        self._publish_status(
+            "final bottom regrasp lost its D405 target; returning 101 to startup "
+            "before rescanning the box still on the turntable"
+        )
+        self._wait_for_secondary_y_clearance(
+            "bottom regrasp automatic startup return", require_cycle_active=False
+        )
+        with self._safe_startup_return():
+            with self._timed_stage("bottom_regrasp_return_startup"):
+                self._prepare_robot_for_startup_recovery()
+                clearance_z = float(
+                    self.get_parameter("fast_side_camera_clearance_z_m").value
+                )
+                if not math.isfinite(clearance_z):
+                    raise RuntimeError("bottom regrasp recovery clearance Z is not finite")
+                if self._current_command_pose().z < clearance_z - 0.005:
+                    self._bottom_center_linear_z(
+                        clearance_z,
+                        self._motion_profile(),
+                        "bottom regrasp recovery vertical clearance",
+                        lifting=True,
+                    )
+                self._move_startup_and_open(require_cycle_active=True)
+        # The guarded zone remains closed until the arm has actually returned.
+        self._set_secondary_pick_guard(False)
+        self._release_active_material_event(event_number)
+        if not rescan:
+            return None
+        with self.turntable_condition:
+            if self.turntable_place_done_count != event_number:
+                return None
+        self._stop_turntable_if_running("bottom regrasp automatic rescan")
+        return self._accept_turntable_place_done(
+            "automatic bottom-regrasp D405-loss retry",
+            expected_current_event_number=event_number,
+        )
+
     def _cycle_worker(self) -> None:
         try:
             with self.action_lock:
@@ -4405,6 +4623,8 @@ class CosmeticBoxSingleArmNode(Node):
                 pending_side_barcode: Optional[str] = None
                 pending_top_barcode: Optional[str] = None
                 pending_material_event_number: Optional[int] = None
+                bottom_retry_event_number: Optional[int] = None
+                bottom_retry_count = 0
                 early_top_enabled = (
                     bool(self.get_parameter("turntable_enabled").value)
                     and bool(self.get_parameter("top_surface_barcode_enabled").value)
@@ -4498,6 +4718,20 @@ class CosmeticBoxSingleArmNode(Node):
                             )
                             target_bundle = self._request_vision_target()
                     if target_bundle is None:
+                        if (
+                            self.running
+                            and self.cycle_enabled
+                            and bool(self.get_parameter("turntable_enabled").value)
+                            and self._confirm_empty_turntable(pending_material_event_number)
+                            and self._release_confirmed_empty_turntable_event(
+                                pending_material_event_number
+                            )
+                        ):
+                            pending_material_event_number = None
+                            pending_side_barcode = None
+                            pending_top_barcode = None
+                            self._finish_cycle_timing("empty_turntable_reopened_for_102")
+                            continue
                         delay = max(0.1, float(self.get_parameter("vision_retry_delay_s").value))
                         self._publish_status(f"cycle {cycle_index}: no valid box; retrying in {delay:.1f}s")
                         with self._timed_stage("vision_retry_delay"):
@@ -4515,11 +4749,28 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                         if bool(self.get_parameter("turntable_enabled").value):
                             guard_wait_started = time.monotonic()
-                            self._close_secondary_zone_for_pick()
+                            self._close_secondary_zone_for_pick(
+                                pending_material_event_number
+                            )
                             if time.monotonic() - guard_wait_started > 0.30:
                                 with self._timed_stage("post_guard_fresh_vision"):
                                     refreshed = self._request_vision_target()
                                 if refreshed is None:
+                                    if (
+                                        self._confirm_empty_turntable(
+                                            pending_material_event_number
+                                        )
+                                        and self._release_confirmed_empty_turntable_event(
+                                            pending_material_event_number
+                                        )
+                                    ):
+                                        pending_material_event_number = None
+                                        pending_side_barcode = None
+                                        pending_top_barcode = None
+                                        self._finish_cycle_timing(
+                                            "empty_turntable_reopened_for_102"
+                                        )
+                                        continue
                                     self._set_secondary_pick_guard(False)
                                     self._finish_cycle_timing("post_guard_vision_retry")
                                     continue
@@ -4544,6 +4795,33 @@ class CosmeticBoxSingleArmNode(Node):
                         self._publish_status(str(exc))
                         self._finish_cycle_timing("material_replaced")
                         continue
+                    except EmptyTurntableConfirmed as exc:
+                        if not self._release_confirmed_empty_turntable_event(
+                            pending_material_event_number
+                        ):
+                            with self.turntable_condition:
+                                replaced = (
+                                    self.turntable_place_done_count
+                                    != pending_material_event_number
+                                )
+                            if replaced:
+                                self._release_active_material_event(
+                                    pending_material_event_number
+                                )
+                                pending_material_event_number = None
+                                pending_side_barcode = None
+                                pending_top_barcode = None
+                                self._finish_cycle_timing("material_replaced")
+                                continue
+                            raise RuntimeError(
+                                "D405 reported an empty turntable, but 101 startup "
+                                "or the material-event state could not be verified"
+                            ) from exc
+                        pending_material_event_number = None
+                        pending_side_barcode = None
+                        pending_top_barcode = None
+                        self._finish_cycle_timing("empty_turntable_reopened_for_102")
+                        continue
                     except SecondaryClearanceRetry as exc:
                         if not self.running or not self.cycle_enabled:
                             self._finish_cycle_timing("cancelled")
@@ -4553,6 +4831,37 @@ class CosmeticBoxSingleArmNode(Node):
                         with self._timed_stage("secondary_clearance_retry_delay"):
                             time.sleep(delay)
                         self._finish_cycle_timing("secondary_clearance_retry")
+                        continue
+                    except BottomRegraspTargetLost as exc:
+                        if pending_material_event_number != bottom_retry_event_number:
+                            bottom_retry_count = 0
+                        bottom_retry_count += 1
+                        limit = max(0, int(self.get_parameter(
+                            "bottom_regrasp_auto_rescan_max_retries"
+                        ).value))
+                        new_event = self._recover_bottom_regrasp_target_loss(
+                            pending_material_event_number,
+                            rescan=bottom_retry_count <= limit,
+                        )
+                        bottom_retry_event_number = new_event
+                        pending_material_event_number = None
+                        pending_side_barcode = None
+                        pending_top_barcode = None
+                        d405_pretracking_armed = False
+                        if bottom_retry_count > limit:
+                            raise RuntimeError(
+                                f"Final bottom regrasp lost D405 target after "
+                                f"{bottom_retry_count} attempts; 101 returned to startup"
+                            ) from exc
+                        if new_event is None:
+                            bottom_retry_count = 0
+                            self._finish_cycle_timing("material_replaced")
+                            continue
+                        self._publish_status(
+                            f"automatic bottom-regrasp rescan {bottom_retry_count}/{limit}: "
+                            f"new material event #{new_event}"
+                        )
+                        self._finish_cycle_timing("bottom_regrasp_auto_rescan")
                         continue
                     except RecoverableGraspError as exc:
                         with self._timed_stage("grasp_failure_recovery"):
@@ -5006,6 +5315,7 @@ class CosmeticBoxSingleArmNode(Node):
                     0, int(self.get_parameter("single_cycle_grasp_retry_limit").value)
                 )
                 grasp_failures = 0
+                bottom_retry_count = 0
                 attempt_index = 0
                 while True:
                     attempt_index += 1
@@ -5044,6 +5354,21 @@ class CosmeticBoxSingleArmNode(Node):
                             )
                             grasp_failures = 0
                             continue
+                        if (
+                            self.running
+                            and self.cycle_enabled
+                            and bool(self.get_parameter("turntable_enabled").value)
+                            and self._confirm_empty_turntable(material_event_number)
+                            and self._release_confirmed_empty_turntable_event(
+                                material_event_number
+                            )
+                        ):
+                            self._finish_cycle_timing("empty_turntable_reopened_for_102")
+                            material_event_number, turntable_side_barcode, turntable_top_barcode = (
+                                self._wait_for_scanned_turntable_material()
+                            )
+                            grasp_failures = 0
+                            continue
                         self._release_active_material_event(material_event_number)
                         self._finish_cycle_timing("no_target")
                         raise RuntimeError("no stable D405 target received")
@@ -5053,11 +5378,18 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                         if bool(self.get_parameter("turntable_enabled").value):
                             guard_wait_started = time.monotonic()
-                            self._close_secondary_zone_for_pick()
+                            self._close_secondary_zone_for_pick(material_event_number)
                             if time.monotonic() - guard_wait_started > 0.30:
                                 with self._timed_stage("post_guard_fresh_vision"):
                                     result = self._request_vision_target()
                                 if result is None:
+                                    if self._confirm_empty_turntable(
+                                        material_event_number
+                                    ):
+                                        raise EmptyTurntableConfirmed(
+                                            "D405 confirmed an empty turntable after "
+                                            "waiting for 102 clearance"
+                                        )
                                     self._set_secondary_pick_guard(False)
                                     raise RuntimeError(
                                         "D405 target unavailable after waiting for 102 clearance"
@@ -5081,6 +5413,35 @@ class CosmeticBoxSingleArmNode(Node):
                         )
                         grasp_failures = 0
                         continue
+                    except EmptyTurntableConfirmed as exc:
+                        if not self._release_confirmed_empty_turntable_event(
+                            material_event_number
+                        ):
+                            with self.turntable_condition:
+                                replaced = (
+                                    self.turntable_place_done_count
+                                    != material_event_number
+                                )
+                            if replaced:
+                                self._release_active_material_event(
+                                    material_event_number
+                                )
+                                self._finish_cycle_timing("material_replaced")
+                                material_event_number, turntable_side_barcode, turntable_top_barcode = (
+                                    self._wait_for_scanned_turntable_material()
+                                )
+                                grasp_failures = 0
+                                continue
+                            raise RuntimeError(
+                                "D405 reported an empty turntable, but 101 startup "
+                                "or the material-event state could not be verified"
+                            ) from exc
+                        self._finish_cycle_timing("empty_turntable_reopened_for_102")
+                        material_event_number, turntable_side_barcode, turntable_top_barcode = (
+                            self._wait_for_scanned_turntable_material()
+                        )
+                        grasp_failures = 0
+                        continue
                     except SecondaryClearanceRetry as exc:
                         if not self.running or not self.cycle_enabled:
                             self._finish_cycle_timing("cancelled")
@@ -5090,6 +5451,28 @@ class CosmeticBoxSingleArmNode(Node):
                         with self._timed_stage("secondary_clearance_retry_delay"):
                             time.sleep(delay)
                         self._finish_cycle_timing("secondary_clearance_retry")
+                        continue
+                    except BottomRegraspTargetLost as exc:
+                        bottom_retry_count += 1
+                        limit = max(0, int(self.get_parameter(
+                            "bottom_regrasp_auto_rescan_max_retries"
+                        ).value))
+                        new_event = self._recover_bottom_regrasp_target_loss(
+                            material_event_number,
+                            rescan=bottom_retry_count <= limit,
+                        )
+                        if bottom_retry_count > limit:
+                            raise RuntimeError(
+                                f"Final bottom regrasp lost D405 target after "
+                                f"{bottom_retry_count} attempts; 101 returned to startup"
+                            ) from exc
+                        self._finish_cycle_timing("bottom_regrasp_auto_rescan")
+                        if new_event is None:
+                            bottom_retry_count = 0
+                        material_event_number, turntable_side_barcode, turntable_top_barcode = (
+                            self._wait_for_scanned_turntable_material()
+                        )
+                        grasp_failures = 0
                         continue
                     except RecoverableGraspError as exc:
                         grasp_failures += 1
@@ -7873,7 +8256,7 @@ class CosmeticBoxSingleArmNode(Node):
                 )
                 return pose
             time.sleep(0.01)
-        raise RuntimeError(
+        raise BottomRegraspTargetLost(
             "No fresh D405 tracked target arrived after the second Tool-Rx; "
             "final bottom regrasp descent was not commanded"
         )

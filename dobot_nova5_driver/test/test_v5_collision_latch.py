@@ -6,6 +6,7 @@ import pytest
 
 from dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v5 import (
     CosmeticBoxSingleArmNode,
+    EmptyTurntableConfirmed,
 )
 from dobot_nova5_driver.turntable_v3 import PlacementRetreatTrigger
 
@@ -22,6 +23,7 @@ def stopped_node():
     node.secondary_recovery_clear_samples = 0
     node.secondary_safety_reason = ""
     node.secondary_zone_open_for_102 = False
+    node.turntable_waiting_for_place = True
     node.secondary_zone_held_by_102 = False
     node.secondary_pick_guard_active = False
     node.secondary_pick_motion_active = False
@@ -55,6 +57,147 @@ def stopped_node():
     )
     node.get_logger = lambda: MagicMock()
     return node
+
+
+def empty_event_node():
+    node = stopped_node()
+    node.running = True
+    node.controller.robot_mode = 5
+    node.controller.current_joint = lambda: [25.0, 13.0, -110.0, 15.0, 80.0, 20.0]
+    node.turntable_lock = threading.RLock()
+    node.turntable_condition = threading.Condition(node.turntable_lock)
+    node.turntable_place_done_count = 3
+    node.turntable_active_pick_event_number = 3
+    node.turntable_material_ready = True
+    node.turntable_scan_in_progress = False
+    node.turntable_state = "STOPPED"
+    node.turntable_ready_barcode = "barcode_detected"
+    node.turntable_ready_top_barcode = ""
+    node.turntable_scan_error = ""
+    node.turntable_secondary_retreat_trigger = MagicMock()
+    node.data_lock = threading.RLock()
+    node.vision_result_count = 0
+    node.latest_vision_result = ""
+    node.trigger_publisher = MagicMock()
+    node._read_secondary_y_clearance = lambda: {
+        "right_y_m": 0.295,
+        "gap_y_m": 0.300,
+    }
+    node._set_top_surface_barcode_window = MagicMock()
+    node._six_values = lambda _name: [25.0, 13.0, -110.0, 15.0, 80.0, 20.0]
+    node.get_parameter = lambda name: SimpleNamespace(
+        value={
+            "secondary_zone_safe_y_m": 0.400,
+            "secondary_pick_guard_y_m": 0.325,
+            "secondary_collision_x_lt_m": 0.535,
+            "secondary_collision_z_gt_m": 0.075,
+            "startup_joint_skip_tolerance_deg": 1.0,
+            "empty_turntable_confirm_samples": 2,
+            "empty_turntable_result_timeout_s": 0.2,
+            "empty_turntable_guard_probe_interval_s": 0.2,
+            "secondary_vla_interlock_required": True,
+        }.get(name, 0.180)
+    )
+    return node
+
+
+def test_empty_event_requires_two_explicit_full_frame_no_box_results():
+    node = empty_event_node()
+    results = iter(["failure:no_cosmetic_box", "failure:no_cosmetic_box"])
+
+    def publish(_message):
+        node.latest_vision_result = next(results)
+        node.vision_result_count += 1
+
+    node.trigger_publisher.publish.side_effect = publish
+    assert node._confirm_empty_turntable(3)
+    assert node.trigger_publisher.publish.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "second_result",
+    ["failure:no_yolo_candidate_inside_roi", "failure:no_valid_height", "success:stable_target_published"],
+)
+def test_empty_event_rejects_ambiguous_or_positive_vision(second_result):
+    node = empty_event_node()
+    results = iter(["failure:no_cosmetic_box", second_result])
+
+    def publish(_message):
+        node.latest_vision_result = next(results)
+        node.vision_result_count += 1
+
+    node.trigger_publisher.publish.side_effect = publish
+    assert not node._confirm_empty_turntable(3)
+    assert node.turntable_material_ready
+
+
+def test_empty_event_rejects_no_box_when_102_occludes_view():
+    node = empty_event_node()
+    node.secondary_zone_held_by_102 = True
+    assert not node._confirm_empty_turntable(3)
+    node.trigger_publisher.publish.assert_not_called()
+
+
+def test_empty_event_reopens_102_only_after_verified_101_startup():
+    node = empty_event_node()
+    node.secondary_pick_guard_active = True
+    assert node._release_confirmed_empty_turntable_event(3)
+    assert node.turntable_waiting_for_place
+    assert not node.turntable_material_ready
+    assert node.turntable_active_pick_event_number is None
+    assert not node.secondary_pick_guard_active
+    assert node.secondary_zone_open_for_102
+    node.turntable_secondary_retreat_trigger.reset.assert_called_once_with(
+        require_fresh_entry=True
+    )
+
+
+def test_empty_event_keeps_102_closed_if_101_pose_is_not_startup():
+    node = empty_event_node()
+    node.controller.current_joint = lambda: [45.0, 13.0, -110.0, 15.0, 80.0, 20.0]
+    node.secondary_pick_guard_active = True
+    assert not node._release_confirmed_empty_turntable_event(3)
+    assert node.turntable_material_ready
+    assert node.secondary_pick_guard_active
+    assert not node.secondary_zone_open_for_102
+
+
+def test_old_empty_confirmation_cannot_discard_a_new_placement():
+    node = empty_event_node()
+    node.turntable_place_done_count = 4
+    assert not node._release_confirmed_empty_turntable_event(3)
+    assert node.turntable_material_ready
+    assert not node.secondary_zone_open_for_102
+
+
+def test_guard_wait_checks_empty_table_before_101_moving():
+    node = empty_event_node()
+    node.secondary_guard_ack_sequence = -1
+    node._read_secondary_y_clearance = lambda: {
+        "right_y_m": 0.295,
+        "gap_y_m": 0.300,
+    }
+    node._confirm_empty_turntable = MagicMock(return_value=True)
+
+    with pytest.raises(EmptyTurntableConfirmed):
+        node._close_secondary_zone_for_pick(3)
+
+    node._confirm_empty_turntable.assert_called_once_with(3)
+    assert node.secondary_pick_guard_active
+    assert not node.secondary_zone_open_for_102
+    assert node._release_confirmed_empty_turntable_event(3)
+    assert node.secondary_zone_open_for_102
+
+
+def test_102_cannot_acquire_stale_open_lease_after_new_material_event():
+    node = empty_event_node()
+    node.turntable_waiting_for_place = False
+    node.secondary_zone_open_for_102 = True
+    response = node._secondary_zone_lease_callback(
+        SimpleNamespace(data=True), SimpleNamespace(success=False, message="")
+    )
+    assert not response.success
+    assert not node.secondary_zone_held_by_102
 
 
 def test_near_miss_stops_once_and_resumes_only_after_verified_release():

@@ -304,6 +304,10 @@ class RecoverableGraspError(RuntimeError):
         self.needs_vertical_retreat = needs_vertical_retreat
 
 
+class BottomRegraspTargetLost(RuntimeError):
+    """The released box cannot be located for the final bottom-face regrasp."""
+
+
 class SecondaryClearanceRetry(RuntimeError):
     """The left arm must retry a cycle because the right arm is too close."""
 
@@ -904,6 +908,7 @@ class CosmeticBoxSingleArmNode(Node):
         # 仅当抬升后反馈仍为“运动中”时使用，并非每轮固定等待。
         self.declare_parameter("grasp_feedback_wait_s", 0.7)
         self.declare_parameter("single_cycle_grasp_retry_limit", 3)
+        self.declare_parameter("bottom_regrasp_auto_rescan_max_retries", 2)
         self.declare_parameter("grasp_success_min_opening_m", 0.003)
         # A correct side grasp starts with roughly 20 mm clearance and must
         # visibly close before state=GRIPPED is trusted.  If the fingers land
@@ -2845,7 +2850,9 @@ class CosmeticBoxSingleArmNode(Node):
             return
         self._accept_turntable_place_done("manual/topic place_done")
 
-    def _accept_turntable_place_done(self, source: str) -> None:
+    def _accept_turntable_place_done(
+        self, source: str, *, expected_current_event_number: Optional[int] = None
+    ) -> Optional[int]:
         """Start a fresh material round for every completed 102 placement.
 
         In the V3 cell contract a place_done event means the material has been
@@ -2855,6 +2862,11 @@ class CosmeticBoxSingleArmNode(Node):
 
         thread = None
         with self.turntable_condition:
+            if (
+                expected_current_event_number is not None
+                and self.turntable_place_done_count != expected_current_event_number
+            ):
+                return None
             scan_running = self.turntable_scan_in_progress
             if not scan_running:
                 if self.turntable_state == "UNKNOWN":
@@ -2904,7 +2916,7 @@ class CosmeticBoxSingleArmNode(Node):
                 f"new material event #{event_number} from {source} replaced the "
                 "previous scan; stopping it before scanning the latest material"
             )
-            return
+            return event_number
         self._publish_status(
             f"accepted material event #{event_number} from {source}; "
             "place_done confirms the turntable is stopped, starting a fresh "
@@ -2913,6 +2925,7 @@ class CosmeticBoxSingleArmNode(Node):
         if thread is None:
             raise RuntimeError("turntable pre-scan worker was not created")
         thread.start()
+        return event_number
 
     def _turntable_prescan_worker(self, event_number: int) -> None:
         barcode = ""
@@ -3920,6 +3933,48 @@ class CosmeticBoxSingleArmNode(Node):
             return self._request_vision_target(require_cycle_enabled=require_cycle_enabled)
         return None
 
+    def _recover_bottom_regrasp_target_loss(
+        self, event_number: int, *, rescan: bool = True
+    ) -> Optional[int]:
+        """Return home before rescanning the released box as a new material event."""
+
+        self._publish_status(
+            "final bottom regrasp lost its D405 target; returning 101 to startup "
+            "before rescanning the box still on the turntable"
+        )
+        self._wait_for_secondary_y_clearance(
+            "bottom regrasp automatic startup return", require_cycle_active=False
+        )
+        with self._timed_stage("bottom_regrasp_return_startup"):
+            self._prepare_robot_for_startup_recovery()
+            clearance_z = float(
+                self.get_parameter("fast_side_camera_clearance_z_m").value
+            )
+            if not math.isfinite(clearance_z):
+                raise RuntimeError("bottom regrasp recovery clearance Z is not finite")
+            if self._current_command_pose().z < clearance_z - 0.005:
+                self._bottom_center_linear_z(
+                    clearance_z,
+                    self._motion_profile(),
+                    "bottom regrasp recovery vertical clearance",
+                    lifting=True,
+                )
+            self._move_startup_and_open(require_cycle_active=True)
+        self._release_active_material_event(event_number)
+        if not rescan:
+            return None
+        # A real 102 placement may have superseded this box during the return.
+        # The compare inside _accept_turntable_place_done is atomic with the
+        # event update, so a synthetic event can never overwrite that placement.
+        with self.turntable_condition:
+            if self.turntable_place_done_count != event_number:
+                return None
+        self._stop_turntable_if_running("bottom regrasp automatic rescan")
+        return self._accept_turntable_place_done(
+            "automatic bottom-regrasp D405-loss retry",
+            expected_current_event_number=event_number,
+        )
+
     def _cycle_worker(self) -> None:
         try:
             with self.action_lock:
@@ -3932,6 +3987,8 @@ class CosmeticBoxSingleArmNode(Node):
                 pending_side_barcode: Optional[str] = None
                 pending_top_barcode: Optional[str] = None
                 pending_material_event_number: Optional[int] = None
+                bottom_retry_event_number: Optional[int] = None
+                bottom_retry_count = 0
                 early_top_enabled = (
                     bool(self.get_parameter("turntable_enabled").value)
                     and bool(self.get_parameter("top_surface_barcode_enabled").value)
@@ -4064,6 +4121,37 @@ class CosmeticBoxSingleArmNode(Node):
                         with self._timed_stage("secondary_clearance_retry_delay"):
                             time.sleep(delay)
                         self._finish_cycle_timing("secondary_clearance_retry")
+                        continue
+                    except BottomRegraspTargetLost as exc:
+                        if pending_material_event_number != bottom_retry_event_number:
+                            bottom_retry_count = 0
+                        bottom_retry_count += 1
+                        limit = max(0, int(self.get_parameter(
+                            "bottom_regrasp_auto_rescan_max_retries"
+                        ).value))
+                        new_event = self._recover_bottom_regrasp_target_loss(
+                            pending_material_event_number,
+                            rescan=bottom_retry_count <= limit,
+                        )
+                        bottom_retry_event_number = new_event
+                        pending_material_event_number = None
+                        pending_side_barcode = None
+                        pending_top_barcode = None
+                        d405_pretracking_armed = False
+                        if bottom_retry_count > limit:
+                            raise RuntimeError(
+                                f"Final bottom regrasp lost D405 target after "
+                                f"{bottom_retry_count} attempts; 101 returned to startup"
+                            ) from exc
+                        if new_event is None:
+                            bottom_retry_count = 0
+                            self._finish_cycle_timing("material_replaced")
+                            continue
+                        self._publish_status(
+                            f"automatic bottom-regrasp rescan {bottom_retry_count}/{limit}: "
+                            f"new material event #{new_event}"
+                        )
+                        self._finish_cycle_timing("bottom_regrasp_auto_rescan")
                         continue
                     except RecoverableGraspError as exc:
                         with self._timed_stage("grasp_failure_recovery"):
@@ -4467,6 +4555,7 @@ class CosmeticBoxSingleArmNode(Node):
                     0, int(self.get_parameter("single_cycle_grasp_retry_limit").value)
                 )
                 grasp_failures = 0
+                bottom_retry_count = 0
                 attempt_index = 0
                 while True:
                     attempt_index += 1
@@ -4540,6 +4629,28 @@ class CosmeticBoxSingleArmNode(Node):
                         with self._timed_stage("secondary_clearance_retry_delay"):
                             time.sleep(delay)
                         self._finish_cycle_timing("secondary_clearance_retry")
+                        continue
+                    except BottomRegraspTargetLost as exc:
+                        bottom_retry_count += 1
+                        limit = max(0, int(self.get_parameter(
+                            "bottom_regrasp_auto_rescan_max_retries"
+                        ).value))
+                        new_event = self._recover_bottom_regrasp_target_loss(
+                            material_event_number,
+                            rescan=bottom_retry_count <= limit,
+                        )
+                        if bottom_retry_count > limit:
+                            raise RuntimeError(
+                                f"Final bottom regrasp lost D405 target after "
+                                f"{bottom_retry_count} attempts; 101 returned to startup"
+                            ) from exc
+                        self._finish_cycle_timing("bottom_regrasp_auto_rescan")
+                        if new_event is None:
+                            bottom_retry_count = 0
+                        material_event_number, turntable_side_barcode, turntable_top_barcode = (
+                            self._wait_for_scanned_turntable_material()
+                        )
+                        grasp_failures = 0
                         continue
                     except RecoverableGraspError as exc:
                         grasp_failures += 1
@@ -7316,7 +7427,7 @@ class CosmeticBoxSingleArmNode(Node):
                 )
                 return pose
             time.sleep(0.01)
-        raise RuntimeError(
+        raise BottomRegraspTargetLost(
             "No fresh D405 tracked target arrived after the second Tool-Rx; "
             "final bottom regrasp descent was not commanded"
         )
