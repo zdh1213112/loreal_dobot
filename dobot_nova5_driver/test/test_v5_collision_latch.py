@@ -1,4 +1,6 @@
 import threading
+import time
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -76,11 +78,19 @@ def empty_event_node():
     node.turntable_scan_error = ""
     node.turntable_secondary_retreat_trigger = MagicMock()
     node.data_lock = threading.RLock()
+    node.pose_count = 0
+    node.pregrasp_pose_count = 0
+    node.pregrasp_observations = deque(maxlen=40)
+    node.last_turntable_stop_monotonic = 0.0
+    node.last_turntable_stop_epoch = 0.0
+    node.last_turntable_stop_pregrasp_count = 0
+    node.empty_turntable_confirmation = (3, 0, 0)
+    node.empty_turntable_target_invalidated = False
     node.vision_result_count = 0
     node.latest_vision_result = ""
     node.trigger_publisher = MagicMock()
     node._read_secondary_y_clearance = lambda: {
-        "right_y_m": 0.295,
+        "right_y_m": 0.344,
         "gap_y_m": 0.300,
     }
     node._set_top_surface_barcode_window = MagicMock()
@@ -93,6 +103,7 @@ def empty_event_node():
             "secondary_collision_z_gt_m": 0.075,
             "startup_joint_skip_tolerance_deg": 1.0,
             "empty_turntable_confirm_samples": 2,
+            "empty_turntable_min_observation_s": 0.2,
             "empty_turntable_result_timeout_s": 0.2,
             "empty_turntable_guard_probe_interval_s": 0.2,
             "secondary_vla_interlock_required": True,
@@ -110,8 +121,37 @@ def test_empty_event_requires_two_explicit_full_frame_no_box_results():
         node.vision_result_count += 1
 
     node.trigger_publisher.publish.side_effect = publish
+    started = time.monotonic()
     assert node._confirm_empty_turntable(3)
     assert node.trigger_publisher.publish.call_count == 2
+    assert time.monotonic() - started >= 0.19
+
+
+def test_empty_event_rejects_late_pregrasp_target_after_first_no_box():
+    node = empty_event_node()
+
+    def publish(_message):
+        node.latest_vision_result = "failure:no_cosmetic_box"
+        node.vision_result_count += 1
+        node.pregrasp_pose_count += 1
+
+    node.trigger_publisher.publish.side_effect = publish
+    assert not node._confirm_empty_turntable(3)
+    assert node.trigger_publisher.publish.call_count == 1
+    assert node.turntable_material_ready
+
+
+def test_empty_event_rejects_post_stop_target_already_seen():
+    node = empty_event_node()
+    node.last_turntable_stop_monotonic = time.monotonic() - 1.0
+    node.last_turntable_stop_epoch = time.time() - 1.0
+    node.pregrasp_observations.append(SimpleNamespace(
+        count=1,
+        received_at_monotonic=time.monotonic(),
+        frame_time_s=time.time(),
+    ))
+    assert not node._confirm_empty_turntable(3)
+    node.trigger_publisher.publish.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -138,6 +178,22 @@ def test_empty_event_rejects_no_box_when_102_occludes_view():
     node.trigger_publisher.publish.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("right_y_m", "gap_y_m"),
+    [(0.400, 0.300), (0.401, 0.300), (0.344, 0.170)],
+)
+def test_empty_event_requires_102_outside_place_zone_and_safe_gap(
+    right_y_m, gap_y_m
+):
+    node = empty_event_node()
+    node._read_secondary_y_clearance = lambda: {
+        "right_y_m": right_y_m,
+        "gap_y_m": gap_y_m,
+    }
+    assert not node._confirm_empty_turntable(3)
+    node.trigger_publisher.publish.assert_not_called()
+
+
 def test_empty_event_reopens_102_only_after_verified_101_startup():
     node = empty_event_node()
     node.secondary_pick_guard_active = True
@@ -150,6 +206,33 @@ def test_empty_event_reopens_102_only_after_verified_101_startup():
     node.turntable_secondary_retreat_trigger.reset.assert_called_once_with(
         require_fresh_entry=True
     )
+
+
+def test_positive_target_between_confirmation_and_release_keeps_102_closed():
+    node = empty_event_node()
+    node.pregrasp_pose_count += 1
+    assert not node._release_confirmed_empty_turntable_event(3)
+    assert node.empty_turntable_target_invalidated
+    assert node.turntable_material_ready
+    assert not node.secondary_zone_open_for_102
+
+
+def test_102_at_344mm_gets_lease_after_empty_event_is_confirmed():
+    node = empty_event_node()
+    node.secondary_pick_guard_active = True
+
+    def publish(_message):
+        node.latest_vision_result = "failure:no_cosmetic_box"
+        node.vision_result_count += 1
+
+    node.trigger_publisher.publish.side_effect = publish
+    assert node._confirm_empty_turntable(3)
+    assert node._release_confirmed_empty_turntable_event(3)
+    response = node._secondary_zone_lease_callback(
+        SimpleNamespace(data=True), SimpleNamespace(success=False, message="")
+    )
+    assert response.success
+    assert node.secondary_zone_held_by_102
 
 
 def test_empty_event_keeps_102_closed_if_101_pose_is_not_startup():
@@ -174,7 +257,7 @@ def test_guard_wait_checks_empty_table_before_101_moving():
     node = empty_event_node()
     node.secondary_guard_ack_sequence = -1
     node._read_secondary_y_clearance = lambda: {
-        "right_y_m": 0.295,
+        "right_y_m": 0.344,
         "gap_y_m": 0.300,
     }
     node._confirm_empty_turntable = MagicMock(return_value=True)

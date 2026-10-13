@@ -45,6 +45,7 @@ from dobot_nova5_driver.handoff_clearance_v3 import (
     HandoffClearanceResult,
     evaluate_camera_right_handoff_clearance,
     evaluate_gripper_side_clearance,
+    find_support_plane_points,
     find_unsupported_near_depth_points,
     measure_voxel_overlap,
 )
@@ -73,7 +74,7 @@ CAMERA_SERIAL = "409122274792"
 FFS_MODEL_DIR = os.path.join(FFS_DIR, "weights/23-36-37/model_best_bp2_serialize.pth")
 SAM2_CHECKPOINT = os.path.join(SAM2_DIR, "checkpoints/sam2.1/sam2.1_hiera_small.pt")
 SAM2_CFG = "sam2.1/sam2.1_hiera_s.yaml"
-YOLO_MODEL_PATH = "src/Fast-FoundationStereoPose-dul_cam/models/best_00921_2.pt"
+YOLO_MODEL_PATH = "src/Fast-FoundationStereoPose-dul_cam/models/best_d405_1013.pt"
 VALID_ITERS = 6
 MAX_DISP = 192
 ZNEAR = 0.16
@@ -111,6 +112,8 @@ TABLE_RING_KERNEL_PX = 41
 TABLE_EXCLUSION_KERNEL_PX = 7
 MIN_TABLE_PLANE_POINTS = 30
 TABLE_RANSAC_DISTANCE_M = 0.003
+HANDOFF_SUPPORT_PLANE_MIN_INLIERS = 100
+HANDOFF_SUPPORT_PLANE_MIN_INLIER_RATIO = 0.60
 TOP_TABLE_NORMAL_ALIGNMENT = 0.90
 MIN_TOP_CAMERA_FACING_COS = 0.55
 TOP_SURFACE_DISTANCE_M = 0.006
@@ -2616,6 +2619,7 @@ try:
                         table_plane_points = 0
                         table_candidate_normal = None
                         table_inlier_points = None
+                        table_support_plane_model = None
                         table_ring_kernel = np.ones(
                             (TABLE_RING_KERNEL_PX, TABLE_RING_KERNEL_PX), np.uint8
                         )
@@ -2643,6 +2647,16 @@ try:
                                 >= MIN_TOP_CAMERA_FACING_COS
                             ):
                                 table_candidate_normal = fitted_table_normal
+                                # Excluding obstacles requires stronger evidence
+                                # than estimating the box height from the table.
+                                if (
+                                    len(table_inliers) >= HANDOFF_SUPPORT_PLANE_MIN_INLIERS
+                                    and len(table_inliers) / len(table_points)
+                                    >= HANDOFF_SUPPORT_PLANE_MIN_INLIER_RATIO
+                                ):
+                                    table_support_plane_model = np.asarray(
+                                        table_model, dtype=np.float64
+                                    )
                                 table_inlier_points = table_points[
                                     np.asarray(table_inliers, dtype=np.int64)
                                 ]
@@ -2830,6 +2844,48 @@ try:
                                                     GRIPPER_SIDE_MIN_CLUSTER_POINTS
                                                 ),
                                             )
+                                            support_plane_reject_mask = np.zeros(
+                                                len(points_3d), dtype=bool
+                                            )
+                                            if (
+                                                not side_clearance.clear
+                                                and table_height is not None
+                                                and table_support_plane_model is not None
+                                            ):
+                                                # Only exclude finger-corridor candidates
+                                                # on the independently fitted turntable
+                                                # plane. Uncertain or raised points remain.
+                                                support_plane_reject_mask = find_support_plane_points(
+                                                    points_3d,
+                                                    side_clearance.candidate_mask,
+                                                    table_support_plane_model,
+                                                    max_distance_m=TABLE_RANSAC_DISTANCE_M,
+                                                )
+                                                support_reject_count = int(np.count_nonzero(
+                                                    support_plane_reject_mask
+                                                ))
+                                                if support_reject_count:
+                                                    side_clearance = evaluate_gripper_side_clearance(
+                                                        points_3d,
+                                                        smooth_box_center,
+                                                        smooth_extent,
+                                                        smooth_rotation,
+                                                        target_point_mask=object_hits,
+                                                        valid_point_mask=~support_plane_reject_mask,
+                                                        finger_span_m=GRIPPER_SIDE_FINGER_SPAN_M,
+                                                        target_exclusion_m=GRIPPER_SIDE_TARGET_EXCLUSION_M,
+                                                        side_check_depth_m=GRIPPER_SIDE_CHECK_DEPTH_M,
+                                                        grasp_below_center_fraction=GRIPPER_SIDE_GRASP_BELOW_CENTER_FRACTION,
+                                                        vertical_margin_above_m=GRIPPER_SIDE_VERTICAL_MARGIN_ABOVE_M,
+                                                        voxel_size_m=GRIPPER_SIDE_VOXEL_SIZE_M,
+                                                        min_obstacle_points=GRIPPER_SIDE_MIN_CLUSTER_POINTS,
+                                                    )
+                                                    logging.info(
+                                                        "[handoff-clearance] support-plane cross-check: "
+                                                        f"removed={support_reject_count} table-surface points; "
+                                                        f"remaining -Y={side_clearance.negative_candidate_point_count}, "
+                                                        f"+Y={side_clearance.positive_candidate_point_count}"
+                                                    )
                                             if not side_clearance.clear and not using_locked_cloud:
                                                 # A shiny box/table edge may create a
                                                 # coherent FFS near cloud. Check only
@@ -2876,7 +2932,7 @@ try:
                                                             smooth_rotation,
                                                             target_point_mask=object_hits,
                                                             valid_point_mask=(
-                                                                ~unsupported_side_points
+                                                                ~(unsupported_side_points | support_plane_reject_mask)
                                                             ),
                                                             finger_span_m=GRIPPER_SIDE_FINGER_SPAN_M,
                                                             target_exclusion_m=GRIPPER_SIDE_TARGET_EXCLUSION_M,
@@ -3150,6 +3206,19 @@ try:
                                                         above_table_mm = (
                                                             side_local[:, 2] + 0.5 * smooth_extent[2]
                                                         ) * 1000.0
+                                                        support_distance_text = "unavailable"
+                                                        if table_support_plane_model is not None:
+                                                            support_normal, support_offset = normalized_plane(
+                                                                table_support_plane_model
+                                                            )
+                                                            support_distance_mm = np.abs(
+                                                                points_3d[side_mask] @ support_normal
+                                                                + support_offset
+                                                            ) * 1000.0
+                                                            support_distance_text = (
+                                                                f"{support_distance_mm.min():.1f}.."
+                                                                f"{support_distance_mm.max():.1f}mm"
+                                                            )
                                                         logging.info(
                                                             f"[handoff-clearance] {side_name} candidate origin: "
                                                             f"RGB={rgb_bbox}, "
@@ -3157,7 +3226,8 @@ try:
                                                             f"local_Y={side_local[:, 1].min()*1000:.1f}.."
                                                             f"{side_local[:, 1].max()*1000:.1f}mm, "
                                                             f"above_table={above_table_mm.min():.1f}.."
-                                                            f"{above_table_mm.max():.1f}mm"
+                                                            f"{above_table_mm.max():.1f}mm, "
+                                                            f"support_plane_abs={support_distance_text}"
                                                         )
                                             last_handoff_state = handoff_state
                                             publish_handoff_clearance(

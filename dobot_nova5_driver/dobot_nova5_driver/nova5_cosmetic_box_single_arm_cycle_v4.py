@@ -375,7 +375,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("transfer_joint", [14.0, -29.0, -99.0, 39.0, 88.0, 15.0])
         # 101 is the left pick arm.  These parameters only read 102 feedback;
         # the left node never sends a motion command to the right/VLA arm.
-        self.declare_parameter("secondary_collision_check_enabled", True)
+        self.declare_parameter("secondary_collision_check_enabled", False)
         self.declare_parameter("secondary_robot_ip", "192.168.111.102")
         self.declare_parameter("secondary_dashboard_port", 29999)
         self.declare_parameter("secondary_feedback_port", 30004)
@@ -1185,8 +1185,8 @@ class CosmeticBoxSingleArmNode(Node):
             "the gripper commands position=0 and GRIP_GRIPPED feedback remains mandatory before lift"
         )
         self.get_logger().info(
-            "101 left-arm controller ready; monitoring 102 right-arm TCP feedback "
-            "read-only for the Y-clearance interlock and passive turntable trigger."
+            "101 left-arm controller ready; 102 TCP feedback is read-only for "
+            "the automatic turntable place/retreat trigger."
         )
         self.get_logger().warning(
             "V3 turntable workflow: "
@@ -1608,10 +1608,10 @@ class CosmeticBoxSingleArmNode(Node):
                 "continuous_auto_restart=fresh-startup-after-retreat"
             )
         else:
-            self.get_logger().warning(
-                "Secondary TCP Y interlock DISABLED: 101 will not connect to or "
-                "check 102 feedback; use only when the two-arm collision risk is "
-                "controlled by the operator"
+            self.get_logger().info(
+                "Secondary TCP Y interlock DISABLED; 101 does not use 102 TCP "
+                "feedback to stop or delay motion. The read-only 102 feedback "
+                "connection remains active for automatic turntable placement detection."
             )
         if bool(self.get_parameter("turntable_enabled").value):
             safe_transfer_z = float(
@@ -2529,7 +2529,7 @@ class CosmeticBoxSingleArmNode(Node):
                     )
                 except Exception as exc:
                     self.secondary_recovery_clear_samples = 0
-                    if robot_mode in (7, 8, 10):
+                    if collision_check_enabled and robot_mode in (7, 8, 10):
                         self._latch_secondary_protective_stop(
                             "102 TCP safety feedback failed while 101 was moving; "
                             f"stopping 101: {exc}",
@@ -3942,9 +3942,6 @@ class CosmeticBoxSingleArmNode(Node):
             "final bottom regrasp lost its D405 target; returning 101 to startup "
             "before rescanning the box still on the turntable"
         )
-        self._wait_for_secondary_y_clearance(
-            "bottom regrasp automatic startup return", require_cycle_active=False
-        )
         with self._timed_stage("bottom_regrasp_return_startup"):
             self._prepare_robot_for_startup_recovery()
             clearance_z = float(
@@ -3969,7 +3966,6 @@ class CosmeticBoxSingleArmNode(Node):
         with self.turntable_condition:
             if self.turntable_place_done_count != event_number:
                 return None
-        self._stop_turntable_if_running("bottom regrasp automatic rescan")
         return self._accept_turntable_place_done(
             "automatic bottom-regrasp D405-loss retry",
             expected_current_event_number=event_number,
@@ -4125,6 +4121,7 @@ class CosmeticBoxSingleArmNode(Node):
                     except BottomRegraspTargetLost as exc:
                         if pending_material_event_number != bottom_retry_event_number:
                             bottom_retry_count = 0
+                        failed_event_number = pending_material_event_number
                         bottom_retry_count += 1
                         limit = max(0, int(self.get_parameter(
                             "bottom_regrasp_auto_rescan_max_retries"
@@ -4138,7 +4135,12 @@ class CosmeticBoxSingleArmNode(Node):
                         pending_side_barcode = None
                         pending_top_barcode = None
                         d405_pretracking_armed = False
-                        if bottom_retry_count > limit:
+                        with self.turntable_condition:
+                            material_replaced = (
+                                self.turntable_place_done_count
+                                != failed_event_number
+                            )
+                        if bottom_retry_count > limit and not material_replaced:
                             raise RuntimeError(
                                 f"Final bottom regrasp lost D405 target after "
                                 f"{bottom_retry_count} attempts; 101 returned to startup"
@@ -4556,6 +4558,7 @@ class CosmeticBoxSingleArmNode(Node):
                 )
                 grasp_failures = 0
                 bottom_retry_count = 0
+                bottom_retry_event_number: Optional[int] = None
                 attempt_index = 0
                 while True:
                     attempt_index += 1
@@ -4631,6 +4634,9 @@ class CosmeticBoxSingleArmNode(Node):
                         self._finish_cycle_timing("secondary_clearance_retry")
                         continue
                     except BottomRegraspTargetLost as exc:
+                        if material_event_number != bottom_retry_event_number:
+                            bottom_retry_count = 0
+                        failed_event_number = material_event_number
                         bottom_retry_count += 1
                         limit = max(0, int(self.get_parameter(
                             "bottom_regrasp_auto_rescan_max_retries"
@@ -4639,7 +4645,13 @@ class CosmeticBoxSingleArmNode(Node):
                             material_event_number,
                             rescan=bottom_retry_count <= limit,
                         )
-                        if bottom_retry_count > limit:
+                        bottom_retry_event_number = new_event
+                        with self.turntable_condition:
+                            material_replaced = (
+                                self.turntable_place_done_count
+                                != failed_event_number
+                            )
+                        if bottom_retry_count > limit and not material_replaced:
                             raise RuntimeError(
                                 f"Final bottom regrasp lost D405 target after "
                                 f"{bottom_retry_count} attempts; 101 returned to startup"

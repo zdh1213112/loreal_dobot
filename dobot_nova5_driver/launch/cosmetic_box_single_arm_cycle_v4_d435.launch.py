@@ -643,7 +643,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "secondary_collision_check_enabled",
-                default_value="true",
+                default_value="false",
                 description=(
                     "Enable the 102 read-only TCP Y-clearance interlock for 101; "
                     "set false to run without 102 feedback protection"
