@@ -997,6 +997,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.top_surface_barcode_lock = threading.Lock()
         self.top_surface_barcode_window_active = False
         self.top_surface_barcode_value = ""
+        self.top_surface_barcode_uncertain = False
         self.top_surface_barcode_result_count = 0
         self.early_top_at_startup = False
 
@@ -2787,6 +2788,16 @@ class CosmeticBoxSingleArmNode(Node):
         """Accept only confirmed top-surface results during the active cycle."""
 
         encoded = msg.data.strip()
+        if encoded == "uncertain:top_plane_unverified":
+            with self.top_surface_barcode_lock:
+                if not self.top_surface_barcode_window_active or self.top_surface_barcode_value:
+                    return
+                self.top_surface_barcode_uncertain = True
+            self.get_logger().warning(
+                "D405 found a barcode candidate but could not prove it lies on "
+                "the box top plane; automatic bottom-face flip is blocked"
+            )
+            return
         if not encoded.startswith("success:"):
             return
         value = encoded.split(":", 1)[1].strip()
@@ -2796,6 +2807,7 @@ class CosmeticBoxSingleArmNode(Node):
             if not self.top_surface_barcode_window_active:
                 return
             self.top_surface_barcode_value = value
+            self.top_surface_barcode_uncertain = False
             self.top_surface_barcode_result_count += 1
         self.get_logger().info(
             f"Top-surface barcode confirmed for current target: {value!r}"
@@ -3639,6 +3651,15 @@ class CosmeticBoxSingleArmNode(Node):
                 self._publish_status(
                     f"D435 barcode {barcode!r} confirmed before or during final stop/settle"
                 )
+            if (
+                top_window_armed and not barcode and not top_barcode
+                and self._top_surface_barcode_is_uncertain()
+            ):
+                raise RuntimeError(
+                    "D405 saw a barcode candidate but live 3-D points did not "
+                    "verify the top plane; turntable is stopped and 101 will "
+                    "not automatically classify it as a bottom barcode"
+                )
             with self.turntable_lock:
                 self.turntable_early_top_barcode = (
                     top_barcode if not barcode else ""
@@ -3691,6 +3712,7 @@ class CosmeticBoxSingleArmNode(Node):
             self.top_surface_barcode_window_active = active
             if active:
                 self.top_surface_barcode_value = ""
+                self.top_surface_barcode_uncertain = False
                 self.top_surface_barcode_result_count = 0
         message = Bool()
         message.data = active
@@ -3702,6 +3724,10 @@ class CosmeticBoxSingleArmNode(Node):
     def _current_top_surface_barcode(self) -> str:
         with self.top_surface_barcode_lock:
             return str(self.top_surface_barcode_value)
+
+    def _top_surface_barcode_is_uncertain(self) -> bool:
+        with self.top_surface_barcode_lock:
+            return bool(self.top_surface_barcode_uncertain)
 
     def _wait_for_top_surface_barcode(self) -> str:
         """Allow a short hover window for the D405 detector to confirm the top label."""
@@ -6417,6 +6443,14 @@ class CosmeticBoxSingleArmNode(Node):
             turntable_side_barcode,
             top_surface_barcode,
         )
+        if (
+            observe_top_barcode and barcode_face == "bottom"
+            and self._top_surface_barcode_is_uncertain()
+        ):
+            raise RuntimeError(
+                "D405 barcode candidate has no live 3-D top-plane proof; "
+                "refusing automatic bottom-face flip at grasp depth"
+            )
         if observe_top_barcode and not top_surface_barcode and bool(
             self.get_parameter("top_surface_barcode_enabled").value
         ):

@@ -55,7 +55,10 @@ from dobot_nova5_driver.top_surface_geometry_v3 import (
     normalized_plane,
     select_top_plane_candidate,
 )
-from top_surface_barcode_detector_v3 import TopSurfaceBarcodeDetector
+from top_surface_barcode_detector_v3 import (
+    TopSurfaceBarcodeDetector,
+    verify_top_plane_barcode,
+)
 from sam2_target_mask_v4 import prompt_from_obb, refine_sam_mask
 
 SAM2_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "SAM2_streaming")
@@ -1135,6 +1138,8 @@ def top_surface_barcode_trigger_callback(msg: Bool) -> None:
     global top_surface_barcode_requested, top_surface_barcode_reported
     global top_barcode_capture_session, top_barcode_capture_phase
     global top_surface_barcode_candidate, top_surface_barcode_hits
+    global top_surface_barcode_unverified_candidate, top_surface_barcode_unverified_hits
+    global top_surface_barcode_unverified_last_at, top_surface_barcode_uncertain_reported
     global top_surface_barcode_last_hit_at
     global top_surface_barcode_last_attempt_at, top_surface_barcode_last_debug_write_at
     top_surface_barcode_requested = bool(msg.data) and TOP_SURFACE_BARCODE_ENABLED
@@ -1145,6 +1150,10 @@ def top_surface_barcode_trigger_callback(msg: Bool) -> None:
         top_surface_barcode_reported = False
         top_surface_barcode_candidate = ""
         top_surface_barcode_hits = 0
+        top_surface_barcode_unverified_candidate = ""
+        top_surface_barcode_unverified_hits = 0
+        top_surface_barcode_unverified_last_at = 0.0
+        top_surface_barcode_uncertain_reported = False
         top_surface_barcode_last_hit_at = 0.0
         top_surface_barcode_last_attempt_at = 0.0
         top_surface_barcode_last_debug_write_at = 0.0
@@ -1959,6 +1968,10 @@ elif TOP_SURFACE_BARCODE_ENABLED:
     )
 top_surface_barcode_candidate = ""
 top_surface_barcode_hits = 0
+top_surface_barcode_unverified_candidate = ""
+top_surface_barcode_unverified_hits = 0
+top_surface_barcode_unverified_last_at = 0.0
+top_surface_barcode_uncertain_reported = False
 top_surface_barcode_last_hit_at = 0.0
 top_surface_barcode_last_value = ""
 top_surface_barcode_last_attempt_at = 0.0
@@ -2185,9 +2198,14 @@ try:
             )
             tracking_frames_without_height += 1
 
-        # During the robot's move-above window, decode only inside the current
-        # YOLO-selected/SAM-tracked target region.  This runs on the already
-        # acquired D405 RGB frame and does not start another camera pipeline.
+        # The 2-D hit is only a candidate. The current frame's FFS top-plane
+        # fit below must verify its actual 3-D barcode footprint before any
+        # result can be sent to the robot.
+        top_hit = None
+        top_barcode_capture = None
+        top_barcode_plane = None
+        top_barcode_points = None
+        top_barcode_uv = None
         if (
             top_surface_barcode_requested
             and not top_surface_barcode_reported
@@ -2196,7 +2214,7 @@ try:
             and time.monotonic() - top_surface_barcode_last_attempt_at >= 0.20
         ):
             top_surface_barcode_last_attempt_at = time.monotonic()
-            capture = {"session": top_barcode_capture_session,
+            top_barcode_capture = {"session": top_barcode_capture_session,
                        "attempt_ns": time.time_ns(), "phase": top_barcode_capture_phase,
                        "robot_status": latest_cycle_status}
             try:
@@ -2211,7 +2229,6 @@ try:
                 top_surface_barcode_last_debug = dict(
                     top_surface_barcode_detector.last_debug
                 )
-                top_surface_barcode_last_hit = top_hit
                 top_surface_barcode_last_debug_at = time.monotonic()
                 if (
                     top_surface_barcode_last_debug_at
@@ -2227,15 +2244,6 @@ try:
                         len(top_surface_barcode_last_debug.get("candidate_boxes", [])),
                         top_surface_barcode_last_debug.get("decoder", "none"),
                     )
-                save_top_barcode_debug_frame(
-                    color_bgr,
-                    current_mask,
-                    locked_target_corners,
-                    top_surface_barcode_last_debug,
-                    top_hit,
-                    force=top_hit is not None,
-                    capture=capture,
-                )
             except Exception as exc:
                 top_hit = None
                 top_surface_barcode_last_debug = {
@@ -2246,42 +2254,11 @@ try:
                     "decoder": "exception",
                     "message": str(exc),
                 }
-                top_surface_barcode_last_hit = None
                 top_surface_barcode_last_debug_at = time.monotonic()
-                save_top_barcode_debug_frame(
-                    color_bgr,
-                    current_mask,
-                    locked_target_corners,
-                    top_surface_barcode_last_debug,
-                    None,
-                    capture=capture,
-                )
                 now = time.monotonic()
                 if now - top_surface_barcode_last_hit_at > 2.0:
                     logging.warning(f"[top-barcode] detection failed: {exc}")
                     top_surface_barcode_last_hit_at = now
-            if top_hit is not None:
-                now = time.monotonic()
-                if (
-                    top_hit.value == top_surface_barcode_candidate
-                    and now - top_surface_barcode_last_hit_at <= 0.8
-                ):
-                    top_surface_barcode_hits += 1
-                else:
-                    top_surface_barcode_candidate = top_hit.value
-                    top_surface_barcode_hits = 1
-                top_surface_barcode_last_hit_at = now
-                logging.info(
-                    f"[top-barcode] candidate={top_hit.value!r}, "
-                    f"hits={top_surface_barcode_hits}/{TOP_SURFACE_BARCODE_STABLE_HITS}"
-                )
-                if top_surface_barcode_hits >= TOP_SURFACE_BARCODE_STABLE_HITS:
-                    top_surface_barcode_reported = True
-                    publish_top_surface_barcode(top_hit.value)
-                    logging.info(
-                        f"[top-barcode] confirmed on YOLO/SAM target top surface: "
-                        f"{top_hit.value}"
-                    )
 
         # A moving turntable invalidates the old selection cloud even when
         # SAM2 still follows the box. Reuse it only for a non-pretracking
@@ -2753,6 +2730,10 @@ try:
                                         near_square_axis_ratio=TOP_NEAR_SQUARE_AXIS_RATIO,
                                     )
                                     if axes is not None:
+                                        if table_height is not None and not using_locked_cloud:
+                                            top_barcode_plane = np.asarray(top_plane, dtype=np.float64)
+                                            top_barcode_points = mask_object_points
+                                            top_barcode_uv = mask_object_uv
                                         last_grasp_axis_source = "3d-top-surface-rectangle"
                                         x_axis, y_axis, normal = (
                                             axes[:, 0],
@@ -3430,6 +3411,85 @@ try:
                 locked_cloud_in_bounds = None
                 locked_cloud_colors = None
                 reset_requested = True
+
+        if top_barcode_capture is not None:
+            if top_hit is not None:
+                evidence = verify_top_plane_barcode(
+                    top_hit, top_barcode_points, top_barcode_uv, top_barcode_plane,
+                )
+                top_surface_barcode_last_debug["top_plane_evidence"] = evidence
+                if evidence["verified"]:
+                    top_surface_barcode_unverified_candidate = ""
+                    top_surface_barcode_unverified_hits = 0
+                    now = time.monotonic()
+                    if (
+                        top_hit.value == top_surface_barcode_candidate
+                        and now - top_surface_barcode_last_hit_at <= 0.8
+                    ):
+                        top_surface_barcode_hits += 1
+                    else:
+                        top_surface_barcode_candidate = top_hit.value
+                        top_surface_barcode_hits = 1
+                    top_surface_barcode_last_hit_at = now
+                    logging.info(
+                        f"[top-barcode] 3-D verified candidate={top_hit.value!r}, "
+                        f"hits={top_surface_barcode_hits}/{TOP_SURFACE_BARCODE_STABLE_HITS}, "
+                        f"pixels={evidence['sample_pixels']}, "
+                        f"plane_ratio={evidence['inlier_ratio']:.2f}"
+                    )
+                    if top_surface_barcode_hits >= TOP_SURFACE_BARCODE_STABLE_HITS:
+                        top_surface_barcode_reported = True
+                        publish_top_surface_barcode(top_hit.value)
+                        logging.info(
+                            f"[top-barcode] confirmed by live top-plane depth: "
+                            f"{top_hit.value}"
+                        )
+                else:
+                    now = time.monotonic()
+                    if (
+                        top_hit.value == top_surface_barcode_unverified_candidate
+                        and now - top_surface_barcode_unverified_last_at <= 0.8
+                    ):
+                        top_surface_barcode_unverified_hits += 1
+                    else:
+                        top_surface_barcode_unverified_candidate = top_hit.value
+                        top_surface_barcode_unverified_hits = 1
+                    top_surface_barcode_unverified_last_at = now
+                    if (
+                        top_surface_barcode_unverified_hits >= TOP_SURFACE_BARCODE_STABLE_HITS
+                        and not top_surface_barcode_uncertain_reported
+                    ):
+                        result = String()
+                        result.data = "uncertain:top_plane_unverified"
+                        top_surface_barcode_result_pub.publish(result)
+                        top_surface_barcode_uncertain_reported = True
+                        logging.warning(
+                            "[top-barcode] persistent 2-D barcode without top-plane "
+                            "proof; requesting automatic bottom-flip interlock"
+                        )
+                    logging.info(
+                        "[top-barcode] 2-D hit rejected by 3-D top plane: %s; "
+                        "pixels=%s ratio=%.2f median_mm=%s",
+                        evidence["reason"], evidence["sample_pixels"],
+                        evidence["inlier_ratio"], evidence["median_distance_mm"],
+                    )
+                    top_surface_barcode_candidate = ""
+                    top_surface_barcode_hits = 0
+                    top_surface_barcode_last_debug["accepted_candidate"] = None
+                    top_surface_barcode_last_debug["message"] = (
+                        "2-D barcode rejected: " + evidence["reason"]
+                    )
+                    top_hit = None
+            top_surface_barcode_last_hit = top_hit
+            save_top_barcode_debug_frame(
+                color_bgr,
+                current_mask,
+                locked_target_corners,
+                top_surface_barcode_last_debug,
+                top_hit,
+                force=top_hit is not None,
+                capture=top_barcode_capture,
+            )
 
         if last_yolo_obbs is not None and time.time() - last_yolo_time <= YOLO_BOX_DISPLAY_TTL_S:
             for index, corners in enumerate(last_yolo_obbs):

@@ -31,6 +31,96 @@ class TopSurfaceBarcode:
     rect: tuple[int, int, int, int] | None = None
 
 
+def verify_top_plane_barcode(
+    hit: TopSurfaceBarcode,
+    points_xyz: np.ndarray | None,
+    pixels_uv: np.ndarray | None,
+    top_plane: np.ndarray | None,
+    *,
+    min_pixels: int = 12,
+    max_distance_m: float = 0.008,
+    min_inlier_ratio: float = 0.80,
+) -> dict:
+    """Require live 3-D points under the barcode to lie on the box top plane.
+
+    The caller must supply a top plane independently matched to the turntable
+    support plane. Missing depth or geometry is inconclusive, never a top hit.
+    """
+
+    evidence = {
+        "verified": False,
+        "reason": "missing live top-plane evidence",
+        "sample_pixels": 0,
+        "inlier_ratio": 0.0,
+        "median_distance_mm": None,
+        "inlier_coverage_xy": [0.0, 0.0],
+    }
+    if hit.rect is None or points_xyz is None or pixels_uv is None or top_plane is None:
+        return evidence
+    points = np.asarray(points_xyz, dtype=np.float64)
+    pixels = np.asarray(pixels_uv)
+    plane = np.asarray(top_plane, dtype=np.float64).reshape(-1)
+    if (
+        points.ndim != 2 or points.shape[1] != 3
+        or pixels.shape != (len(points), 2)
+        or len(plane) != 4
+        or not np.all(np.isfinite(plane))
+    ):
+        evidence["reason"] = "invalid 3-D geometry"
+        return evidence
+    normal_length = float(np.linalg.norm(plane[:3]))
+    if normal_length < 1e-9 or abs(float(plane[2]) / normal_length) < 0.55:
+        evidence["reason"] = "top plane is not camera-facing"
+        return evidence
+    x, y, width, height = (int(value) for value in hit.rect)
+    if width <= 0 or height <= 0:
+        evidence["reason"] = "invalid barcode rectangle"
+        return evidence
+    # Ignore label borders, where projected side pixels and background depth
+    # are most likely to contaminate an otherwise valid top-face sample.
+    inset_x = min(max(1, round(width * 0.1)), max(1, (width - 1) // 3))
+    inset_y = min(max(1, round(height * 0.1)), max(1, (height - 1) // 3))
+    within = (
+        (pixels[:, 0] >= x + inset_x)
+        & (pixels[:, 0] < x + width - inset_x)
+        & (pixels[:, 1] >= y + inset_y)
+        & (pixels[:, 1] < y + height - inset_y)
+        & np.all(np.isfinite(points), axis=1)
+    )
+    if not np.any(within):
+        evidence["reason"] = "no depth points inside barcode"
+        return evidence
+    # Count each RGB pixel once so duplicated FFS projections cannot make a
+    # sparse/noisy label look like abundant independent depth evidence.
+    _, unique_indices = np.unique(pixels[within], axis=0, return_index=True)
+    sampled = points[within][unique_indices]
+    sampled_pixels = pixels[within][unique_indices]
+    evidence["sample_pixels"] = int(len(sampled))
+    if len(sampled) < min_pixels:
+        evidence["reason"] = "too few independent barcode depth pixels"
+        return evidence
+    distances = np.abs(sampled @ plane[:3] + plane[3]) / normal_length
+    inlier_ratio = float(np.mean(distances <= max_distance_m))
+    median_distance_m = float(np.median(distances))
+    evidence["inlier_ratio"] = round(inlier_ratio, 3)
+    evidence["median_distance_mm"] = round(median_distance_m * 1000.0, 2)
+    if inlier_ratio < min_inlier_ratio or median_distance_m > max_distance_m:
+        evidence["reason"] = "barcode depth is not on the top plane"
+        return evidence
+    # A narrow stripe along the top edge of a side label can coincide with the
+    # top plane. Require corroborating inliers across both image dimensions.
+    inlier_pixels = sampled_pixels[distances <= max_distance_m]
+    coverage_x = float(np.ptp(inlier_pixels[:, 0])) / max(1, width - 2 * inset_x)
+    coverage_y = float(np.ptp(inlier_pixels[:, 1])) / max(1, height - 2 * inset_y)
+    evidence["inlier_coverage_xy"] = [round(coverage_x, 3), round(coverage_y, 3)]
+    if min(coverage_x, coverage_y) < 0.3:
+        evidence["reason"] = "top-plane points cover only a narrow barcode strip"
+        return evidence
+    evidence["verified"] = True
+    evidence["reason"] = "barcode depth matches the top plane"
+    return evidence
+
+
 class TopSurfaceBarcodeDetector:
     """Decode a barcode whose centre lies in the interior of a SAM2 mask."""
 
@@ -38,7 +128,7 @@ class TopSurfaceBarcodeDetector:
         self,
         *,
         minimum_interior_pixels: int = 4,
-        model_path: str = "src/Fast-FoundationStereoPose-dul_cam/models/best_0929.pt",
+        model_path: str = "src/Fast-FoundationStereoPose-dul_cam/models/best_d405_top_barcode_1013.pt",
         model_confidence: float = 0.40,
     ) -> None:
         self.minimum_interior_pixels = max(1, int(minimum_interior_pixels))

@@ -5,11 +5,71 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from std_msgs.msg import String
 
 from dobot_nova5_driver.controller_v3 import TcpPose
 from dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v5 import (
     CosmeticBoxSingleArmNode,
 )
+
+
+def test_unverified_top_candidate_blocks_bottom_flip_until_3d_success():
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    node.top_surface_barcode_lock = threading.RLock()
+    node.top_surface_barcode_window_active = True
+    node.top_surface_barcode_value = ""
+    node.top_surface_barcode_uncertain = False
+    node.top_surface_barcode_result_count = 0
+    node.get_logger = lambda: SimpleNamespace(info=MagicMock(), warning=MagicMock())
+
+    node._top_surface_barcode_callback(String(data="uncertain:top_plane_unverified"))
+    assert node._top_surface_barcode_is_uncertain()
+    assert node._current_top_surface_barcode() == ""
+
+    node._top_surface_barcode_callback(String(data="success:barcode_detected"))
+    assert not node._top_surface_barcode_is_uncertain()
+    assert node._current_top_surface_barcode() == "barcode_detected"
+
+
+@pytest.mark.parametrize("side_confirmed", [False, True])
+def test_uncertain_early_top_candidate_respects_confirmed_side(side_confirmed):
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    values = {
+        "turntable_enabled": True,
+        "turntable_stationary_barcode_check_s": 0.01,
+        "turntable_scan_timeout_s": 0.02,
+        "turntable_mid_scan_restart_s": 0.0,
+        "turntable_settle_s": 0.0,
+        "d405_early_top_barcode_enabled": True,
+        "top_surface_barcode_enabled": True,
+    }
+    node.get_parameter = lambda name: SimpleNamespace(value=values[name])
+    node.turntable_lock = threading.RLock()
+    node.turntable_scan_cancel = threading.Event()
+    node.turntable_state = "STOPPED"
+    node.turntable_barcode_value = "barcode_detected" if side_confirmed else ""
+    node.early_top_at_startup = True
+    node.running = True
+    node.shutting_down = False
+    node._wait_for_secondary_y_clearance = lambda *_args, **_kwargs: None
+    node._wait_for_turntable_camera_ready = lambda **_kwargs: None
+    node._set_turntable_barcode_window = MagicMock()
+    node._set_top_surface_barcode_window = MagicMock()
+    node._current_top_surface_barcode = lambda: ""
+    node._top_surface_barcode_is_uncertain = lambda: True
+    node._publish_status = MagicMock()
+    node._notify_d405_post_stop_revalidate = MagicMock()
+    node._toggle_turntable = lambda expected, new, _reason: (
+        setattr(node, "turntable_state", new) or time.monotonic()
+    )
+
+    if side_confirmed:
+        assert node._scan_turntable_for_side_barcode(require_cycle_active=False) == "barcode_detected"
+    else:
+        with pytest.raises(RuntimeError, match="did not verify the top plane"):
+            node._scan_turntable_for_side_barcode(require_cycle_active=False)
+
+    assert node.turntable_state == "STOPPED"
 
 
 @pytest.mark.parametrize("top_found_at", ["stopped", "rotating"])
