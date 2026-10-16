@@ -2090,7 +2090,7 @@ try:
             # frame, then use the manual ROI only to accept/reject candidate
             # centres. A rotating box can cross the padded compute ROI edge.
             processing_roi = None
-            results = yolo_model(detection_color, conf=0.6, verbose=False)#置信度参数设置目前0.6
+            results = yolo_model(detection_color, conf=0.30, verbose=False)#置信度参数设置目前0.6
             if results and results[0].obb is not None and len(results[0].obb) > 0:
                 detected_obbs = results[0].obb.xyxyxyxy.cpu().numpy()
                 roi_for_request = get_manual_roi()
