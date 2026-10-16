@@ -121,6 +121,8 @@ class FramedDobotApiFeedBack(DobotApiFeedBack):
         super().__init__(ip, port)
         self._feedback_buffer = bytearray()
         self.last_chunk_monotonic_s = 0.0
+        self.last_frame_parsed_monotonic_s = 0.0
+        self.last_recv_wait_ms = 0.0
 
     def feedBackData(self):  # noqa: N802 - vendor API name
         frame_size = MyType.itemsize
@@ -130,7 +132,9 @@ class FramedDobotApiFeedBack(DobotApiFeedBack):
             if len(self._feedback_buffer) < frame_size:
                 if latest_frame is not None:
                     break
+                recv_started = time.monotonic()
                 chunk = self.socket_dobot.recv(144000)
+                self.last_recv_wait_ms = (time.monotonic() - recv_started) * 1000.0
                 if not chunk:
                     raise ConnectionError("30004 feedback socket closed")
                 self.last_chunk_monotonic_s = time.monotonic()
@@ -149,6 +153,7 @@ class FramedDobotApiFeedBack(DobotApiFeedBack):
 
             latest_frame = bytes(self._feedback_buffer[:frame_size])
             del self._feedback_buffer[:frame_size]
+        self.last_frame_parsed_monotonic_s = time.monotonic()
         return np.frombuffer(latest_frame, dtype=MyType)
 
 
@@ -211,6 +216,10 @@ class DobotNova5Controller:
             maxlen=FEEDBACK_POSE_HISTORY_SIZE
         )
         self._latest_feedback_received_at = 0.0
+        self._latest_feedback_pose_received_at = 0.0
+        self._latest_feedback_published_monotonic_s = 0.0
+        self._latest_feedback_pose_published_monotonic_s = 0.0
+        self._latest_feedback_parse_to_publish_ms = 0.0
         self._latest_feedback_read_error = ""
         self._feedback_read_active = False
         self._feedback_read_started_monotonic_s = 0.0
@@ -461,7 +470,10 @@ class DobotNova5Controller:
             if not self._feedback_pose_history:
                 raise RuntimeError("Timestamped robot feedback pose is not ready")
             _, pose, user_index, tool_index = self._feedback_pose_history[-1]
-            received_at = self._latest_feedback_received_at
+            # A malformed or out-of-order controller timestamp can update the
+            # packet stream without adding a new pose to history. Never make
+            # the old pose appear fresh by pairing it with that packet's time.
+            received_at = self._latest_feedback_pose_received_at
             if received_at <= 0.0:
                 received_at = self._feedback_pose_history[-1][0]
         return pose, user_index, tool_index, float(received_at)
@@ -500,6 +512,12 @@ class DobotNova5Controller:
         reader = self.feedback
         chunk_at = getattr(reader, "last_chunk_monotonic_s", 0.0)
         chunk_age_ms = (now - chunk_at) * 1000.0 if chunk_at > 0.0 else -1.0
+        parsed_at = getattr(reader, "last_frame_parsed_monotonic_s", 0.0)
+        parsed_age_ms = (now - parsed_at) * 1000.0 if parsed_at > 0.0 else -1.0
+        published_at = getattr(self, "_latest_feedback_published_monotonic_s", 0.0)
+        published_age_ms = (now - published_at) * 1000.0 if published_at > 0.0 else -1.0
+        pose_published_at = getattr(self, "_latest_feedback_pose_published_monotonic_s", 0.0)
+        pose_age_ms = (now - pose_published_at) * 1000.0 if pose_published_at > 0.0 else -1.0
         wait_ms = (
             (now - self._feedback_read_started_monotonic_s) * 1000.0
             if self._feedback_read_active
@@ -509,7 +527,11 @@ class DobotNova5Controller:
         thread_alive = bool(self._feedback_thread and self._feedback_thread.is_alive())
         return (
             f"reader_active={self._feedback_read_active}, "
-            f"read_wait={wait_ms:.0f}ms, last_chunk_age={chunk_age_ms:.0f}ms, "
+            f"read_wait={wait_ms:.0f}ms, last_recv_wait={getattr(reader, 'last_recv_wait_ms', -1.0):.0f}ms, "
+            f"last_chunk_age={chunk_age_ms:.0f}ms, last_parsed_age={parsed_age_ms:.0f}ms, "
+            f"last_published_age={published_age_ms:.0f}ms, "
+            f"last_pose_age={pose_age_ms:.0f}ms, "
+            f"parse_to_publish={getattr(self, '_latest_feedback_parse_to_publish_ms', -1.0):.0f}ms, "
             f"buffered={buffered}B, thread_alive={thread_alive}"
         )
 
@@ -1552,6 +1574,8 @@ class DobotNova5Controller:
                                 self._feedback_pose_history.append(
                                     (sample_time, actual_pose, actual_user, actual_tool)
                                 )
+                                self._latest_feedback_pose_received_at = received_at
+                                self._latest_feedback_pose_published_monotonic_s = time.monotonic()
                             try:
                                 tcp_speed_values = packet["TCPSpeedActual"][0]
                                 linear_speed_mps = (
@@ -1571,6 +1595,12 @@ class DobotNova5Controller:
                                 )
                             if history_is_fresh:
                                 self._feedback_timestamp_source = timestamp_source
+                    published_at = time.monotonic()
+                    self._latest_feedback_published_monotonic_s = published_at
+                    parsed_at = getattr(self.feedback, "last_frame_parsed_monotonic_s", 0.0)
+                    self._latest_feedback_parse_to_publish_ms = (
+                        (published_at - parsed_at) * 1000.0 if parsed_at > 0.0 else -1.0
+                    )
             except Exception as exc:
                 self._feedback_read_active = False
                 with self._feedback_lock:

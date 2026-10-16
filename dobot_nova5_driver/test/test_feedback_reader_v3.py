@@ -8,6 +8,7 @@ import dobot_nova5_driver.controller_v3 as controller_v3
 from dobot_nova5_driver.controller_v3 import (
     DobotNova5Controller,
     FramedDobotApiFeedBack,
+    TcpPose,
 )
 
 
@@ -46,6 +47,9 @@ def test_split_tcp_reads_reconstruct_one_feedback_frame():
 
     assert int(reader.feedBackData()["TimeStamp"][0]) == 123456
     assert reader._feedback_buffer == bytearray()
+    assert reader.last_chunk_monotonic_s > 0.0
+    assert reader.last_frame_parsed_monotonic_s >= reader.last_chunk_monotonic_s
+    assert reader.last_recv_wait_ms >= 0.0
 
 
 def test_coalesced_frames_use_latest_and_preserve_partial_next_frame():
@@ -96,3 +100,16 @@ def test_transient_feedback_error_retries_without_using_full_safety_budget(monke
     assert sleeps == [controller_v3.FEEDBACK_READ_ERROR_RETRY_S]
     assert controller.feedback_data is packet
     assert controller.feedback_last_read_error == ""
+
+
+def test_new_packet_cannot_make_an_old_pose_look_fresh():
+    controller = DobotNova5Controller("192.0.2.102")
+    pose = TcpPose(0.5, 0.3, 0.2, 0.0, 0.0, 0.0)
+    controller._feedback_pose_history.append((100.0, pose, 0, 1))
+    controller._latest_feedback_pose_received_at = 100.0
+    controller._latest_feedback_received_at = 101.0
+
+    result, user, tool, received_at = controller.current_feedback_tcp_pose_with_timestamp()
+
+    assert (result, user, tool) == (pose, 0, 1)
+    assert received_at == 100.0

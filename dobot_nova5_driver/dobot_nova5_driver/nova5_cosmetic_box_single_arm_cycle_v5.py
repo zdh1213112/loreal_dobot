@@ -399,6 +399,7 @@ class CosmeticBoxSingleArmNode(Node):
         # to the common 101 User frame as y_102_common = y_102 - 0.725.
         self.declare_parameter("secondary_base_y_offset_m", -0.725)
         self.declare_parameter("secondary_tcp_max_age_s", 0.05)
+        self.declare_parameter("secondary_recovery_stable_s", 1.0)
         # Redundant left-arm TCP-gap stop. The primary turntable arbitration
         # is the 102 VLA lease above; no 101 retreat jog is automatic in V5.
         # This node reads 102 feedback but never commands its motion.
@@ -975,6 +976,9 @@ class CosmeticBoxSingleArmNode(Node):
         # distance interlock remain active throughout the return.
         self.secondary_safe_startup_return_active = threading.Event()
         self.secondary_recovery_clear_samples = 0
+        self.secondary_recovery_clear_since: Optional[float] = None
+        self.secondary_recovery_last_feedback_at = 0.0
+        self.secondary_recovery_last_observed_at = 0.0
         # A near-miss may restart only after 102 has released its zone lease,
         # retreated, and the VLA heartbeat remains live. Controller collision
         # mode is never cleared by this software path.
@@ -1182,6 +1186,9 @@ class CosmeticBoxSingleArmNode(Node):
         )
         self.secondary_fetch_phase_publisher = self.create_publisher(
             Bool, "/dual_arm_102_post_place_fetch", guard_qos,
+        )
+        self.secondary_placement_ready_publisher = self.create_publisher(
+            Bool, "/dual_arm_102_placement_ready", guard_qos,
         )
         self.create_subscription(
             UInt32, "/dual_arm_102_guard_ack", self._secondary_guard_ack_callback, 10,
@@ -2046,6 +2053,35 @@ class CosmeticBoxSingleArmNode(Node):
             x_lt_m, z_gt_m, 2.0,
         ]
         self.secondary_guard_xyz_publisher.publish(xyz_message)
+        self._publish_secondary_placement_ready()
+
+    def _publish_secondary_placement_ready(self) -> None:
+        """Advertise the placement window; the service still grants ownership."""
+        publisher = getattr(self, "secondary_placement_ready_publisher", None)
+        if publisher is None:
+            return
+        with self.secondary_safety_lock:
+            departure_clear = (
+                self.secondary_material_removed_for_handoff
+                and not self.secondary_pick_guard_active
+            )
+            available = (
+                self.cycle_enabled
+                and not self.secondary_protective_stop_latched.is_set()
+                and self._secondary_vla_heartbeat_fresh()
+                and self.secondary_zone_open_for_102
+                and not self.secondary_zone_held_by_102
+                and self.turntable_waiting_for_place
+                and not self.secondary_pick_guard_active
+                and (self.controller.robot_mode == 5 or departure_clear)
+                and (
+                    not self.secondary_material_removed_for_handoff
+                    or not self.secondary_departure_grant_consumed
+                )
+            )
+        message = Bool()
+        message.data = bool(available)
+        publisher.publish(message)
 
     def _set_secondary_post_place_fetch(self, active: bool) -> None:
         """Report the 102 phase inferred from its measured place/retreat edge."""
@@ -2194,6 +2230,7 @@ class CosmeticBoxSingleArmNode(Node):
                         self.secondary_departure_grant_consumed = True
             if granted and first_grant:
                 self._publish_status("102 turntable lease granted; 101 stays clear")
+            self._publish_secondary_placement_ready()
             response.success = granted
             response.message = "102 turntable lease granted" if granted else "101 shared zone unavailable"
             return response
@@ -2216,6 +2253,7 @@ class CosmeticBoxSingleArmNode(Node):
                 self.secondary_zone_held_by_102 = False
         if released and was_held:
             self._publish_status("102 turntable lease released after safe retreat")
+        self._publish_secondary_placement_ready()
         response.success = released
         response.message = "102 turntable lease released" if released else "102 has not retreated"
         return response
@@ -2234,6 +2272,7 @@ class CosmeticBoxSingleArmNode(Node):
                 and not self.secondary_protective_stop_latched.is_set()
                 and self.controller.robot_mode == 5
             )
+        self._publish_secondary_placement_ready()
 
     def _open_secondary_zone_after_departure(self) -> None:
         """Let 102 place once 101 confirms turntable departure and ends its guard."""
@@ -2255,6 +2294,7 @@ class CosmeticBoxSingleArmNode(Node):
                 "101 confirmed the box clear of the turntable and ended the "
                 "pick/flip guard; 102 may place while 101 finishes at the fixed pose"
             )
+            self._publish_secondary_placement_ready()
 
     def _close_secondary_zone_for_pick(
         self, material_event_number: Optional[int] = None
@@ -2265,6 +2305,7 @@ class CosmeticBoxSingleArmNode(Node):
             self.secondary_zone_open_for_102 = False
             self.secondary_material_removed_for_handoff = False
             self.secondary_departure_grant_consumed = False
+        self._publish_secondary_placement_ready()
         if not bool(self.get_parameter("secondary_vla_interlock_required").value):
             return
         clear_since = None
@@ -2422,6 +2463,7 @@ class CosmeticBoxSingleArmNode(Node):
             "gap_y_m": float(gap_y_m),
             "threshold_m": float(threshold_m),
             "feedback_age_s": float(feedback_age_s),
+            "feedback_received_at": float(received_at),
             "secondary_user": int(actual_user),
             "secondary_tool": int(actual_tool),
             "source": source,
@@ -2624,10 +2666,10 @@ class CosmeticBoxSingleArmNode(Node):
             # Re-close the cycle on every unsafe sample, including an enable
             # request racing with an already latched conflict.
             self.cycle_enabled = False
+            self._reset_secondary_recovery_evidence()
             if first_trigger:
                 self.secondary_protective_stop_latched.set()
                 self.secondary_safety_reason = str(detail)
-                self.secondary_recovery_clear_samples = 0
                 self.secondary_zone_open_for_102 = False
 
         if first_trigger:
@@ -2679,6 +2721,26 @@ class CosmeticBoxSingleArmNode(Node):
                     break
                 time.sleep(0.01)
             else:
+                return
+
+            # The cancelled cycle may have been carrying a box when Stop was
+            # issued.  A fresh worker opens the gripper at startup, so only
+            # resume automatically when feedback positively reports no object.
+            try:
+                grip_state = int(self.gripper.read_grip_state())
+            except Exception as exc:
+                grip_state = None
+                grip_detail = f"gripper feedback unavailable: {exc}"
+            else:
+                grip_detail = self._grip_state_text(grip_state)
+            if grip_state != GRIP_REACHED:
+                with self.secondary_safety_lock:
+                    self.secondary_auto_resume_requested.clear()
+                self._publish_status(
+                    "101 automatic restart cancelled after safety Stop: "
+                    f"gripper is {grip_detail}; holding position and gripper "
+                    "for operator recovery"
+                )
                 return
 
             with self.secondary_safety_lock:
@@ -2909,13 +2971,19 @@ class CosmeticBoxSingleArmNode(Node):
             self.get_logger().fatal(self.secondary_safety_reason)
             self._publish_status(self.secondary_safety_reason)
 
+    def _reset_secondary_recovery_evidence(self) -> None:
+        self.secondary_recovery_clear_samples = 0
+        self.secondary_recovery_clear_since = None
+        self.secondary_recovery_last_feedback_at = 0.0
+        self.secondary_recovery_last_observed_at = 0.0
+
     def _recover_secondary_protective_stop_if_clear(
         self, gap_m: float, robot_mode: int
     ) -> bool:
-        """Restart a near-miss only after the VLA has vacated the shared zone."""
+        """Restart only after distinct fresh 102 poses remain safe for 1 s."""
 
         if not self.secondary_protective_stop_latched.is_set():
-            self.secondary_recovery_clear_samples = 0
+            self._reset_secondary_recovery_evidence()
             return False
         _, _, recover_m = self._secondary_interlock_distances()
         measurement = self.secondary_last_measurement or {}
@@ -2928,16 +2996,41 @@ class CosmeticBoxSingleArmNode(Node):
             < float(self.get_parameter("secondary_zone_safe_y_m").value)
         )
         if not ready:
-            self.secondary_recovery_clear_samples = 0
+            self._reset_secondary_recovery_evidence()
             return False
+        feedback_at = float(measurement.get("feedback_received_at", float("nan")))
+        if not math.isfinite(feedback_at):
+            self._reset_secondary_recovery_evidence()
+            return False
+        now = time.monotonic()
+        if feedback_at <= self.secondary_recovery_last_feedback_at:
+            return False
+        # An idle monitor thread cannot prove continuous safety across a long
+        # scheduling gap, even if a fresh packet is available when it wakes.
+        max_gap_s = max(
+            0.10, float(self.get_parameter("secondary_tcp_max_age_s").value)
+        )
+        if (
+            self.secondary_recovery_last_observed_at > 0.0
+            and now - self.secondary_recovery_last_observed_at > max_gap_s
+        ):
+            self._reset_secondary_recovery_evidence()
+        self.secondary_recovery_last_feedback_at = feedback_at
+        self.secondary_recovery_last_observed_at = now
+        if self.secondary_recovery_clear_since is None:
+            self.secondary_recovery_clear_since = now
         self.secondary_recovery_clear_samples += 1
-        if self.secondary_recovery_clear_samples < 2:
+        stable_s = max(1.0, float(self.get_parameter("secondary_recovery_stable_s").value))
+        if (
+            self.secondary_recovery_clear_samples < 3
+            or now - self.secondary_recovery_clear_since < stable_s
+        ):
             return False
         with self.secondary_safety_lock:
             self.secondary_protective_stop_latched.clear()
             self.secondary_retreat_attempted.clear()
             restart = self.secondary_auto_resume_requested.is_set()
-            self.secondary_recovery_clear_samples = 0
+            self._reset_secondary_recovery_evidence()
         self._publish_status(
             "101/102 turntable zone recovered after verified 102 retreat; "
             + ("starting a fresh cycle" if restart else "cycle remains stopped")
@@ -3000,7 +3093,7 @@ class CosmeticBoxSingleArmNode(Node):
                         allow_reconnect=robot_mode not in (7, 8, 10)
                     )
                 except Exception as exc:
-                    self.secondary_recovery_clear_samples = 0
+                    self._reset_secondary_recovery_evidence()
                     if robot_mode in (7, 8, 10):
                         self._latch_secondary_protective_stop(
                             "102 TCP safety feedback failed while 101 was moving; "
@@ -3049,7 +3142,7 @@ class CosmeticBoxSingleArmNode(Node):
                     retreat_m,
                 )
                 if action == "stop":
-                    self.secondary_recovery_clear_samples = 0
+                    self._reset_secondary_recovery_evidence()
                     self._latch_secondary_protective_stop(
                         "101 protective stop: common-Y TCP gap "
                         f"{gap_m * 1000.0:.1f}mm "
@@ -3058,7 +3151,7 @@ class CosmeticBoxSingleArmNode(Node):
                         robot_mode,
                     )
                 elif action == "retreat":
-                    self.secondary_recovery_clear_samples = 0
+                    self._reset_secondary_recovery_evidence()
                     self._latch_secondary_protective_stop(
                         "101 emergency retreat trigger: common-Y TCP gap "
                         f"{gap_m * 1000.0:.1f}mm "
@@ -3692,6 +3785,11 @@ class CosmeticBoxSingleArmNode(Node):
                 and observation.frame_time_s > stop_epoch
                 for observation in self.pregrasp_observations
             ):
+                self._publish_status(
+                    f"empty-turntable confirmation blocked for material event "
+                    f"#{event_number}: D405 already published a valid post-stop "
+                    "target; retaining the material event"
+                )
                 return False
 
         def target_seen() -> bool:
@@ -3885,6 +3983,9 @@ class CosmeticBoxSingleArmNode(Node):
         self._publish_status(
             "turntable material was removed by the left arm; waiting for the next 102 placement"
         )
+        # Hand off as soon as the departure checks pass, without waiting for
+        # the monitor's next iteration or 102's first Y>400 mm action.
+        self._open_secondary_zone_after_departure()
 
     def _reset_turntable_round_for_operator_recovery(self) -> None:
         """Discard the previous material workflow after a startup recovery.

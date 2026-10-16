@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Export a one-class Ultralytics barcode detector to runtime-ready ONNX.
+r"""Export a one-class Ultralytics barcode detector to runtime-ready ONNX.
+
+Usage (replace the input .pt and output .onnx paths with your own weights)::
+
+    /home/zdh/miniconda3/envs/yolo/bin/python \
+      /home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/tools/export_barcode_onnx.py \
+      /home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_0929.pt \
+      --output /home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_0929_reexport.onnx \
+      --imgsz 640 --opset 17 --device cpu
 
 The fast D435 detector in this workspace expects a static NCHW input and an
 end-to-end detection output shaped ``[batch, max_det, 6]``. Each output row is

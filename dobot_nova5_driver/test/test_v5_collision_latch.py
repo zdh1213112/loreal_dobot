@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v5 as cycle_v5
 from dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v5 import (
     CosmeticBoxSingleArmNode,
     EmptyTurntableConfirmed,
@@ -23,6 +24,9 @@ def stopped_node():
     node.secondary_auto_resume_requested = threading.Event()
     node.turntable_scan_cancel = threading.Event()
     node.secondary_recovery_clear_samples = 0
+    node.secondary_recovery_clear_since = None
+    node.secondary_recovery_last_feedback_at = 0.0
+    node.secondary_recovery_last_observed_at = 0.0
     node.secondary_safety_reason = ""
     node.secondary_zone_open_for_102 = False
     node.turntable_waiting_for_place = True
@@ -33,11 +37,15 @@ def stopped_node():
     node.secondary_fetch_phase_publisher = MagicMock()
     node.secondary_pick_guard_publisher = MagicMock()
     node.secondary_guard_xyz_publisher = MagicMock()
+    node.secondary_placement_ready_publisher = MagicMock()
     node.secondary_guard_sequence = 1
     node.secondary_guard_ack_sequence = 1
     node.secondary_material_removed_for_handoff = False
     node.secondary_departure_grant_consumed = False
-    node.secondary_last_measurement = {"right_y_m": 0.100}
+    node.secondary_last_measurement = {
+        "right_y_m": 0.100,
+        "feedback_received_at": 1.0,
+    }
     node.cycle_enabled = True
     node.worker = SimpleNamespace(is_alive=lambda: True)
     node.controller = SimpleNamespace(
@@ -55,6 +63,8 @@ def stopped_node():
             "secondary_pick_guard_y_m": 0.325,
             "secondary_collision_x_lt_m": 0.535,
             "secondary_collision_z_gt_m": 0.075,
+            "secondary_recovery_stable_s": 1.0,
+            "secondary_tcp_max_age_s": 0.05,
         }.get(name, 0.180)
     )
     node.get_logger = lambda: MagicMock()
@@ -152,6 +162,69 @@ def test_empty_event_rejects_post_stop_target_already_seen():
     ))
     assert not node._confirm_empty_turntable(3)
     node.trigger_publisher.publish.assert_not_called()
+    node._publish_status.assert_called_with(
+        "empty-turntable confirmation blocked for material event #3: "
+        "D405 already published a valid post-stop target; retaining the material event"
+    )
+
+
+def test_safety_restart_keeps_gripped_box_and_does_not_open_gripper():
+    node = stopped_node()
+    node.running = True
+    node.cycle_enabled = False
+    node.worker = None
+    node.secondary_safety_shutdown = threading.Event()
+    node.secondary_resume_thread = threading.current_thread()
+    node.secondary_auto_resume_requested.set()
+    node.controller.robot_mode = 5
+    node.gripper = SimpleNamespace(read_grip_state=lambda: cycle_v5.GRIP_GRIPPED)
+    node._ensure_worker = MagicMock()
+
+    node._resume_continuous_after_secondary_clearance()
+
+    assert not node.secondary_auto_resume_requested.is_set()
+    assert not node.cycle_enabled
+    node._ensure_worker.assert_not_called()
+    assert "gripper is object gripped" in node._publish_status.call_args.args[0]
+
+
+def test_safety_restart_requires_verified_gripper_feedback():
+    node = stopped_node()
+    node.running = True
+    node.cycle_enabled = False
+    node.worker = None
+    node.secondary_safety_shutdown = threading.Event()
+    node.secondary_resume_thread = threading.current_thread()
+    node.secondary_auto_resume_requested.set()
+    node.controller.robot_mode = 5
+    node.gripper = SimpleNamespace(read_grip_state=MagicMock(side_effect=RuntimeError("offline")))
+    node._ensure_worker = MagicMock()
+
+    node._resume_continuous_after_secondary_clearance()
+
+    assert not node.secondary_auto_resume_requested.is_set()
+    assert not node.cycle_enabled
+    node._ensure_worker.assert_not_called()
+    assert "gripper feedback unavailable" in node._publish_status.call_args.args[0]
+
+
+def test_safety_restart_continues_when_gripper_is_verified_empty():
+    node = stopped_node()
+    node.running = True
+    node.cycle_enabled = False
+    node.worker = None
+    node.secondary_safety_shutdown = threading.Event()
+    node.secondary_resume_thread = threading.current_thread()
+    node.secondary_auto_resume_requested.set()
+    node.controller.robot_mode = 5
+    node.gripper = SimpleNamespace(read_grip_state=lambda: cycle_v5.GRIP_REACHED)
+    node._ensure_worker = MagicMock()
+
+    node._resume_continuous_after_secondary_clearance()
+
+    assert not node.secondary_auto_resume_requested.is_set()
+    assert node.cycle_enabled
+    node._ensure_worker.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -283,7 +356,9 @@ def test_102_cannot_acquire_stale_open_lease_after_new_material_event():
     assert not node.secondary_zone_held_by_102
 
 
-def test_near_miss_stops_once_and_resumes_only_after_verified_release():
+def test_near_miss_stops_once_and_resumes_only_after_stable_fresh_retreat(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(cycle_v5.time, "monotonic", lambda: now[0])
     node = stopped_node()
     node._latch_secondary_protective_stop("102 approaching", robot_mode=7)
     node._latch_secondary_protective_stop("102 approaching", robot_mode=7)
@@ -297,8 +372,49 @@ def test_near_miss_stops_once_and_resumes_only_after_verified_release():
     assert node.secondary_protective_stop_latched.is_set()
     node.secondary_zone_held_by_102 = False
     assert not node._recover_secondary_protective_stop_if_clear(0.200, 5)
-    assert node._recover_secondary_protective_stop_if_clear(0.200, 5)
+    # Polling the same packet cannot count as an independent fresh sample.
+    now[0] = 10.02
+    assert not node._recover_secondary_protective_stop_if_clear(0.200, 5)
+    assert node.secondary_recovery_clear_samples == 1
+    recovered = False
+    for index in range(2, 28):
+        now[0] = 10.0 + (index - 1) * 0.04
+        node.secondary_last_measurement["feedback_received_at"] = float(index)
+        recovered = node._recover_secondary_protective_stop_if_clear(0.200, 5) or recovered
+    assert recovered
     node._schedule_continuous_restart_after_secondary_clearance.assert_called_once()
+
+
+def test_recovery_timer_restarts_after_an_unsafe_sample(monkeypatch):
+    now = [20.0]
+    monkeypatch.setattr(cycle_v5.time, "monotonic", lambda: now[0])
+    node = stopped_node()
+    node._latch_secondary_protective_stop("102 feedback stale", robot_mode=7)
+    assert not node._recover_secondary_protective_stop_if_clear(0.200, 5)
+    now[0] = 20.04
+    node.secondary_last_measurement["right_y_m"] = 0.405
+    assert not node._recover_secondary_protective_stop_if_clear(0.200, 5)
+    assert node.secondary_recovery_clear_since is None
+    node.secondary_last_measurement["right_y_m"] = 0.100
+    recovered = False
+    for index in range(2, 28):
+        node.secondary_last_measurement["feedback_received_at"] = float(index)
+        now[0] = 20.08 + (index - 2) * 0.04
+        recovered = node._recover_secondary_protective_stop_if_clear(0.200, 5) or recovered
+    assert recovered
+
+
+def test_recovery_timer_restarts_after_monitor_gap(monkeypatch):
+    now = [30.0]
+    monkeypatch.setattr(cycle_v5.time, "monotonic", lambda: now[0])
+    node = stopped_node()
+    node._latch_secondary_protective_stop("102 feedback stale", robot_mode=7)
+    assert not node._recover_secondary_protective_stop_if_clear(0.200, 5)
+    now[0] = 30.20
+    node.secondary_last_measurement["feedback_received_at"] = 2.0
+    assert not node._recover_secondary_protective_stop_if_clear(0.200, 5)
+    assert node.secondary_recovery_clear_samples == 1
+    assert node.secondary_recovery_clear_since == 30.20
 
 
 def test_collision_mode_keeps_latch_even_after_102_retreat():
@@ -448,6 +564,43 @@ def test_102_can_enter_after_box_departure_without_101_y_threshold():
         SimpleNamespace(data=True), SimpleNamespace(success=False, message="")
     )
     assert not response.success
+
+
+def test_departure_immediately_advertises_the_placement_window():
+    node = empty_event_node()
+    node.controller.robot_mode = 7
+    node.secondary_pick_guard_active = True
+    node._mark_turntable_material_removed()
+    assert not node.secondary_pick_guard_active
+    assert node.secondary_zone_open_for_102
+    assert node.turntable_waiting_for_place
+    assert node.secondary_placement_ready_publisher.publish.call_args.args[0].data is True
+
+    response = node._secondary_zone_lease_callback(
+        SimpleNamespace(data=True), SimpleNamespace(success=False, message=""),
+    )
+    assert response.success
+    assert node.secondary_placement_ready_publisher.publish.call_args.args[0].data is False
+
+
+@pytest.mark.parametrize("condition", ["grasping", "occupied", "disabled", "stopped", "consumed"])
+def test_placement_window_advertisement_remains_closed_until_safe(condition):
+    node = stopped_node()
+    node.controller.robot_mode = 5
+    node.secondary_zone_open_for_102 = True
+    if condition == "grasping":
+        node.secondary_pick_guard_active = True
+    elif condition == "occupied":
+        node.turntable_waiting_for_place = False
+    elif condition == "disabled":
+        node.cycle_enabled = False
+    elif condition == "stopped":
+        node.secondary_protective_stop_latched.set()
+    else:
+        node.secondary_material_removed_for_handoff = True
+        node.secondary_departure_grant_consumed = True
+    node._publish_secondary_placement_ready()
+    assert node.secondary_placement_ready_publisher.publish.call_args.args[0].data is False
 
 
 def test_102_cannot_enter_during_101_down_grasp_even_if_vla_sees_empty_table():
