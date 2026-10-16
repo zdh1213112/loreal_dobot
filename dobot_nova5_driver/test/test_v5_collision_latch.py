@@ -1,6 +1,7 @@
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,6 +13,7 @@ from dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v5 import (
     EmptyTurntableConfirmed,
 )
 from dobot_nova5_driver.turntable_v3 import PlacementRetreatTrigger
+from dobot_nova5_driver.controller_v3 import TcpPose
 
 
 def stopped_node():
@@ -60,7 +62,7 @@ def stopped_node():
     node.get_parameter = lambda name: SimpleNamespace(
         value={
             "secondary_zone_safe_y_m": 0.400,
-            "secondary_pick_guard_y_m": 0.325,
+            "secondary_pick_guard_y_m": 0.300,
             "secondary_collision_x_lt_m": 0.535,
             "secondary_collision_z_gt_m": 0.075,
             "secondary_recovery_stable_s": 1.0,
@@ -91,6 +93,8 @@ def empty_event_node():
     node.pose_count = 0
     node.pregrasp_pose_count = 0
     node.pregrasp_observations = deque(maxlen=40)
+    node.handoff_state_count = 0
+    node.latest_handoff_clear = False
     node.last_turntable_stop_monotonic = 0.0
     node.last_turntable_stop_epoch = 0.0
     node.last_turntable_stop_pregrasp_count = 0
@@ -99,7 +103,7 @@ def empty_event_node():
     node.vision_result_count = 0
     node.latest_vision_result = ""
     node.trigger_publisher = MagicMock()
-    node._read_secondary_y_clearance = lambda: {
+    node._read_secondary_y_clearance = lambda **_kwargs: {
         "right_y_m": 0.344,
         "gap_y_m": 0.300,
     }
@@ -108,7 +112,7 @@ def empty_event_node():
     node.get_parameter = lambda name: SimpleNamespace(
         value={
             "secondary_zone_safe_y_m": 0.400,
-            "secondary_pick_guard_y_m": 0.325,
+            "secondary_pick_guard_y_m": 0.300,
             "secondary_collision_x_lt_m": 0.535,
             "secondary_collision_z_gt_m": 0.075,
             "startup_joint_skip_tolerance_deg": 1.0,
@@ -116,6 +120,10 @@ def empty_event_node():
             "empty_turntable_min_observation_s": 0.2,
             "empty_turntable_result_timeout_s": 0.2,
             "empty_turntable_guard_probe_interval_s": 0.2,
+            "pregrasp_pose_max_age_s": 0.65,
+            "d405_post_stop_samples": 2,
+            "vision_position_stability_m": 0.005,
+            "vision_angle_stability_deg": 10.0,
             "secondary_vla_interlock_required": True,
         }.get(name, 0.180)
     )
@@ -166,6 +174,210 @@ def test_empty_event_rejects_post_stop_target_already_seen():
         "empty-turntable confirmation blocked for material event #3: "
         "D405 already published a valid post-stop target; retaining the material event"
     )
+
+
+def test_stale_target_allows_repeated_empty_check_and_new_placement_round():
+    node = empty_event_node()
+    node.last_turntable_stop_monotonic = time.monotonic() - 3.0
+    node.last_turntable_stop_epoch = time.time() - 3.0
+    node.pregrasp_pose_count = 1
+    node.pregrasp_observations.append(SimpleNamespace(
+        count=1,
+        received_at_monotonic=time.monotonic() - 2.0,
+        frame_time_s=time.time() - 2.0,
+    ))
+
+    def publish(_message):
+        node.latest_vision_result = "failure:no_cosmetic_box"
+        node.vision_result_count += 1
+
+    node.trigger_publisher.publish.side_effect = publish
+    assert node._confirm_empty_turntable(3)
+    assert node.trigger_publisher.publish.call_count == 2
+    assert node._release_confirmed_empty_turntable_event(3)
+    assert not node.turntable_material_ready
+    assert node.turntable_active_pick_event_number is None
+    assert node.turntable_ready_barcode == ""
+    assert node.turntable_ready_top_barcode == ""
+    assert node.turntable_scan_error == ""
+    assert node.last_accepted_target is None
+    assert node.turntable_waiting_for_place
+    assert node.secondary_zone_open_for_102
+    node.turntable_secondary_retreat_trigger.reset.assert_called_once_with(
+        require_fresh_entry=True
+    )
+
+
+def rediscovered_box_node():
+    node = empty_event_node()
+    assert node._release_confirmed_empty_turntable_event(3)
+    node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(0.400, 0.0)
+    node._read_secondary_y_clearance = lambda **_kwargs: {
+        "right_y_m": 0.300, "right_x_m": 0.500, "right_z_m": 0.200,
+        "gap_y_m": 0.300,
+    }
+    now, epoch = time.monotonic(), time.time()
+    node.empty_turntable_recovery = cycle_v5.EmptyTurntableRecovery(
+        event_number=3, pose_count=0, pregrasp_count=0, handoff_count=0,
+        began_monotonic=now - 0.30, began_epoch=epoch - 0.30,
+    )
+    node.pose_count = 1
+    node.pregrasp_pose_count = 2
+    node.handoff_state_count = 2
+    node.latest_handoff_clear = True
+    for count, age in [(1, 0.10), (2, 0.05)]:
+        node.pregrasp_observations.append(cycle_v5.PregraspObservation(
+            count=count, pose=TcpPose(0.5, -0.15, 0.19, 180.0, 0.0, 0.0),
+            received_at_monotonic=now-age, frame_time_s=epoch-age,
+        ))
+    node._accept_turntable_place_done = MagicMock()
+    return node
+
+
+@pytest.mark.parametrize("reason", [
+    "place_entry_latched", "still_above_400", "inside_pick_volume", "stale_feedback",
+    "entry_during_feedback_read", "new_event_during_feedback_read", "placement_event_pending",
+])
+def test_rediscovery_does_not_interrupt_normal_102_placement(reason):
+    node = rediscovered_box_node()
+    node.secondary_zone_held_by_102 = True
+    if reason == "place_entry_latched":
+        # The exact reported sequence: normal place entry was already logged,
+        # then D405 published a target before the place/retreat event completed.
+        node.turntable_secondary_retreat_trigger.place_seen = True
+    elif reason == "placement_event_pending":
+        node.turntable_place_event_pending = True
+    elif reason == "stale_feedback":
+        node._read_secondary_y_clearance = MagicMock(side_effect=RuntimeError("stale"))
+    else:
+        def measurement(**_kwargs):
+            if reason == "entry_during_feedback_read":
+                node.turntable_secondary_retreat_trigger.place_seen = True
+            elif reason == "new_event_during_feedback_read":
+                node.turntable_place_done_count += 1
+                node.empty_turntable_recovery = None
+            return {
+                "right_y_m": (0.401 if reason == "still_above_400" else
+                              0.344 if reason == "inside_pick_volume" else 0.300),
+                "right_x_m": 0.500, "right_z_m": 0.200, "gap_y_m": 0.300,
+            }
+        node._read_secondary_y_clearance = measurement
+
+    node._recover_material_after_empty_turntable()
+
+    assert not node.empty_turntable_recovery_claimed
+    assert not node.secondary_pick_guard_active
+    node._accept_turntable_place_done.assert_not_called()
+
+
+def test_normal_placement_retreat_wins_over_empty_round_rediscovery():
+    node = rediscovered_box_node()
+    node.secondary_zone_held_by_102 = True
+    node._update_turntable_place_from_secondary_tcp(
+        {"right_y_m": 0.401, "right_x_m": 0.500, "right_z_m": 0.200}
+    )
+    node._recover_material_after_empty_turntable()
+    assert not node.secondary_pick_guard_active
+    node._accept_turntable_place_done.assert_not_called()
+
+    def accept(source):
+        assert source.startswith("automatic 102 TCP place/retreat trigger")
+        # This is the handoff between trigger firing and material-event
+        # acceptance; the rediscovery loop may run on the worker meanwhile.
+        assert node.turntable_place_event_pending
+        node._recover_material_after_empty_turntable()
+        assert not node.secondary_pick_guard_active
+        node.empty_turntable_recovery = None
+
+    node._accept_turntable_place_done.side_effect = accept
+    node._update_turntable_place_from_secondary_tcp(
+        {"right_y_m": 0.398, "right_x_m": 0.500, "right_z_m": 0.200}
+    )
+    node._accept_turntable_place_done.assert_called_once()
+    assert not node.turntable_place_event_pending
+    assert not node.secondary_pick_guard_active
+
+
+def test_rediscovered_box_recovers_without_another_102_place_event():
+    node = rediscovered_box_node()
+    node.secondary_zone_held_by_102 = True  # Prefetched after the empty result.
+
+    node._recover_material_after_empty_turntable()
+    assert node.empty_turntable_recovery_claimed
+    assert node.secondary_pick_guard_active
+    assert not node.secondary_zone_open_for_102
+    node._accept_turntable_place_done.assert_not_called()
+
+    # No scan while the 102 client still owns its prefetched placement lease.
+    node.secondary_guard_ack_sequence = node.secondary_guard_sequence
+    node._recover_material_after_empty_turntable()
+    node._accept_turntable_place_done.assert_not_called()
+    response = node._secondary_zone_lease_callback(
+        SimpleNamespace(data=False), SimpleNamespace(success=False, message="")
+    )
+    assert response.success
+    node._recover_material_after_empty_turntable()
+    node._accept_turntable_place_done.assert_called_once_with(
+        "D405 material rediscovered after empty-turntable checks",
+        expected_current_event_number=3,
+    )
+
+
+@pytest.mark.parametrize("reason", [
+    "old_pose", "old_frames", "no_stable_target", "duplicate_frame", "blocked",
+    "unstable", "not_startup", "running_table", "new_event",
+])
+def test_rediscovery_rejects_unverified_material_or_wrong_round(reason):
+    node = rediscovered_box_node()
+    if reason == "old_pose":
+        node.pregrasp_observations.clear()
+    elif reason == "old_frames":
+        node.pregrasp_observations = deque([
+            cycle_v5.PregraspObservation(
+                count=i, pose=TcpPose(0.5, -0.15, 0.19, 180.0, 0.0, 0.0),
+                received_at_monotonic=time.monotonic(), frame_time_s=time.time()-2.0,
+            ) for i in [1, 2]
+        ])
+    elif reason == "no_stable_target":
+        node.pose_count = 0
+    elif reason == "duplicate_frame":
+        node.pregrasp_observations = deque([node.pregrasp_observations[-1]] * 2)
+    elif reason == "blocked":
+        node.latest_handoff_clear = False
+    elif reason == "unstable":
+        node.pregrasp_observations[-1] = cycle_v5.PregraspObservation(
+            count=2, pose=TcpPose(0.6, -0.15, 0.19, 180.0, 0.0, 0.0),
+            received_at_monotonic=time.monotonic(), frame_time_s=time.time(),
+        )
+    elif reason == "not_startup":
+        node.controller.current_joint = lambda: [0.0] * 6
+    elif reason == "running_table":
+        node.turntable_state = "RUNNING"
+    elif reason == "new_event":
+        node.turntable_place_done_count = 4
+
+    node._recover_material_after_empty_turntable()
+    assert not node.empty_turntable_recovery_claimed
+    assert not node.secondary_pick_guard_active
+    node._accept_turntable_place_done.assert_not_called()
+
+
+def test_recovered_material_wait_does_not_require_new_placement_callback():
+    node = rediscovered_box_node()
+    node._recover_material_after_empty_turntable()
+    node.secondary_guard_ack_sequence = node.secondary_guard_sequence
+
+    def accept(_source, **_kwargs):
+        node.turntable_place_done_count = 4
+        node.empty_turntable_recovery = None
+        node.turntable_waiting_for_place = False
+        node.turntable_material_ready = True
+        node.turntable_ready_barcode = ""
+        node.turntable_ready_top_barcode = ""
+
+    node._accept_turntable_place_done.side_effect = accept
+    assert node._wait_for_scanned_turntable_material() == (4, "", "")
+    assert node.turntable_active_pick_event_number == 4
 
 
 def test_safety_restart_keeps_gripped_box_and_does_not_open_gripper():
@@ -456,8 +668,8 @@ def test_pick_guard_violation_stops_motion_but_not_safe_startup_return():
     node = stopped_node()
     node.secondary_pick_guard_active = True
 
-    assert not node._secondary_pick_guard_stop_required(0.325, 7, 0.100, 0.500)
-    assert node._secondary_pick_guard_stop_required(0.326, 7, 0.100, 0.500)
+    assert not node._secondary_pick_guard_stop_required(0.300, 7, 0.100, 0.500)
+    assert node._secondary_pick_guard_stop_required(0.3002, 7, 0.100, 0.500)
     assert not node._secondary_pick_guard_stop_required(0.390, 7, 0.075, 0.500)
     assert not node._secondary_pick_guard_stop_required(0.390, 7, 0.100, 0.535)
     assert not node._secondary_pick_guard_stop_required(0.390, 5, 0.100, 0.500)
@@ -472,7 +684,7 @@ def test_collision_volume_requires_all_three_conditions():
     node.secondary_post_place_fetch = True
 
     assert not node._secondary_pick_corridor_clear(0.390, 0.100, 0.500)
-    assert node._secondary_pick_corridor_clear(0.320, 0.100, 0.500)
+    assert node._secondary_pick_corridor_clear(0.295, 0.100, 0.500)
     assert node._secondary_pick_corridor_clear(0.390, 0.070, 0.500)
     assert node._secondary_pick_corridor_clear(0.390, 0.100, 0.550)
     assert node._secondary_pick_guard_stop_required(0.390, 7, 0.100, 0.500)
@@ -583,6 +795,231 @@ def test_departure_immediately_advertises_the_placement_window():
     assert node.secondary_placement_ready_publisher.publish.call_args.args[0].data is False
 
 
+def test_repeated_departure_preserves_new_102_material_and_consumed_grant():
+    node = empty_event_node()
+    node._mark_turntable_material_removed()
+    assert node._secondary_zone_lease_callback(
+        SimpleNamespace(data=True), SimpleNamespace(success=False, message=""),
+    ).success
+    node.secondary_zone_held_by_102 = False
+    node.turntable_place_done_count = 4
+    node.turntable_material_ready = True
+    node.turntable_waiting_for_place = False
+    node.turntable_ready_barcode = "new_box"
+    node._mark_turntable_material_removed()
+    assert node.turntable_material_ready
+    assert not node.turntable_waiting_for_place
+    assert node.turntable_ready_barcode == "new_box"
+    assert node.secondary_departure_grant_consumed
+    assert not node.secondary_zone_open_for_102
+
+
+def lift_handoff_node():
+    node = empty_event_node()
+    node.controller.robot_mode = 7
+    node.secondary_pick_guard_active = True
+    node.secondary_pick_motion_active = True
+    original_parameter = node.get_parameter
+    params = {
+        "grasp_lift_m": 0.060,
+        "scan_exit_user_xyz": [0.531, 0.328, 0.320],
+        "side_barcode_place_xyz": [0.531, 0.328, 0.180],
+        "side_barcode_place_rx_delta_deg": -20.0,
+        "user_index": 0,
+        "command_tool_index": 1,
+        "jog_tolerance_m": 0.002,
+        "jog_axis_timeout_s": 0.5,
+        "barcode_flip_watch_joint_index": 5,
+        "d435_side_face_reference_joint_deg": 0.0,
+        "barcode_flip_step_deg": -90.0,
+        "barcode_flip_safe_joint_limit_deg": 355.0,
+        "barcode_flip_jog_tolerance_deg": 1.0,
+        "fast_side_departure_place_queue_lead_m": 0.100,
+        "fast_side_departure_place_blend_cp": 60,
+        "fast_side_camera_clearance_z_m": 0.260,
+        "fast_side_rise_after_camera_clearance_m": 0.005,
+        "fast_side_departure_place_command_start_grace_s": 0.05,
+        "dh_max_opening_m": 0.095,
+        "turntable_surface_z_m": 0.164,
+        "turntable_surface_clearance_m": 0.003,
+        "turntable_tcp_below_target_m": 0.0,
+    }
+    node.get_parameter = lambda name: SimpleNamespace(value=params[name]) if name in params else original_parameter(name)
+    node._require_cycle_active = MagicMock()
+    node._is_barcode_flip_joint_safe = lambda *_args: True
+    node._timed_stage = lambda _name: nullcontext()
+    node._validate_grasp_feedback = MagicMock()
+    node._stop_active_motion_for_queue_failure = MagicMock()
+    node._motion_profile = lambda: {
+        "grasp_lift_speed": 20, "grasp_lift_acc": 20,
+        "barcode_alignment_speed": 20, "barcode_alignment_acc": 20,
+    }
+    controller = node.controller
+    controller.pose = TcpPose(0.523, -0.163, 0.181, 0.0, 0.0, 20.0)
+    controller.gate_pose = TcpPose(0.523, -0.163, 0.261, 0.0, 0.0, 0.0)
+    controller.active = True
+    controller.current_joint = lambda: [0.0] * 5 + [controller.pose.rz]
+    controller.forward_kinematics = lambda joints, **_kw: TcpPose(
+        controller.pose.x, controller.pose.y, controller.pose.z,
+        0.0, 0.0, joints[5],
+    )
+    controller.inverse_kinematics = lambda pose, **_kw: [0.0] * 5 + [pose.rz]
+
+    def submit_lift(_pose, **_kw):
+        assert node.secondary_pick_guard_active
+        assert not node.secondary_zone_open_for_102
+        controller.pose = controller.gate_pose
+        return object()
+
+    controller.submit_move_linear_tcp = MagicMock(side_effect=submit_lift)
+    controller.motion_command_is_active = lambda _command: controller.active
+    controller.wait_for_command = MagicMock()
+    node._current_command_pose = lambda: controller.pose
+    return node
+
+
+def test_fast_side_hands_off_at_measured_vertical_gate_before_transfer_or_grip_recheck():
+    node = lift_handoff_node()
+
+    def transfer(*_args, queue_gate_callback, **_kw):
+        assert node.controller.pose.z == pytest.approx(0.261)
+        assert not node.secondary_pick_guard_active
+        assert not node.secondary_pick_motion_active
+        assert node.turntable_waiting_for_place
+        assert node.secondary_placement_ready_publisher.publish.call_args.args[0].data
+        node._validate_grasp_feedback.assert_not_called()
+        # Reproduce the reported 325.2 mm entry while 101 starts transfer.
+        assert not node._secondary_pick_guard_stop_required(0.3252, 7, 0.243, 0.501)
+        assert node._secondary_zone_lease_callback(
+            SimpleNamespace(data=True), SimpleNamespace(success=False, message=""),
+        ).success
+        queue_gate_callback()  # the later grasp check is still performed
+        return True
+
+    node._execute_post_scan_safe_place_blend = MagicMock(side_effect=transfer)
+    assert node._execute_turntable_lift_face_snap(node._motion_profile(), continuous_place=True)
+    node._validate_grasp_feedback.assert_called_once()
+    assert node._fast_turntable_removed_precompleted
+    assert node._fast_side_place_precompleted
+
+
+@pytest.mark.parametrize("failure", ["short_lift", "xy_drift", "nonfinite", "command_error"])
+def test_failed_fast_vertical_clearance_keeps_102_guard_and_lease_closed(failure):
+    node = lift_handoff_node()
+    if failure == "short_lift":
+        node.controller.gate_pose = TcpPose(0.523, -0.163, 0.250, 0.0, 0.0, 0.0)
+        node.controller.active = False
+    elif failure == "xy_drift":
+        node.controller.gate_pose = TcpPose(0.543, -0.163, 0.261, 0.0, 0.0, 0.0)
+    elif failure == "nonfinite":
+        node.controller.gate_pose = TcpPose(float("nan"), -0.163, 0.261, 0.0, 0.0, 0.0)
+    else:
+        node.controller.submit_move_linear_tcp.side_effect = RuntimeError("lift failed")
+    node._execute_post_scan_safe_place_blend = MagicMock()
+    with pytest.raises(RuntimeError):
+        node._execute_turntable_lift_face_snap(node._motion_profile(), continuous_place=True)
+    assert node.secondary_pick_guard_active
+    assert node.turntable_material_ready
+    assert not node.secondary_zone_open_for_102
+    assert not node._secondary_zone_lease_callback(
+        SimpleNamespace(data=True), SimpleNamespace(success=False, message=""),
+    ).success
+    node._execute_post_scan_safe_place_blend.assert_not_called()
+
+
+@pytest.mark.parametrize("box_height", [0.038, 0.120])
+def test_top_and_final_bottom_regrasp_handoff_after_lift_before_xy_transfer(box_height):
+    node = lift_handoff_node()
+    start = node.controller.pose
+    node._top_surface_barcode_place_xyz = lambda: [0.531, 0.328, 0.105]
+    node._cycle_cancel_requested = lambda: False
+    node.gripper = SimpleNamespace(
+        read_position=lambda: 0.4,
+        set_position=MagicMock(), wait_until_stopped=MagicMock(),
+    )
+    moves = []
+
+    def move(xyz, **_kw):
+        if not moves:
+            assert node.secondary_pick_guard_active
+            assert xyz[:2] == pytest.approx([start.x, start.y])
+        else:
+            assert not node.secondary_pick_guard_active
+            assert node.secondary_zone_open_for_102
+            node._validate_grasp_feedback.assert_not_called()
+        moves.append(xyz)
+        node.controller.pose = TcpPose(*xyz, start.rx, start.ry, start.rz)
+
+    node._move_to_user_xyz_with_rotation = move
+    node._place_as_top_barcode_box(turntable_box_height_m=box_height)
+    expected_z = max(start.z + 0.060, 0.260, 0.164 + box_height + 0.003)
+    assert moves[0][2] == pytest.approx(expected_z)
+    assert moves[1] == pytest.approx([0.531, 0.328, expected_z + 0.005])
+    assert moves[2] == pytest.approx([0.531, 0.328, 0.105])
+    node._validate_grasp_feedback.assert_called_once()
+    node.gripper.set_position.assert_called_once()
+
+
+def test_top_vertical_lift_failure_preserves_guard_and_material():
+    node = lift_handoff_node()
+    node._top_surface_barcode_place_xyz = lambda: [0.531, 0.328, 0.105]
+    node._move_to_user_xyz_with_rotation = MagicMock(side_effect=RuntimeError("lift failed"))
+    with pytest.raises(RuntimeError, match="lift failed"):
+        node._place_as_top_barcode_box(turntable_box_height_m=0.038)
+    assert node.secondary_pick_guard_active
+    assert node.turntable_material_ready
+    assert not node.secondary_zone_open_for_102
+
+
+@pytest.mark.parametrize("mode", ["straight", "combined"])
+def test_noncontinuous_departure_also_hands_off_at_verified_lift(mode):
+    node = lift_handoff_node()
+
+    def move(pose, **_kw):
+        assert node.secondary_pick_guard_active
+        node.controller.pose = pose
+
+    node.controller.move_linear_tcp = MagicMock(side_effect=move)
+    if mode == "straight":
+        node._execute_turntable_safe_departure_lift(node._motion_profile())
+    else:
+        assert node._execute_turntable_lift_face_snap(node._motion_profile())
+    assert node.controller.pose.z == pytest.approx(0.320)
+    assert not node.secondary_pick_guard_active
+    assert node.secondary_zone_open_for_102
+
+
+def test_intermediate_bottom_flip_lift_keeps_guard_for_return_to_table():
+    node = lift_handoff_node()
+    start = node.controller.pose
+    node.controller.move_linear_tcp = lambda pose, **_kw: setattr(node.controller, "pose", pose)
+    node._bottom_center_linear_z(
+        start.z + 0.030, node._motion_profile(), "temporary flip lift", lifting=True,
+    )
+    assert node.controller.pose.z == pytest.approx(start.z + 0.030)
+    assert node.secondary_pick_guard_active
+    assert node.secondary_pick_motion_active
+    assert node.turntable_material_ready
+    assert not node.secondary_zone_open_for_102
+
+
+def test_fast_transfer_still_stops_on_later_grasp_check_failure():
+    node = lift_handoff_node()
+    node._validate_grasp_feedback.side_effect = RuntimeError("object lost")
+
+    def transfer(*_args, queue_gate_callback, **_kw):
+        assert not node.secondary_pick_guard_active
+        queue_gate_callback()
+        pytest.fail("must not continue placement after object loss")
+
+    node._execute_post_scan_safe_place_blend = transfer
+    with pytest.raises(RuntimeError, match="object lost"):
+        node._execute_turntable_lift_face_snap(node._motion_profile(), continuous_place=True)
+    node._stop_active_motion_for_queue_failure.assert_called_once_with(
+        "continuous camera-clearance grasp feedback failure",
+    )
+
+
 @pytest.mark.parametrize("condition", ["grasping", "occupied", "disabled", "stopped", "consumed"])
 def test_placement_window_advertisement_remains_closed_until_safe(condition):
     node = stopped_node()
@@ -671,12 +1108,12 @@ def test_101_pick_waits_for_102_lease_release_and_collision_volume_clear():
     assert not node.secondary_material_removed_for_handoff
     node.secondary_zone_held_by_102 = False
     assert not finished.wait(0.05)
-    measurement["right_y_m"] = 0.320
+    measurement["right_y_m"] = 0.295
     thread.join(timeout=1.0)
     assert finished.is_set()
     assert node.secondary_pick_guard_active
     published = node.secondary_pick_guard_publisher.publish.call_args.args[0]
-    assert published.data == pytest.approx(0.325)
+    assert published.data == pytest.approx(0.300)
 
 
 def test_pick_guard_release_restores_400mm_without_resetting_vla():
@@ -737,6 +1174,64 @@ def test_safe_x_fetch_crossing_is_not_a_new_placement():
         {"right_x_m": 0.500, "right_y_m": 0.390, "right_z_m": 0.200}
     )
     node._accept_turntable_place_done.assert_called_once()
+
+
+def test_empty_round_reset_can_rearm_from_safe_x_fetch_feedback():
+    node = empty_event_node()
+    node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(0.400, 0.0)
+    node.secondary_post_place_fetch = True
+    get_parameter = node.get_parameter
+    node.get_parameter = lambda name: (
+        SimpleNamespace(value=True)
+        if name == "turntable_auto_place_from_secondary_tcp"
+        else get_parameter(name)
+    )
+    assert node._release_confirmed_empty_turntable_event(3)
+    assert not node.turntable_secondary_retreat_trigger.entry_armed
+    node._accept_turntable_place_done = MagicMock()
+
+    # The low-Y sample after a round reset is on the safe fetch X side.
+    # It must rearm entry detection without inventing a placement event.
+    node._update_turntable_place_from_secondary_tcp(
+        {"right_x_m": 0.680, "right_y_m": 0.200, "right_z_m": 0.100}
+    )
+    node._accept_turntable_place_done.assert_not_called()
+
+    # A fetch crossing of Y=400 mm is still filtered. The actual place
+    # enters at unsafe X while Y is already above 400 mm.
+    node._update_turntable_place_from_secondary_tcp(
+        {"right_x_m": 0.600, "right_y_m": 0.420, "right_z_m": 0.200}
+    )
+    assert not node.turntable_secondary_retreat_trigger.place_seen
+    node._update_turntable_place_from_secondary_tcp(
+        {"right_x_m": 0.500, "right_y_m": 0.420, "right_z_m": 0.200}
+    )
+    node._accept_turntable_place_done.assert_not_called()
+    node._update_turntable_place_from_secondary_tcp(
+        {"right_x_m": 0.550, "right_y_m": 0.390, "right_z_m": 0.200}
+    )
+    node._accept_turntable_place_done.assert_called_once()
+    assert node.secondary_post_place_fetch
+
+
+def test_reset_still_requires_low_y_before_a_new_placement():
+    node = stopped_node()
+    node.turntable_lock = threading.Lock()
+    node.turntable_secondary_retreat_trigger = PlacementRetreatTrigger(0.400, 0.0)
+    node.turntable_secondary_retreat_trigger.reset(require_fresh_entry=True)
+    node._accept_turntable_place_done = MagicMock()
+    node.secondary_post_place_fetch = True
+    values = {"turntable_auto_place_from_secondary_tcp": True,
+              "secondary_collision_x_lt_m": 0.535}
+    node.get_parameter = lambda name: SimpleNamespace(value=values[name])
+
+    # Starting inside the previous placement must not consume a new round.
+    for x_m, y_m in [(0.500, 0.420), (0.550, 0.390), (0.550, 0.380)]:
+        node._update_turntable_place_from_secondary_tcp(
+            {"right_x_m": x_m, "right_y_m": y_m, "right_z_m": 0.200}
+        )
+    node._accept_turntable_place_done.assert_not_called()
+    assert not node.turntable_secondary_retreat_trigger.place_seen
 
 
 def test_reset_requires_stopped_worker_and_retired_102():

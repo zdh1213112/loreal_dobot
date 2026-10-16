@@ -364,6 +364,16 @@ class PregraspObservation:
     tcp_linear_speed_mps: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class EmptyTurntableRecovery:
+    event_number: int
+    pose_count: int
+    pregrasp_count: int
+    handoff_count: int
+    began_monotonic: float
+    began_epoch: float
+
+
 class CosmeticBoxSingleArmNode(Node):
     def __init__(self) -> None:
         super().__init__("nova5_cosmetic_box_single_arm_cycle_v5")
@@ -387,7 +397,7 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("secondary_zone_safe_y_m", 0.400)
         # 102 User-0/Tool-1 TCP is in the measured collision region only when
         # all three strict inequalities hold during a 101 grasp/flip.
-        self.declare_parameter("secondary_pick_guard_y_m", 0.325)
+        self.declare_parameter("secondary_pick_guard_y_m", 0.300)
         self.declare_parameter("secondary_collision_x_lt_m", 0.535)
         self.declare_parameter("secondary_collision_z_gt_m", 0.075)
         self.declare_parameter("secondary_robot_ip", "192.168.111.102")
@@ -1064,8 +1074,11 @@ class CosmeticBoxSingleArmNode(Node):
         self.turntable_place_done_count = 0
         self.turntable_place_done_consumed = 0
         self.turntable_place_done_duplicate_warned = False
+        self.turntable_place_event_pending = False
         self.turntable_rescan_pending = False
         self.turntable_active_pick_event_number: Optional[int] = None
+        self.empty_turntable_recovery: Optional[EmptyTurntableRecovery] = None
+        self.empty_turntable_recovery_claimed = False
         # V3 pre-scans material as soon as 102 finishes placing it.  The left
         # arm later consumes this ready state; it no longer owns turntable
         # scanning or waits for a fresh place event after Execute is clicked.
@@ -2489,18 +2502,25 @@ class CosmeticBoxSingleArmNode(Node):
             if (
                 self.secondary_post_place_fetch
                 and not was_place_seen
+                and right_y_m >= self.turntable_secondary_retreat_trigger.place_y_m
                 and self._secondary_fetch_x_clear(
                     float(measurement.get("right_x_m", float("-inf"))),
                 )
             ):
-                # A measured safe-X fetch transit is not a deposit.
-                # Once a dangerous-X placement entry is latched, still observe
-                # the following retreat at any height.
+                # A measured safe-X fetch entry is not a deposit. Low-Y
+                # feedback must still rearm the trigger after an empty-round
+                # or operator reset; otherwise the next real placement can
+                # be missed when X becomes unsafe after Y crossed 400 mm.
+                # Once a placement entry is latched, observe every retreat.
                 return
             fired = self.turntable_secondary_retreat_trigger.update(
                 right_y_m,
                 now_s,
             )
+            if fired:
+                # Keep the normal deposit authoritative until its event is
+                # accepted, including the gap after the trigger resets itself.
+                self.turntable_place_event_pending = True
             place_seen_now = (
                 not was_place_seen
                 and self.turntable_secondary_retreat_trigger.place_seen
@@ -2515,11 +2535,15 @@ class CosmeticBoxSingleArmNode(Node):
                 "waiting for a stable Y retreat after the X fetch filter"
             )
         if fired:
-            self._accept_turntable_place_done(
-                "automatic 102 TCP place/retreat trigger "
-                f"(Y={right_y_m * 1000.0:.1f}mm; X fetch filtered)"
-            )
-            self._set_secondary_post_place_fetch(True)
+            try:
+                self._accept_turntable_place_done(
+                    "automatic 102 TCP place/retreat trigger "
+                    f"(Y={right_y_m * 1000.0:.1f}mm; X fetch filtered)"
+                )
+                self._set_secondary_post_place_fetch(True)
+            finally:
+                with self.turntable_lock:
+                    self.turntable_place_event_pending = False
 
     def _wait_for_secondary_y_clearance(
         self,
@@ -3385,7 +3409,8 @@ class CosmeticBoxSingleArmNode(Node):
                 self.top_surface_barcode_uncertain = True
             self.get_logger().warning(
                 "D405 found a barcode candidate but could not prove it lies on "
-                "the box top plane; automatic bottom-face flip is blocked"
+                "the box top plane; top barcode remains unconfirmed and the "
+                "normal side/top/bottom search continues"
             )
             return
         if not encoded.startswith("success:"):
@@ -3482,6 +3507,8 @@ class CosmeticBoxSingleArmNode(Node):
                         f"state={self.turntable_state}"
                     )
             self.turntable_place_done_count += 1
+            self.empty_turntable_recovery = None
+            self.empty_turntable_recovery_claimed = False
             self.empty_turntable_confirmation = None
             self.empty_turntable_target_invalidated = False
             event_number = self.turntable_place_done_count
@@ -3675,6 +3702,7 @@ class CosmeticBoxSingleArmNode(Node):
         deadline = time.monotonic() + timeout_s if timeout_s > 0.0 else None
         announced = False
         while self.running and self.cycle_enabled:
+            self._recover_material_after_empty_turntable()
             with self.turntable_condition:
                 if self.turntable_material_ready:
                     barcode = self.turntable_ready_barcode
@@ -3713,6 +3741,148 @@ class CosmeticBoxSingleArmNode(Node):
                 self.turntable_condition.wait(timeout=wait_s)
         raise RuntimeError("cycle cancelled while waiting for D435-ready material")
 
+    def _recover_material_after_empty_turntable(self) -> None:
+        """Resume a box rediscovered after no-box results ended its old round."""
+
+        recovery = getattr(self, "empty_turntable_recovery", None)
+        if recovery is None or not self.running or not self.cycle_enabled:
+            return
+        with self.turntable_condition:
+            if (
+                self.turntable_place_done_count != recovery.event_number
+                or not self.turntable_waiting_for_place
+                or self.turntable_material_ready
+                or self.turntable_scan_in_progress
+                or self.turntable_state != "STOPPED"
+                or self.turntable_secondary_retreat_trigger.place_seen
+                or getattr(self, "turntable_place_event_pending", False)
+            ):
+                return
+        # Recovery may withdraw an advertised placement window only while
+        # 101 is still physically at startup. No arm motion is issued here.
+        try:
+            startup = self._six_values("startup_joint")
+            current = self.controller.current_joint()
+            tolerance = max(
+                0.5, float(self.get_parameter("startup_joint_skip_tolerance_deg").value)
+            )
+            if self.controller.robot_mode != 5 or len(current) != len(startup) or not all(
+                math.isfinite(float(actual))
+                and abs(float(actual) - float(expected)) <= tolerance
+                for actual, expected in zip(current, startup)
+            ):
+                return
+        except Exception:
+            return
+
+        if bool(self.get_parameter("secondary_vla_interlock_required").value):
+            try:
+                measurement = self._read_secondary_y_clearance(allow_reconnect=False)
+                right_y = float(measurement["right_y_m"])
+                gap_y = float(measurement["gap_y_m"])
+                _, _, recover_m = self._secondary_interlock_distances()
+                if not (
+                    math.isfinite(right_y)
+                    and math.isfinite(gap_y)
+                    and right_y < float(self.get_parameter("secondary_zone_safe_y_m").value)
+                    and gap_y >= recover_m
+                    and self._secondary_pick_corridor_clear(
+                        right_y, float(measurement["right_z_m"]),
+                        float(measurement["right_x_m"]),
+                    )
+                ):
+                    return
+            except Exception:
+                return
+
+        if not self.empty_turntable_recovery_claimed:
+            max_age = max(0.05, float(self.get_parameter("pregrasp_pose_max_age_s").value))
+            now = time.monotonic()
+            now_epoch = time.time()
+            with self.data_lock:
+                if (
+                    self.pose_count <= recovery.pose_count
+                    or self.handoff_state_count <= recovery.handoff_count
+                    or not self.latest_handoff_clear
+                ):
+                    return
+                observations = [
+                    observation for observation in self.pregrasp_observations
+                    if observation.count > recovery.pregrasp_count
+                    and observation.received_at_monotonic >= recovery.began_monotonic
+                    and 0.0 <= now - observation.received_at_monotonic <= max_age
+                    and observation.frame_time_s > recovery.began_epoch
+                    and -0.05 <= now_epoch - observation.frame_time_s <= max_age
+                ]
+            required = max(2, int(self.get_parameter("d405_post_stop_samples").value))
+            observations.sort(key=lambda sample: sample.frame_time_s)
+            samples = observations[-required:]
+            if len({sample.frame_time_s for sample in samples}) < required:
+                return
+            if not all(
+                math.isfinite(value)
+                for sample in samples
+                for value in (
+                    sample.pose.x, sample.pose.y, sample.pose.z,
+                    sample.pose.rx, sample.pose.ry, sample.pose.rz,
+                )
+            ):
+                return
+            for sample in samples[1:]:
+                position_delta, angle_delta = self._pose_delta(samples[0].pose, sample.pose)
+                if (
+                    position_delta > float(self.get_parameter("vision_position_stability_m").value)
+                    or angle_delta > float(self.get_parameter("vision_angle_stability_deg").value)
+                ):
+                    return
+            # A normal placement can begin while camera/feedback evidence is
+            # checked. Let that entry finish through its normal retreat event;
+            # it must never be interrupted by the rediscovery fallback.
+            with self.turntable_condition:
+                if (
+                    self.empty_turntable_recovery is not recovery
+                    or self.turntable_place_done_count != recovery.event_number
+                    or not self.turntable_waiting_for_place
+                    or self.turntable_material_ready
+                    or self.turntable_scan_in_progress
+                    or self.turntable_state != "STOPPED"
+                    or self.turntable_secondary_retreat_trigger.place_seen
+                    or getattr(self, "turntable_place_event_pending", False)
+                ):
+                    return
+                # Close the offer before publishing the guard. An existing
+                # unused prefetch still has to be returned by the 102 client.
+                with self.secondary_safety_lock:
+                    if self.secondary_protective_stop_latched.is_set():
+                        return
+                    self.secondary_zone_open_for_102 = False
+                self.empty_turntable_recovery_claimed = True
+            self._set_secondary_pick_guard(True)
+            self._publish_status(
+                "D405 rediscovered stable material after empty-turntable checks; "
+                "withdrawing the new-placement window and waiting for 102 retreat/lease return "
+                "before restarting side/top/bottom barcode processing"
+            )
+
+        if not self._secondary_vla_heartbeat_fresh():
+            return
+        with self.secondary_safety_lock:
+            if (
+                self.secondary_zone_held_by_102
+                or self.secondary_protective_stop_latched.is_set()
+                or self.secondary_guard_ack_sequence != self.secondary_guard_sequence
+            ):
+                return
+        if not self._secondary_clear_of_placement_for_empty_check():
+            return
+        # A fresh scan rechecks barcode evidence, then the normal cycle
+        # requires a fresh stopped target again before any approach/descent.
+        # If the target vanished while 102 yielded, normal no-box retries run.
+        self._accept_turntable_place_done(
+            "D405 material rediscovered after empty-turntable checks",
+            expected_current_event_number=recovery.event_number,
+        )
+
     def _require_current_material_event(self, event_number: int, stage: str) -> None:
         if not bool(self.get_parameter("turntable_enabled").value):
             return
@@ -3733,9 +3903,9 @@ class CosmeticBoxSingleArmNode(Node):
                 self.turntable_condition.notify_all()
 
     def _secondary_clear_of_placement_for_empty_check(self) -> bool:
-        """102 may wait between 325 and 400 mm while 101 is idle at startup.
+        """102 may wait between 300 and 400 mm while 101 is idle at startup.
 
-        The 325 mm XYZ guard protects an actual 101 pick.  It is not an
+        The 300 mm XYZ guard protects an actual 101 pick.  It is not an
         appropriate prerequisite for confirming an empty turntable before
         that pick has begun: the VLA can wait at 344 mm for a placement lease.
         """
@@ -3757,7 +3927,7 @@ class CosmeticBoxSingleArmNode(Node):
             return False
 
     def _confirm_empty_turntable(self, event_number: int) -> bool:
-        """Require sustained no-box evidence with no positive post-stop target."""
+        """Require new no-box evidence; historical targets must not pin a round."""
 
         self.empty_turntable_confirmation = None
         self.empty_turntable_target_invalidated = False
@@ -3779,10 +3949,14 @@ class CosmeticBoxSingleArmNode(Node):
             baseline_pregrasp_count = self.pregrasp_pose_count
             stop_s = float(self.last_turntable_stop_monotonic)
             stop_epoch = float(self.last_turntable_stop_epoch)
+            fresh_after = time.monotonic() - max(
+                0.05, float(self.get_parameter("pregrasp_pose_max_age_s").value)
+            )
             if any(
                 observation.count > self.last_turntable_stop_pregrasp_count
                 and observation.received_at_monotonic >= stop_s
                 and observation.frame_time_s > stop_epoch
+                and observation.received_at_monotonic >= fresh_after
                 for observation in self.pregrasp_observations
             ):
                 self._publish_status(
@@ -3918,6 +4092,15 @@ class CosmeticBoxSingleArmNode(Node):
                     self.empty_turntable_confirmation = None
                     return False
                 self.empty_turntable_confirmation = None
+                self.empty_turntable_recovery = EmptyTurntableRecovery(
+                    event_number=event_number,
+                    pose_count=self.pose_count,
+                    pregrasp_count=self.pregrasp_pose_count,
+                    handoff_count=self.handoff_state_count,
+                    began_monotonic=time.monotonic(),
+                    began_epoch=time.time(),
+                )
+                self.empty_turntable_recovery_claimed = False
             self.turntable_active_pick_event_number = None
             self.turntable_material_ready = False
             self.turntable_ready_barcode = ""
@@ -3943,7 +4126,18 @@ class CosmeticBoxSingleArmNode(Node):
     def _mark_turntable_material_removed(self) -> None:
         """Release the picked material without erasing a newer 102 placement."""
 
-        # The box and 101 TCP have completed the turntable-clear departure.
+        with self.turntable_condition:
+            if (
+                self.secondary_material_removed_for_handoff
+                and self.turntable_active_pick_event_number is None
+            ):
+                # The verified lift already handed off this box. Later
+                # transfer/placement checks may repeat this notification after
+                # 102 has placed its next box; never consume that newer event
+                # or reopen an already consumed placement grant.
+                return
+
+        # The box and 101 TCP have completed the vertical clearance lift.
         # Restore the normal 400 mm VLA execution boundary immediately; the
         # existing lease still decides when 102 may actually place.
         self._set_secondary_pick_guard(False)
@@ -4029,6 +4223,8 @@ class CosmeticBoxSingleArmNode(Node):
             self.turntable_rescan_pending = False
             self.turntable_active_pick_event_number = None
             self.turntable_scan_thread = None
+            self.empty_turntable_recovery = None
+            self.empty_turntable_recovery_claimed = False
             self.turntable_secondary_retreat_trigger.reset(
                 require_fresh_entry=True
             )
@@ -4470,10 +4666,10 @@ class CosmeticBoxSingleArmNode(Node):
                 top_window_armed and not barcode and not top_barcode
                 and self._top_surface_barcode_is_uncertain()
             ):
-                raise RuntimeError(
+                self._publish_status(
                     "D405 saw a barcode candidate but live 3-D points did not "
-                    "verify the top plane; turntable is stopped and 101 will "
-                    "not automatically classify it as a bottom barcode"
+                    "verify the top plane; continuing normal top-face observation "
+                    "during approach, then bottom-face recovery if no top barcode is confirmed"
                 )
             with self.turntable_lock:
                 self.turntable_early_top_barcode = (
@@ -7471,9 +7667,9 @@ class CosmeticBoxSingleArmNode(Node):
             observe_top_barcode and barcode_face == "bottom"
             and self._top_surface_barcode_is_uncertain()
         ):
-            raise RuntimeError(
+            self._publish_status(
                 "D405 barcode candidate has no live 3-D top-plane proof; "
-                "refusing automatic bottom-face flip at grasp depth"
+                "top barcode remains unconfirmed; continuing the normal bottom-face recovery"
             )
         if observe_top_barcode and not top_surface_barcode and bool(
             self.get_parameter("top_surface_barcode_enabled").value
@@ -8041,6 +8237,7 @@ class CosmeticBoxSingleArmNode(Node):
                     [current.x, current.y, clearance_z_m],
                     ry_delta_deg=0.0, rz_delta_deg=0.0, linear_tcp=True,
                 )
+            self._mark_turntable_material_removed()
             self._publish_status(
                 "top-barcode rising transfer: Cartesian MovL toward placement "
                 f"while TCP Z rises to {transfer_z_m*1000:.1f}mm"
@@ -8050,7 +8247,6 @@ class CosmeticBoxSingleArmNode(Node):
                     [place_xyz[0], place_xyz[1], transfer_z_m],
                     ry_delta_deg=0.0, rz_delta_deg=0.0, linear_tcp=True,
                 )
-            self._mark_turntable_material_removed()
             with self._timed_stage("top_barcode_fixed_place_descent"):
                 self._move_to_user_xyz_with_rotation(
                     place_xyz,
@@ -9851,7 +10047,11 @@ class CosmeticBoxSingleArmNode(Node):
             float(self.get_parameter("jog_tolerance_m").value),
         )
         xy_error_m = math.hypot(final.x - current.x, final.y - current.y)
-        if final.z < target_z - tolerance_m or xy_error_m > tolerance_m * 1.5:
+        if (
+            not all(math.isfinite(value) for value in (final.z, xy_error_m))
+            or final.z < target_z - tolerance_m
+            or xy_error_m > tolerance_m * 1.5
+        ):
             raise RuntimeError(
                 "Turntable-safe vertical departure did not reach its verified "
                 "clearance corridor: "
@@ -9864,6 +10064,7 @@ class CosmeticBoxSingleArmNode(Node):
             f"TCP Z={final.z * 1000.0:.1f}mm, "
             f"XY drift={xy_error_m * 1000.0:.1f}mm"
         )
+        self._mark_turntable_material_removed()
 
     def _execute_turntable_lift_face_snap(
         self,
@@ -10137,7 +10338,8 @@ class CosmeticBoxSingleArmNode(Node):
                 gate_pose.y - start_pose.y,
             )
             if (
-                gate_pose.z < camera_clearance_z - tolerance_m
+                not all(math.isfinite(value) for value in (gate_pose.z, xy_drift))
+                or gate_pose.z < camera_clearance_z - tolerance_m
                 or xy_drift > tolerance_m * 1.5
             ):
                 self._stop_active_motion_for_queue_failure(
@@ -10149,6 +10351,12 @@ class CosmeticBoxSingleArmNode(Node):
                     f"required>={(camera_clearance_z - tolerance_m) * 1000.0:.1f}mm, "
                     f"XY_drift={xy_drift * 1000.0:.1f}mm"
                 )
+
+            # The low-pose grasp was confirmed before lift. The measured
+            # clearance gate ends the pick/flip phase, so give 102 its next
+            # placement window BEFORE starting the horizontal transfer.
+            self._mark_turntable_material_removed()
+            self._fast_turntable_removed_precompleted = True
 
             # Submit the transfer immediately at Z=260 mm.  Any blocking
             # gripper read here would consume the remaining 5 mm command and
@@ -10164,8 +10372,6 @@ class CosmeticBoxSingleArmNode(Node):
                         "continuous camera-clearance grasp feedback failure"
                     )
                     raise
-                self._mark_turntable_material_removed()
-                self._fast_turntable_removed_precompleted = True
 
             placed = self._execute_post_scan_safe_place_blend(
                 approach_xyz,
@@ -10223,13 +10429,18 @@ class CosmeticBoxSingleArmNode(Node):
         self._require_cycle_active("after combined turntable lift/J6 alignment")
         final_pose = self._current_command_pose()
         xy_drift = math.hypot(final_pose.x - start_pose.x, final_pose.y - start_pose.y)
-        if final_pose.z < safe_z - tolerance_m or xy_drift > tolerance_m * 1.5:
+        if (
+            not all(math.isfinite(value) for value in (final_pose.z, xy_drift))
+            or final_pose.z < safe_z - tolerance_m
+            or xy_drift > tolerance_m * 1.5
+        ):
             raise RuntimeError(
                 "Combined turntable lift/J6 alignment missed safe corridor: "
                 f"required_Z={safe_z * 1000.0:.1f}mm, "
                 f"actual_Z={final_pose.z * 1000.0:.1f}mm, "
                 f"XY_drift={xy_drift * 1000.0:.1f}mm"
             )
+        self._mark_turntable_material_removed()
         final_joints = self.controller.current_joint()
         if len(final_joints) != 6:
             raise RuntimeError("Current joint feedback must contain 6 values after face snap")

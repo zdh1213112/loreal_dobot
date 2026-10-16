@@ -281,7 +281,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "secondary_pick_guard_y_m",
-                default_value="0.325",
+                default_value="0.300",
                 description=(
                     "102 User-0 TCP danger region begins above this Y while "
                     "101 grasps or bottom-flips material"

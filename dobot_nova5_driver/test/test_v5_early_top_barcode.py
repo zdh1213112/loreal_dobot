@@ -13,7 +13,7 @@ from dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v5 import (
 )
 
 
-def test_unverified_top_candidate_blocks_bottom_flip_until_3d_success():
+def test_unverified_top_candidate_stays_unconfirmed_until_3d_success():
     node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
     node.top_surface_barcode_lock = threading.RLock()
     node.top_surface_barcode_window_active = True
@@ -66,10 +66,53 @@ def test_uncertain_early_top_candidate_respects_confirmed_side(side_confirmed):
     if side_confirmed:
         assert node._scan_turntable_for_side_barcode(require_cycle_active=False) == "barcode_detected"
     else:
-        with pytest.raises(RuntimeError, match="did not verify the top plane"):
-            node._scan_turntable_for_side_barcode(require_cycle_active=False)
+        assert node._scan_turntable_for_side_barcode(require_cycle_active=False) == ""
+        assert node.turntable_early_top_barcode == ""
+        assert any(
+            "continuing normal top-face observation" in call.args[0]
+            for call in node._publish_status.call_args_list
+        )
 
     assert node.turntable_state == "STOPPED"
+
+
+@pytest.mark.parametrize("scan_error", [None, "turntable stop failed"])
+def test_empty_barcode_scan_is_ready_but_hardware_failure_is_not(scan_error):
+    node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    values = {"turntable_enabled": True, "turntable_place_wait_timeout_s": 0.0}
+    node.get_parameter = lambda name: SimpleNamespace(value=values[name])
+    node.turntable_lock = threading.RLock()
+    node.turntable_condition = threading.Condition(node.turntable_lock)
+    node.turntable_scan_cancel = threading.Event()
+    node.turntable_state = "STOPPED"
+    node.turntable_place_done_count = 3
+    node.turntable_active_pick_event_number = None
+    node.turntable_scan_in_progress = True
+    node.turntable_rescan_pending = False
+    node.turntable_material_ready = False
+    node.turntable_scan_error = ""
+    node.turntable_early_top_barcode = ""
+    node.running = True
+    node.shutting_down = False
+    node.cycle_enabled = True
+    node._scan_turntable_for_side_barcode = MagicMock(
+        return_value="", side_effect=RuntimeError(scan_error) if scan_error else None
+    )
+    node._set_turntable_barcode_window = MagicMock()
+    node._stop_turntable_if_running = MagicMock()
+    node._publish_status = MagicMock()
+
+    node._turntable_prescan_worker(3)
+
+    assert not node.turntable_scan_in_progress
+    if scan_error:
+        assert not node.turntable_material_ready
+        with pytest.raises(RuntimeError, match=scan_error):
+            node._wait_for_scanned_turntable_material()
+    else:
+        assert node.turntable_material_ready
+        assert node.turntable_scan_error == ""
+        assert node._wait_for_scanned_turntable_material() == (3, "", "")
 
 
 @pytest.mark.parametrize("top_found_at", ["stopped", "rotating"])
@@ -207,7 +250,7 @@ def test_single_cycle_arms_early_top_at_startup_then_uses_post_stop_target():
     assert node._set_d405_pretracking.call_args_list[-1].args == (False,)
 
 
-def test_preconfirmed_top_goes_to_center_hover_and_top_placement_without_offset():
+def make_grasp_cycle_node():
     node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
     params = {
         "turntable_enabled": True,
@@ -261,6 +304,11 @@ def test_preconfirmed_top_goes_to_center_hover_and_top_placement_without_offset(
         close=lambda **_kwargs: None,
     )
     target = TcpPose(0.50, -0.18, 0.19, 180.0, 0.0, 0.0)
+    return node, params, target
+
+
+def test_preconfirmed_top_goes_to_center_hover_and_top_placement_without_offset():
+    node, _params, target = make_grasp_cycle_node()
 
     node._execute_one_cycle(
         target, 0.07, 0.05, 0.18,
@@ -271,6 +319,36 @@ def test_preconfirmed_top_goes_to_center_hover_and_top_placement_without_offset(
     node._execute_offset_entry.assert_not_called()
     node._move_turntable_center_hover.assert_called_once()
     node._current_top_surface_barcode.assert_not_called()
+    node._place_as_top_barcode_box.assert_called_once_with(
+        turntable_box_height_m=0.05
+    )
+
+
+@pytest.mark.parametrize("top_barcode", ["", "barcode_detected"])
+def test_unverified_candidate_continues_top_observation_then_normal_face_flow(top_barcode):
+    node, params, target = make_grasp_cycle_node()
+    params.update({
+        "offset_grasp_enabled": False,
+        "top_surface_barcode_enabled": True,
+        "bottom_barcode_recovery_enabled": True,
+        "bottom_near_cube_flip_enabled": False,
+    })
+    node._wait_for_top_surface_barcode = MagicMock(return_value=top_barcode)
+    node._current_top_surface_barcode = MagicMock(return_value=top_barcode)
+    node._top_surface_barcode_is_uncertain = lambda: True
+    node._normalize_bottom_start_j6_if_needed = lambda pose, *_args: pose
+    node._execute_turntable_bottom_center_recovery = MagicMock()
+
+    node._execute_one_cycle(target, 0.07, 0.05, 0.18, aspect_ratio=2.4)
+
+    node._wait_for_top_surface_barcode.assert_called_once_with()
+    node._current_top_surface_barcode.assert_called_once_with()
+    node._move_turntable_center_hover.assert_called_once()
+    if top_barcode:
+        node._execute_turntable_bottom_center_recovery.assert_not_called()
+        node._confirm_grasp_before_lift.assert_called_once()
+    else:
+        node._execute_turntable_bottom_center_recovery.assert_called_once()
     node._place_as_top_barcode_box.assert_called_once_with(
         turntable_box_height_m=0.05
     )

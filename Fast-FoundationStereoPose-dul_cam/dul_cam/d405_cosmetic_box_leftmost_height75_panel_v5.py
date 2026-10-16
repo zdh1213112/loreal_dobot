@@ -3469,7 +3469,7 @@ try:
                         top_surface_barcode_uncertain_reported = True
                         logging.warning(
                             "[top-barcode] persistent 2-D barcode without top-plane "
-                            "proof; requesting automatic bottom-flip interlock"
+                            "proof; keeping top barcode unconfirmed and continuing normal barcode search"
                         )
                     logging.info(
                         "[top-barcode] 2-D hit rejected by 3-D top plane: %s; "
