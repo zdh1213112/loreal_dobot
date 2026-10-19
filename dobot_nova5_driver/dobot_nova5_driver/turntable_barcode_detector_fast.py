@@ -157,6 +157,27 @@ def barcode_region_has_parallel_bar_structure(
     )
 
 
+def scanner_proposal_has_bars(image, polygon, rect) -> bool:
+    """Use the scanner quadrilateral to preserve skewed/diagonal true labels."""
+
+    if barcode_region_has_parallel_bar_structure(image, rect):
+        return True
+    points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+    if len(points) != 4 or not np.all(np.isfinite(points)):
+        return False
+    points = cv2.convexHull(points).reshape(-1, 2)
+    if len(points) != 4 or abs(cv2.contourArea(points)) < 20:
+        return False
+    width = int(round(max(np.linalg.norm(points[1]-points[0]), np.linalg.norm(points[2]-points[3]))))
+    height = int(round(max(np.linalg.norm(points[2]-points[1]), np.linalg.norm(points[3]-points[0]))))
+    if min(width, height) < 12:
+        return False
+    width, height = min(width, 2048), min(height, 2048)
+    target = np.asarray([[0, 0], [width-1, 0], [width-1, height-1], [0, height-1]], dtype=np.float32)
+    aligned = cv2.warpPerspective(image, cv2.getPerspectiveTransform(points, target), (width, height))
+    return barcode_region_has_parallel_bar_structure(aligned, (0, 0, width, height))
+
+
 class TurntableBarcodeDetector:
     """Detect whether the single-class barcode model sees a barcode region."""
 
@@ -192,6 +213,7 @@ class TurntableBarcodeDetector:
         moving_stripes_enabled: bool = True,
     ):
         self.model_path = str(model_path)
+        self.last_unverified_scanner_hit = None
         self.confidence = max(0.05, min(0.95, float(confidence)))
         # The exported ONNX graph and the training run both use 640x640.  A
         # larger inference size was slower and less accurate on blurred
@@ -470,6 +492,7 @@ class TurntableBarcodeDetector:
     ) -> TurntableBarcodeHit | None:
         """Locate a barcode-like quadrilateral without decoding its payload."""
 
+        self.last_unverified_scanner_hit = None
         if self.scanner_detector is None:
             return None
         if image is None or np.asarray(image).size == 0:
@@ -485,6 +508,7 @@ class TurntableBarcodeDetector:
             return None
         image_height, image_width = image.shape[:2]
         eligible = []
+        unverified = []
         for polygon in quadrilaterals:
             x, y, width, height = cv2.boundingRect(polygon)
             left = max(0, min(image_width - 1, int(x)))
@@ -492,8 +516,24 @@ class TurntableBarcodeDetector:
             right = max(left + 1, min(image_width, int(x + width)))
             bottom = max(top + 1, min(image_height, int(y + height)))
             rect = (left, top, right - left, bottom - top)
-            if self._rect_center_in_roi(rect, allowed_roi):
-                eligible.append((abs(cv2.contourArea(polygon)), rect))
+            if not self._rect_center_in_roi(rect, allowed_roi):
+                continue
+            proposal = (abs(cv2.contourArea(polygon)), rect)
+            if (
+                barcode_region_has_visual_detail(image, rect)
+                and scanner_proposal_has_bars(image, polygon, rect)
+            ):
+                eligible.append(proposal)
+            else:
+                unverified.append(proposal)
+        if unverified:
+            _, rect = max(unverified, key=lambda item: item[0])
+            # Preserve weak proposals for stopped-face reinspection. They
+            # cannot independently publish barcode success or presence.
+            self.last_unverified_scanner_hit = TurntableBarcodeHit(
+                value="barcode_detected", rect=rect, confidence=0.0,
+                source="scanner_unverified",
+            )
         if not eligible:
             return None
         _, rect = max(eligible, key=lambda item: item[0])
@@ -893,3 +933,20 @@ class TurntableBarcodeDetector:
         if yolo_hit is not None:
             return yolo_hit
         return self.detect_moving_stripes(image, allowed_roi)
+
+    def detect_candidates(self, image, allowed_roi=None):
+        """Evaluate both independent routes once per acquired frame.
+
+        The original detect() interface remains available to other callers.
+        An unverified scanner proposal is retained solely as a recheck hint.
+        """
+        scanner = self.detect_scanner_pattern(image, allowed_roi)
+        yolo = self.detect_yolo(image, allowed_roi)
+        hits = [hit for hit in (yolo, scanner) if hit is not None]
+        if self.last_unverified_scanner_hit is not None:
+            hits.append(self.last_unverified_scanner_hit)
+        if not hits:
+            stripes = self.detect_moving_stripes(image, allowed_roi)
+            if stripes is not None:
+                hits.append(stripes)
+        return hits

@@ -231,6 +231,21 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
+                "turntable_candidate_grace_s",
+                default_value="0.12",
+                description="Allow normal D435 confirmation before stopping for an unresolved candidate",
+            ),
+            DeclareLaunchArgument(
+                "turntable_candidate_recheck_s",
+                default_value="0.35",
+                description="Extra stopped-face D435 observation time for an unresolved candidate",
+            ),
+            DeclareLaunchArgument(
+                "turntable_candidate_max_rechecks",
+                default_value="2",
+                description="Maximum candidate pauses per scan; 0 disables candidate pauses",
+            ),
+            DeclareLaunchArgument(
                 "turntable_mid_scan_restart_s",
                 default_value="1.4",
                 description=(
@@ -1027,6 +1042,18 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "turntable_stop_pulse_ms": ParameterValue(
                             LaunchConfiguration("turntable_stop_pulse_ms"),
+                            value_type=int,
+                        ),
+                        "turntable_candidate_grace_s": ParameterValue(
+                            LaunchConfiguration("turntable_candidate_grace_s"),
+                            value_type=float,
+                        ),
+                        "turntable_candidate_recheck_s": ParameterValue(
+                            LaunchConfiguration("turntable_candidate_recheck_s"),
+                            value_type=float,
+                        ),
+                        "turntable_candidate_max_rechecks": ParameterValue(
+                            LaunchConfiguration("turntable_candidate_max_rechecks"),
                             value_type=int,
                         ),
                         "turntable_scan_timeout_s": ParameterValue(

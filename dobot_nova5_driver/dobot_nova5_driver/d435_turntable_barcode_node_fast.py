@@ -18,6 +18,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, String
 
+from .barcode_confirmation_fast import BarcodeEvidenceTracks
 from .turntable_barcode_detector_fast import (
     DEFAULT_BARCODE_MODEL,
     TurntableBarcodeDetector,
@@ -145,6 +146,7 @@ class D435TurntableBarcodeNode(Node):
             "continuous_trigger_topic", "/trigger_d435_continuous_detection"
         )
         self.declare_parameter("result_topic", "/turntable_barcode_result")
+        self.declare_parameter("candidate_topic", "/turntable_barcode_candidate")
         self.declare_parameter(
             "continuous_result_topic", "/d435_continuous_barcode_result"
         )
@@ -162,6 +164,9 @@ class D435TurntableBarcodeNode(Node):
         )
         self.result_publisher = self.create_publisher(
             String, str(self.get_parameter("result_topic").value), 10
+        )
+        self.candidate_publisher = self.create_publisher(
+            String, str(self.get_parameter("candidate_topic").value), 10
         )
         self.continuous_result_publisher = self.create_publisher(
             String,
@@ -205,6 +210,8 @@ class D435TurntableBarcodeNode(Node):
         self.scan_active = False
         self.continuous_scan_active = False
         self.scan_generation = 0
+        self.evidence_tracks = BarcodeEvidenceTracks()
+        self.detection_frame_id = 0
         self.candidate = ""
         self.candidate_source = ""
         self.candidate_rect: tuple[int, int, int, int] | None = None
@@ -434,6 +441,7 @@ class D435TurntableBarcodeNode(Node):
             self.candidate_first_rect = None
             self.candidate_hits = 0
             self.candidate_last_at = 0.0
+            self.evidence_tracks.clear()
             generation = self.scan_generation
         self._publish_status(
             f"D435 turntable barcode scanner {'armed' if message.data else 'disarmed'} "
@@ -450,6 +458,7 @@ class D435TurntableBarcodeNode(Node):
             self.candidate_first_rect = None
             self.candidate_hits = 0
             self.candidate_last_at = 0.0
+            self.evidence_tracks.clear()
             self.continuous_last_report_value = ""
             self.continuous_last_report_at = 0.0
             self.continuous_last_seen_at = 0.0
@@ -496,6 +505,7 @@ class D435TurntableBarcodeNode(Node):
             self.candidate_first_rect = None
             self.candidate_hits = 0
             self.candidate_last_at = 0.0
+            self.evidence_tracks.clear()
             self.continuous_last_seen_at = 0.0
             self.continuous_presence_latched = False
         self._publish_continuous_presence(False)
@@ -684,16 +694,19 @@ class D435TurntableBarcodeNode(Node):
             cv2.rectangle(display, draw_start, draw_end, (255, 180, 0), 2)
         if hit is not None:
             x, y, width, height = hit.rect
+            evidence_color = (0, 180, 255) if hit.source == "scanner_unverified" else (0, 255, 0)
             cv2.rectangle(
                 display,
                 (x, y),
                 (x + width, y + height),
-                (0, 255, 0),
+                evidence_color,
                 3,
             )
             label = (
                 "SCANNER"
                 if hit.source == "scanner_pattern"
+                else "SCANNER CANDIDATE"
+                if hit.source == "scanner_unverified"
                 else "MOVING STRIPES"
                 if hit.source == "moving_stripes"
                 else f"YOLO {hit.confidence:.2f}"
@@ -704,7 +717,7 @@ class D435TurntableBarcodeNode(Node):
                 (x, max(18, y - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                (0, 255, 0),
+                evidence_color,
                 2,
                 cv2.LINE_AA,
             )
@@ -862,31 +875,26 @@ class D435TurntableBarcodeNode(Node):
         max_dimension = max(aw, ah, bw, bh)
         return center_distance <= max(90.0, 1.75 * max_dimension)
 
-    def _accept_hit(self, hit, generation: int) -> bool:
+    def _accept_hit(self, hit, generation: int, frame_id: int) -> bool:
         now = time.monotonic()
         value = str(hit.value)
         source = str(hit.source)
-        # The same moving barcode may alternate between OpenCV pattern and
-        # full/tiled YOLO evidence on adjacent frames. Treat those as one
-        # spatial candidate; the active source still selects its own required
-        # hit count and is retained in the confirmation log.
-        candidate_source = (
-            "barcode_visual"
-            if source == "scanner_pattern" or source.startswith("yolo")
-            else source
-        )
         with self.state_lock:
+            # A frame captured before a scan reset must not contribute even
+            # when the separate continuous detector is still enabled.
+            if generation != self.scan_generation:
+                return False
             workflow_active = (
                 self.scan_active and generation == self.scan_generation
             )
             continuous_active = self.continuous_scan_active
             if not workflow_active and not continuous_active:
                 return False
-            if continuous_active:
+            if continuous_active and source != "scanner_unverified":
                 # Any candidate hit keeps the current visible-presence latch
                 # alive, even before the spatial stability count is complete.
                 self.continuous_last_seen_at = now
-            scanner_pattern = source == "scanner_pattern"
+            scanner_pattern = source in ("scanner_pattern", "scanner_unverified")
             moving_stripes = source == "moving_stripes"
             if scanner_pattern:
                 max_gap = max(
@@ -901,9 +909,7 @@ class D435TurntableBarcodeNode(Node):
                         self.get_parameter("scanner_assist_stable_hits").value
                     ),
                 )
-                spatially_consistent = self._rect_iou(
-                    self.candidate_rect, hit.rect
-                ) >= max(
+                min_iou = max(
                     0.0,
                     min(
                         1.0,
@@ -921,36 +927,22 @@ class D435TurntableBarcodeNode(Node):
                     if moving_stripes else
                     max(1, int(self.get_parameter("stable_hits").value))
                 )
-                spatially_consistent = self._rect_iou(
-                    self.candidate_rect, hit.rect
-                ) >= max(
+                min_iou = max(
                     0.0,
                     min(
                         1.0,
                         float(self.get_parameter("yolo_min_iou").value),
                         ),
                     )
-                if moving_stripes:
-                    spatially_consistent = self._moving_stripe_spatially_consistent(
-                        self.candidate_rect,
-                        hit.rect,
-                    )
-            same_candidate = (
-                value == self.candidate
-                and candidate_source == self.candidate_source
-                and now - self.candidate_last_at <= max_gap
-                and spatially_consistent
+            track = self.evidence_tracks.observe(
+                hit, now=now, frame_id=frame_id, max_gap=max_gap, min_iou=min_iou,
+                match=self._moving_stripe_spatially_consistent if moving_stripes else None,
             )
-            if same_candidate:
-                self.candidate_hits += 1
-            else:
-                self.candidate = value
-                self.candidate_source = candidate_source
-                self.candidate_hits = 1
-                self.candidate_first_rect = tuple(hit.rect)
-            self.candidate_rect = tuple(hit.rect)
-            self.candidate_last_at = now
-            if self.candidate_hits < required:
+            self.candidate, self.candidate_source = value, source
+            self.candidate_hits = track.hits
+            self.candidate_rect, self.candidate_first_rect = track.rect, track.first_rect
+            self.candidate_last_at = track.last_at
+            if source == "scanner_unverified" or track.hits < required:
                 return False
             if moving_stripes and self.candidate_first_rect is not None:
                 first_x, first_y, first_w, first_h = self.candidate_first_rect
@@ -974,13 +966,14 @@ class D435TurntableBarcodeNode(Node):
             self.candidate_hits = 0
             self.candidate_rect = None
             self.candidate_first_rect = None
+            self.evidence_tracks.clear()
         if workflow_active:
             result = String()
             result.data = f"success:{value}"
             self.result_publisher.publish(result)
             self._publish_status(
                 f"D435 side barcode confirmed by {source}: {value!r}; "
-                "requesting turntable stop"
+                f"independent_hits={track.hits}/{required}; requesting turntable stop"
             )
         if report_continuous:
             result = String()
@@ -989,6 +982,7 @@ class D435TurntableBarcodeNode(Node):
             self._publish_continuous_presence(True)
             self._publish_status(
                 f"D435 continuous detection confirmed by {source}: {value!r}"
+                f"; independent_hits={track.hits}/{required}"
             )
         return workflow_active or report_continuous
 
@@ -1018,9 +1012,28 @@ class D435TurntableBarcodeNode(Node):
             self.candidate_first_rect = None
             self.candidate_hits = 0
             self.candidate_last_at = 0.0
+            self.evidence_tracks.clear()
             presence_cleared = True
         if presence_cleared:
             self._publish_continuous_presence(False)
+
+    def _publish_candidate_hint(self, hit, generation: int, captured_at: float, *, invalidated=False) -> None:
+        """A hint can request reinspection, but never declares barcode success."""
+
+        with self.state_lock:
+            if generation != self.scan_generation:
+                return
+            pending = self.scan_active and hit is not None
+            invalidated = invalidated or not self.scan_active
+        message = String()
+        message.data = json.dumps({
+            "pending": pending, "captured_at": captured_at,
+            "invalidated": invalidated,
+            "generation": generation,
+            "source": hit.source if pending else "",
+            "rect": list(hit.rect) if pending else None,
+        }, separators=(",", ":"))
+        self.candidate_publisher.publish(message)
 
     def _capture_loop(self) -> None:
         try:
@@ -1060,7 +1073,8 @@ class D435TurntableBarcodeNode(Node):
                 f"full_frame_every={self.detector.full_frame_interval}; "
                 f"min_candidate_area="
                 f"{self.detector.yolo_min_candidate_area_ratio:.3f}; "
-                "flat-background rejection=on; parallel-bar verification=on; "
+                "flat-background rejection=on; parallel-bar verification=YOLO+scanner; "
+                "confirmation=independent per source; weak patterns=recheck-only; "
                 f"moving_stripes={'on' if self.detector.moving_stripes_enabled else 'off'}"
             )
             if self.detector.provider_fallback_reason:
@@ -1082,6 +1096,7 @@ class D435TurntableBarcodeNode(Node):
                 color_frame = frames.get_color_frame()
                 if not color_frame:
                     continue
+                captured_at = time.time()
                 image = np.asanyarray(color_frame.get_data())
                 self._save_pending_sample(image)
                 with self.roi_lock:
@@ -1099,7 +1114,9 @@ class D435TurntableBarcodeNode(Node):
                     last_detect_at = now
                     allowed_roi, roi_generation = self._roi_bounds_with_generation(image)
                     provider_before = self.detector.active_provider
-                    hit = self.detector.detect(image, allowed_roi)
+                    hits = self.detector.detect_candidates(image, allowed_roi)
+                    self.detection_frame_id += 1
+                    hit = hits[0] if hits else None
                     self.detect_rate_count += 1
                     detect_finished_at = time.monotonic()
                     detect_rate_elapsed = (
@@ -1118,14 +1135,22 @@ class D435TurntableBarcodeNode(Node):
                             f"{self.detector.provider_fallback_reason}"
                         )
                     with self.roi_lock:
-                        if roi_generation != self.roi_generation:
+                        roi_changed = roi_generation != self.roi_generation
+                        if roi_changed:
                             # An ROI change during inference invalidates the
                             # old frame's spatial evidence.
                             hit = None
-                        elif hit is not None:
-                            self._accept_hit(hit, generation)
                         else:
-                            self._note_continuous_no_hit(now)
+                            for candidate in hits:
+                                if self._accept_hit(candidate, generation, self.detection_frame_id):
+                                    hit = candidate
+                                    break
+                            if not any(c.source != "scanner_unverified" for c in hits):
+                                self._note_continuous_no_hit(now)
+                        if workflow_active:
+                            self._publish_candidate_hint(
+                                hit, generation, captured_at, invalidated=roi_changed,
+                            )
                 preview_interval = max(
                     0.02,
                     float(self.get_parameter("preview_publish_interval_s").value),

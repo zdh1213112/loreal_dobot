@@ -60,6 +60,7 @@ except ImportError:
 from .offset_grasp_geometry_v3 import camera_rotation_at_target_tcp, plan_offset
 
 from .controller_v3 import DobotNova5Controller, TcpPose
+from .turntable_barcode_recheck import TurntableBarcodeRecheckMixin
 from .dobot_dh_api_v3 import (
     GRIP_DROPPED,
     GRIP_GRIPPED,
@@ -374,7 +375,7 @@ class EmptyTurntableRecovery:
     began_epoch: float
 
 
-class CosmeticBoxSingleArmNode(Node):
+class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
     def __init__(self) -> None:
         super().__init__("nova5_cosmetic_box_single_arm_cycle_v5")
 
@@ -722,6 +723,11 @@ class CosmeticBoxSingleArmNode(Node):
         # measured steady-speed revolution is about 3.2 s, so retain 0.4 s of
         # coverage margin for start-up acceleration, load and speed variation.
         self.declare_parameter("turntable_scan_timeout_s", 3.6)
+        self.declare_parameter("turntable_barcode_candidate_topic", "/turntable_barcode_candidate")
+        self.declare_parameter("turntable_candidate_grace_s", 0.12)
+        self.declare_parameter("turntable_candidate_recheck_s", 0.35)
+        self.declare_parameter("turntable_candidate_max_rechecks", 2)
+        self.declare_parameter("turntable_candidate_max_age_s", 0.40)
         # Fast-only midpoint retrigger. At this offset from the completed start
         # pulse, send stop and start toggle pulses with an explicit low hold.
         # The field controller ignored the restart edge at 50 ms. With the
@@ -1072,6 +1078,11 @@ class CosmeticBoxSingleArmNode(Node):
         self.turntable_barcode_window_active = False
         self.turntable_barcode_value = ""
         self.turntable_barcode_result_count = 0
+        self.turntable_candidate = None
+        self.turntable_candidate_since = 0.0
+        self.turntable_candidate_window_epoch = 0.0
+        self.turntable_candidate_last_frame_epoch = 0.0
+        self.turntable_candidate_rechecks = 0
         self.turntable_camera_ready = False
         self.d435_continuous_detection = bool(
             self.get_parameter("d435_continuous_on_start").value
@@ -1158,6 +1169,12 @@ class CosmeticBoxSingleArmNode(Node):
             String,
             str(self.get_parameter("turntable_barcode_result_topic").value),
             self._turntable_barcode_callback,
+            10,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("turntable_barcode_candidate_topic").value),
+            self._turntable_barcode_candidate_callback,
             10,
         )
         self.create_subscription(
@@ -4306,6 +4323,10 @@ class CosmeticBoxSingleArmNode(Node):
     def _set_turntable_barcode_window(self, active: bool) -> None:
         with self.turntable_lock:
             self.turntable_barcode_window_active = bool(active)
+            self.turntable_candidate = None
+            self.turntable_candidate_window_epoch = time.time()
+            self.turntable_candidate_last_frame_epoch = 0.0
+            self.turntable_candidate_rechecks = 0
             if active:
                 self.turntable_barcode_value = ""
                 self.turntable_barcode_result_count = 0
@@ -4595,6 +4616,20 @@ class CosmeticBoxSingleArmNode(Node):
                             "stopping turntable for the top-face grasp"
                         )
                         break
+                    recheck_started = time.monotonic()
+                    if self._recheck_turntable_barcode_candidate(
+                        require_cycle_active=require_cycle_active,
+                        top_reader=visible_top_barcode,
+                    ):
+                        stopped_interval = time.monotonic() - recheck_started
+                        deadline += stopped_interval
+                        if mid_scan_restart_at is not None and not mid_scan_restart_completed:
+                            mid_scan_restart_at += stopped_interval
+                        barcode = visible_barcode()
+                        top_barcode = visible_top_barcode() if not barcode else ""
+                        if barcode or top_barcode:
+                            break
+                        continue
                     if (
                         mid_scan_restart_at is not None
                         and not mid_scan_restart_completed
@@ -4649,6 +4684,7 @@ class CosmeticBoxSingleArmNode(Node):
                     state = self.turntable_state
                 if state == "RUNNING":
                     self._toggle_turntable("RUNNING", "STOPPED", "stop")
+                if turntable_was_started and self.turntable_state == "STOPPED":
                     self.last_turntable_stop_monotonic = time.monotonic()
                     self.last_turntable_stop_epoch = time.time()
                     self._notify_d405_post_stop_revalidate()
