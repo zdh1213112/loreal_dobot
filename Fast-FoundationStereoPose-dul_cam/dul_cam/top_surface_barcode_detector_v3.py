@@ -128,8 +128,8 @@ class TopSurfaceBarcodeDetector:
         self,
         *,
         minimum_interior_pixels: int = 4,
-        model_path: str = "src/Fast-FoundationStereoPose-dul_cam/models/best_yolo26s_d405_obb_box_1019.pt",
-        model_confidence: float = 0.35,
+        model_path: str = "src/Fast-FoundationStereoPose-dul_cam/models/d405_d435_barcode_1015.pt",
+        model_confidence: float = 0.40,
     ) -> None:
         self.minimum_interior_pixels = max(1, int(minimum_interior_pixels))
         self.model_path = str(model_path)
