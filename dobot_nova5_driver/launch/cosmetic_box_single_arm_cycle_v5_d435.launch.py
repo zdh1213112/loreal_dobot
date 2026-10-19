@@ -57,7 +57,8 @@ def generate_launch_description() -> LaunchDescription:
                 "turntable_d435_model_path",
                 # default_value="/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_0929.onnx",
                 # default_value="/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_d435_barcode_1013.onnx",
-                default_value="src/Fast-FoundationStereoPose-dul_cam/models/d405_d435_barcode_1015.onnx",
+                # default_value="src/Fast-FoundationStereoPose-dul_cam/models/d405_d435_barcode_1015.onnx",
+                default_value="src/Fast-FoundationStereoPose-dul_cam/models/best_barcode_yolo26m_1019.onnx",
                 description="Fast D435 ONNX barcode detector exported from best_0929.pt",
             ),
             DeclareLaunchArgument(
@@ -477,6 +478,11 @@ def generate_launch_description() -> LaunchDescription:
                     "Offset-high clearance above grasp depth; lateral motion, "
                     "orientation alignment and partial descent share one PTP"
                 ),
+            ),
+            DeclareLaunchArgument(
+                "pregrasp_fresh_wait_timeout_s",
+                default_value="0.60",
+                description="Maximum wait at safe hover for fresh D405 tracking (0 disables; max 2s)",
             ),
             DeclareLaunchArgument(
                 "side_barcode_direct_hover_clearance_m",
@@ -1227,6 +1233,10 @@ def generate_launch_description() -> LaunchDescription:
                         "offset_finger_span_m": ParameterValue(LaunchConfiguration("offset_finger_span_m"), value_type=float),
                         "offset_high_clearance_m": ParameterValue(
                             LaunchConfiguration("offset_high_clearance_m"),
+                            value_type=float,
+                        ),
+                        "pregrasp_fresh_wait_timeout_s": ParameterValue(
+                            LaunchConfiguration("pregrasp_fresh_wait_timeout_s"),
                             value_type=float,
                         ),
                         "side_barcode_direct_hover_clearance_m": ParameterValue(

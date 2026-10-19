@@ -353,6 +353,12 @@ roi_end = (-1, -1)
 roi_lock = threading.Lock()
 vision_request_active = False
 pretracking_enabled = False
+# The callback requests a session; the processing loop acknowledges it only
+# when it actually begins acquisition. This also preserves a reset arriving
+# during a previous YOLO/FFS iteration.
+acquisition_request_epoch_s = 0.0
+acquisition_applied_epoch_s = 0.0
+acquisition_capture_epoch_s = 0.0
 standby_next_reacquire_at = 0.0
 post_stop_epoch_s = 0.0
 
@@ -983,6 +989,8 @@ def publish_pregrasp_pose(frame_stamp) -> None:
     frame_stamp_s = float(frame_stamp.sec) + float(frame_stamp.nanosec) * 1e-9
     if post_stop_epoch_s > 0.0 and frame_stamp_s <= post_stop_epoch_s:
         return
+    if not is_current_acquisition_frame(frame_stamp_s):
+        return
     pose_msg = PoseStamped()
     # The robot may receive this message after FFS/SAM2 processing and after
     # it has already moved.  Preserve the stamp of the frame that produced
@@ -1072,30 +1080,56 @@ def host_seconds_to_ros_time(timestamp_s: float) -> RosTime:
 
 
 def trigger_callback(msg: Bool) -> None:
-    global trigger_requested
+    global trigger_requested, acquisition_request_epoch_s
     if msg.data:
+        acquisition_request_epoch_s = time.time()
         trigger_requested = True
         logging.info("[D405] New cosmetic-box detection requested.")
+
+
+def is_current_acquisition_frame(frame_stamp_s: float) -> bool:
+    """A queued pre-reset capture cannot become part of the new stable pair."""
+
+    return (
+        acquisition_applied_epoch_s >= acquisition_request_epoch_s
+        and frame_stamp_s > acquisition_capture_epoch_s
+    )
+
+
+def acknowledge_d405_acquisition() -> None:
+    """Report the applied reset and the earliest permissible frame timestamp."""
+
+    global acquisition_applied_epoch_s, acquisition_capture_epoch_s
+    request_epoch = acquisition_request_epoch_s
+    capture_epoch = time.time()
+    acquisition_applied_epoch_s = request_epoch
+    acquisition_capture_epoch_s = capture_epoch
+    message = String()
+    message.data = f"acquisition_started:{request_epoch:.9f}:{capture_epoch:.9f}"
+    vision_result_pub.publish(message)
 
 
 def pretracking_enable_callback(msg: Bool) -> None:
     """Arm a warm standby detector while 101 is safely at startup."""
 
     global pretracking_enabled, trigger_requested, reset_requested
+    global acquisition_request_epoch_s, acquisition_applied_epoch_s
     global clear_target_display_requested, standby_next_reacquire_at
     enabled = bool(msg.data)
     pretracking_enabled = enabled
-    # Each arm/disarm transition starts a clean SAM2 session.  The v5 driver
-    # will only consume a pose whose callback arrived after the turntable stop.
+    # Each arm/disarm starts a clean SAM2 session. The driver waits for the
+    # processing-loop acknowledgement and frames captured after that barrier.
     reset_requested = True
     clear_target_display_requested = True
     standby_next_reacquire_at = time.monotonic()
     if enabled:
+        acquisition_request_epoch_s = time.time()
         trigger_requested = True
         logging.info(
             "[D405] V5 standby pretracking enabled; acquiring the next target"
         )
     else:
+        acquisition_applied_epoch_s = acquisition_request_epoch_s
         trigger_requested = False
         logging.info("[D405] V5 standby pretracking disabled")
 
@@ -1104,6 +1138,7 @@ def post_stop_revalidate_callback(msg: Bool) -> None:
     """Reacquire the stopped box before any pretracked grasp is accepted."""
 
     global post_stop_epoch_s, handoff_clear_streak, handoff_clearance_passed
+    global acquisition_request_epoch_s
     global handoff_force_live_cloud, last_handoff_state, handoff_reacquire_required
     global pregrasp_tracking_deadline
     global trigger_requested, reset_requested, clear_target_display_requested
@@ -1119,6 +1154,7 @@ def post_stop_revalidate_callback(msg: Bool) -> None:
     if HANDOFF_CLEARANCE_ENABLED:
         publish_handoff_clearance("CHECKING", clear=False)
     if pretracking_enabled:
+        acquisition_request_epoch_s = time.time()
         # The box has rotated since the standby YOLO/SAM2 lock. A fresh YOLO
         # selection on post-stop frames prevents a plausible but drifted SAM2
         # track from being used as the next grasp target.
@@ -2014,7 +2050,12 @@ try:
             )
             logging.info("[D405] Standby reacquisition requested")
 
+        # A callback can arrive while YOLO/FFS is busy. The old iteration may
+        # clear trigger_requested, but it must not swallow the newer reset.
+        if acquisition_request_epoch_s > acquisition_applied_epoch_s:
+            trigger_requested = True
         if trigger_requested:
+            acknowledge_d405_acquisition()
             is_fast_reacquire = fast_reacquire_requested
             fast_reacquire_requested = False
             vision_request_active = True
@@ -3254,7 +3295,10 @@ try:
                                         # clearance requirement passes. This removes the old
                                         # extra post-CLEAR pair of camera iterations without
                                         # relaxing either safety or stability check.
-                                        if not locked_target_ready:
+                                        if (
+                                            not locked_target_ready
+                                            and is_current_acquisition_frame(frame_stamp_s)
+                                        ):
                                             if (
                                                 pending_stable_target_samples
                                                 and pending_stable_target_samples[-1]["frame_index"]

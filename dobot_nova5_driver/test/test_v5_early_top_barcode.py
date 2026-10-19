@@ -177,6 +177,9 @@ def test_early_top_barcode_stops_turntable_and_preserves_top_result(top_found_at
 
 def test_early_top_mode_can_enable_d405_standby_without_old_pretracking_option():
     node = CosmeticBoxSingleArmNode.__new__(CosmeticBoxSingleArmNode)
+    node.data_lock = threading.Lock()
+    node.pregrasp_pose_count = 0
+    node.handoff_state_count = 0
     values = {
         "turntable_enabled": True,
         "top_surface_barcode_enabled": True,

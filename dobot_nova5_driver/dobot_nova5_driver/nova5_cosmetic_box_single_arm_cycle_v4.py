@@ -561,13 +561,15 @@ class CosmeticBoxSingleArmNode(Node):
         self.declare_parameter("camera_frame_id", "camera_d405_link")
         self.declare_parameter("vision_pose_topic", "/target_pose_cam_fine")
         # D405 稳定目标后发布的后台预抓取位姿话题。机器人到达抓取上方
-        # 后只消费这条话题中本次目标的已到达新鲜帧，不增加单独视觉等待。
+        # 后消费本次目标的新鲜帧；短暂断帧时在安全悬停位有限等待。
         self.declare_parameter("pregrasp_pose_topic", "/target_pose_cam_pregrasp")
         # 最新预抓取位姿允许的最大年龄，单位：秒。超过该时间视为视觉
-        # 跟踪失效，机械臂不下压，直接回初始位重新检测。
+        # 跟踪失效；有限等待仍无新帧时，机械臂回初始位重新检测。
         self.declare_parameter("pregrasp_pose_max_age_s", 0.65)
-        # 允许后台预抓取跟踪修正目标位置。修正不是增加一段等待：目标帧
-        # 在 move-above 期间异步累积，到达悬停位后立即消费。
+        # 仅在安全悬停位缺少合格帧时等待；有新鲜帧立即继续，0 可关闭。
+        self.declare_parameter("pregrasp_fresh_wait_timeout_s", 0.60)
+        # 允许后台预抓取跟踪修正目标位置。目标帧在 move-above 期间
+        # 异步累积；悬停时已有合格帧立即消费，缺帧时才有限等待。
         self.declare_parameter("pregrasp_use_live_pose_for_descent", True)
         # 目标相对初始稳定位姿的位置变化阈值，单位：米。小变化继续使用
         # 首次稳定位置；超过该值且最新悬停附近实测帧有连续帧支持时，
@@ -590,8 +592,8 @@ class CosmeticBoxSingleArmNode(Node):
         # TCP 线速度低于该值的视觉帧视为“悬停后稳定帧”。这些帧优先于
         # 机械臂运动中的帧，用于获得稳定的当前手眼变换结果。
         self.declare_parameter("pregrasp_settled_tcp_speed_mps", 0.015)
-        # D405 通常约 4--5 Hz；允许使用到达悬停前约一个帧周期内的
-        # 已采集稳定帧，不额外等待相机再拍一帧。
+        # D405 通常约 4--5 Hz；优先使用到达悬停前约一个帧周期内的
+        # 已采集稳定帧，只有缺少合格帧时才触发有限等待。
         self.declare_parameter("pregrasp_hover_frame_window_s", 0.25)
         # 连续位置帧聚类半径。单帧跳点不会触发水平修正。
         self.declare_parameter("pregrasp_position_consensus_m", 0.006)
@@ -966,6 +968,11 @@ class CosmeticBoxSingleArmNode(Node):
         self.latest_pregrasp_pose: Optional[TcpPose] = None
         self.latest_pregrasp_pose_received_at = 0.0
         self.pregrasp_observations: deque[PregraspObservation] = deque(maxlen=40)
+        self.d405_reacquire_request_epoch = 0.0
+        self.d405_reacquire_applied_epoch = 0.0
+        self.d405_reacquire_capture_epoch = 0.0
+        self.d405_reacquire_pregrasp_count = 0
+        self.d405_reacquire_handoff_count = 0
         self.width_count = 0
         self.length_count = 0
         self.height_count = 0
@@ -1716,7 +1723,8 @@ class CosmeticBoxSingleArmNode(Node):
             "Vision/robot time alignment: feedback "
             f"{self.controller.feedback_timestamp_source} timestamp; "
             f"raw_TimeStamp={self.controller.feedback_raw_timestamp}; "
-            "pregrasp tracking uses no extra hover wait"
+            "pregrasp fresh frames continue immediately; safe-hover tracking-gap "
+            f"wait <= {float(self.get_parameter('pregrasp_fresh_wait_timeout_s').value):.2f}s"
         )
         if self.controller.feedback_timestamp_source == "host_receive":
             self.get_logger().warning(
@@ -2664,6 +2672,8 @@ class CosmeticBoxSingleArmNode(Node):
         if command_pose is None:
             return
         with self.data_lock:
+            if not self._d405_frame_after_reacquire_locked(message_stamp_seconds(msg)):
+                return
             self.pose_count += 1
             self.pose_samples.append((self.pose_count, command_pose))
 
@@ -2684,6 +2694,8 @@ class CosmeticBoxSingleArmNode(Node):
             # firmware variant without speed history must not discard it.
             pass
         with self.data_lock:
+            if not self._d405_frame_after_reacquire_locked(frame_time_s):
+                return
             self.pregrasp_pose_count += 1
             observation_count = self.pregrasp_pose_count
             self.latest_pregrasp_pose = command_pose
@@ -2727,6 +2739,24 @@ class CosmeticBoxSingleArmNode(Node):
     def _vision_result_callback(self, msg: String) -> None:
         result = msg.data.strip()
         if not result:
+            return
+        if result.startswith("acquisition_started:"):
+            try:
+                _, request_text, capture_text = result.split(":")
+                request_epoch, capture_epoch = float(request_text), float(capture_text)
+                if not (
+                    math.isfinite(request_epoch) and math.isfinite(capture_epoch)
+                    and 0.0 <= request_epoch <= capture_epoch
+                ):
+                    return
+            except (ValueError, TypeError):
+                return
+            with self.data_lock:
+                if capture_epoch > self.d405_reacquire_capture_epoch:
+                    self.d405_reacquire_applied_epoch = request_epoch
+                    self.d405_reacquire_capture_epoch = capture_epoch
+            # This is a capture barrier, not the terminal success/failure of
+            # an explicit request or evidence of an empty turntable.
             return
         with self.data_lock:
             self.latest_vision_result = result
@@ -3809,6 +3839,30 @@ class CosmeticBoxSingleArmNode(Node):
             return
         self.get_logger().info(f"[cycle] {text}")
 
+    def _mark_d405_reacquisition(self) -> None:
+        """Invalidate the previous camera session before publishing a reset."""
+
+        with self.data_lock:
+            self.d405_reacquire_request_epoch = time.time()
+            self.d405_reacquire_pregrasp_count = self.pregrasp_pose_count
+            self.d405_reacquire_handoff_count = self.handoff_state_count
+
+    def _d405_frame_after_reacquire(self, frame_time_s: float) -> bool:
+        """Reject queued old frames until the camera has applied this reset."""
+
+        with self.data_lock:
+            return self._d405_frame_after_reacquire_locked(frame_time_s)
+
+    def _d405_frame_after_reacquire_locked(self, frame_time_s: float) -> bool:
+        # Call under data_lock, including after an expensive pose transform:
+        # the worker can request a new session while that transform is running.
+        requested = getattr(self, "d405_reacquire_request_epoch", 0.0)
+        applied = getattr(self, "d405_reacquire_applied_epoch", 0.0)
+        captured_after = getattr(self, "d405_reacquire_capture_epoch", 0.0)
+        return requested <= 0.0 or (
+            applied >= requested and frame_time_s > max(requested, captured_after)
+        )
+
     def _set_d405_pretracking(self, enabled: bool) -> None:
         """Enable/disable V4 D405 standby tracking without requesting a pick."""
 
@@ -3822,6 +3876,8 @@ class CosmeticBoxSingleArmNode(Node):
             or early_top_enabled
         ):
             enabled = False
+        if enabled:
+            self._mark_d405_reacquisition()
         message = Bool()
         message.data = bool(enabled)
         self.d405_pretracking_publisher.publish(message)
@@ -3831,6 +3887,8 @@ class CosmeticBoxSingleArmNode(Node):
         )
 
     def _notify_d405_post_stop_revalidate(self) -> None:
+        if getattr(self, "d405_pretracking_armed", False):
+            self._mark_d405_reacquisition()
         with self.data_lock:
             self.last_turntable_stop_pregrasp_count = self.pregrasp_pose_count
             self.last_turntable_stop_handoff_count = self.handoff_state_count
@@ -3846,14 +3904,21 @@ class CosmeticBoxSingleArmNode(Node):
         *,
         require_cycle_enabled: bool = True,
     ) -> Optional[tuple[TcpPose, float, float, float]]:
-        """Consume only D405 frames received after the most recent table stop."""
+        """Require current-session, recent D405 frames after the table stop."""
 
         stop_s = float(self.last_turntable_stop_monotonic)
         if stop_s <= 0.0:
             return None
         with self.data_lock:
-            baseline_count = self.last_turntable_stop_pregrasp_count
-            baseline_handoff = self.last_turntable_stop_handoff_count
+            baseline_count = max(
+                self.last_turntable_stop_pregrasp_count,
+                getattr(self, "d405_reacquire_pregrasp_count", 0),
+            )
+            baseline_handoff = max(
+                self.last_turntable_stop_handoff_count,
+                getattr(self, "d405_reacquire_handoff_count", 0),
+            )
+        max_age_s = max(0.05, float(self.get_parameter("pregrasp_pose_max_age_s").value))
         required = max(1, int(self.get_parameter("d405_post_stop_samples").value))
         timeout_s = max(
             0.20,
@@ -3868,13 +3933,23 @@ class CosmeticBoxSingleArmNode(Node):
             and (self.cycle_enabled or not require_cycle_enabled)
             and time.monotonic() < deadline
         ):
+            now_monotonic, now_epoch = time.monotonic(), time.time()
             with self.data_lock:
+                request_epoch = getattr(self, "d405_reacquire_request_epoch", 0.0)
+                applied_epoch = getattr(self, "d405_reacquire_applied_epoch", 0.0)
+                frame_barrier = max(
+                    float(self.last_turntable_stop_epoch), request_epoch,
+                    getattr(self, "d405_reacquire_capture_epoch", 0.0),
+                )
                 observations = [
                     observation
                     for observation in self.pregrasp_observations
-                    if observation.count > baseline_count
+                    if applied_epoch >= request_epoch
+                    and observation.count > baseline_count
                     and observation.received_at_monotonic >= stop_s
-                    and observation.frame_time_s > float(self.last_turntable_stop_epoch)
+                    and observation.frame_time_s > frame_barrier
+                    and 0.0 <= now_monotonic - observation.received_at_monotonic <= max_age_s
+                    and 0.0 <= now_epoch - observation.frame_time_s <= max_age_s
                 ]
                 handoff_fresh = self.handoff_state_count > baseline_handoff
                 handoff_clear = bool(self.latest_handoff_clear)
@@ -3946,6 +4021,7 @@ class CosmeticBoxSingleArmNode(Node):
                         self.get_logger().info(
                             "Accepted fresh post-stop D405 target: "
                             f"age={time.monotonic() - samples[-1].received_at_monotonic:.3f}s, "
+                            f"capture_age={time.time() - samples[-1].frame_time_s:.3f}s, "
                             f"samples={len(samples)}, handoff=CLEAR, "
                             f"x={averaged.x:.3f} y={averaged.y:.3f} z={averaged.z:.3f}"
                         )
@@ -4725,6 +4801,7 @@ class CosmeticBoxSingleArmNode(Node):
                 self._set_d405_pretracking(False)
 
     def _request_vision_target(self, require_cycle_enabled: bool = True) -> Optional[tuple[TcpPose, float, float, float]]:
+        self._mark_d405_reacquisition()
         with self.data_lock:
             previous_pose = self.pose_count
             previous_width = self.width_count
@@ -4908,12 +4985,22 @@ class CosmeticBoxSingleArmNode(Node):
         # new message, never mix observations from an earlier box/cycle.
         if previous_count >= 0:
             observations = [observation for observation in observations if observation.count > previous_count]
-        now_monotonic = time.monotonic()
+        now_monotonic, now_epoch = time.monotonic(), time.time()
+        newest_received_age_s = min(
+            (now_monotonic - item.received_at_monotonic for item in observations),
+            default=float("inf"),
+        )
+        newest_capture_age_s = min(
+            (now_epoch - item.frame_time_s for item in observations),
+            default=float("inf"),
+        )
         max_age_s = max(0.05, float(self.get_parameter("pregrasp_pose_max_age_s").value))
         observations = [
             observation
             for observation in observations
-            if now_monotonic - observation.received_at_monotonic <= max_age_s
+            if 0.0 <= now_monotonic - observation.received_at_monotonic <= max_age_s
+            and 0.0 <= now_epoch - observation.frame_time_s <= max_age_s
+            and self._d405_frame_after_reacquire(observation.frame_time_s)
         ]
         observations.sort(key=lambda observation: observation.frame_time_s)
         latest_age_s = (
@@ -4926,12 +5013,53 @@ class CosmeticBoxSingleArmNode(Node):
                 stage="pregrasp revalidation",
                 message=(
                     "no fresh D405 pregrasp pose after reaching the safe hover "
-                    f"(new_samples={max(0, current_count - previous_count)}, age={latest_age_s:.3f}s); "
+                    f"(new_samples={max(0, current_count - previous_count)}, "
+                    f"newest_received_age={newest_received_age_s:.3f}s, "
+                    f"newest_capture_age={newest_capture_age_s:.3f}s); "
                     "will return to startup before descent"
                 ),
                 needs_vertical_retreat=False,
             )
         return observations, latest_age_s
+
+    def _wait_for_fresh_pregrasp_observations(
+        self, previous_count: int,
+    ) -> tuple[list[PregraspObservation], float]:
+        """Hold at safe hover for a bounded tracking gap; never trigger YOLO here."""
+
+        timeout_s = float(self.get_parameter("pregrasp_fresh_wait_timeout_s").value)
+        if not math.isfinite(timeout_s) or not 0.0 <= timeout_s <= 2.0:
+            raise ValueError("pregrasp_fresh_wait_timeout_s must be within [0, 2] seconds")
+        started = time.monotonic()
+        deadline = started + timeout_s
+        waiting = False
+        last_error: Optional[RecoverableGraspError] = None
+        while True:
+            self._require_cycle_active("while validating D405 at safe hover")
+            if last_error is not None and time.monotonic() >= deadline:
+                raise last_error
+            try:
+                result = self._fresh_pregrasp_observations(previous_count)
+            except RecoverableGraspError as exc:
+                last_error = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise
+                if not waiting:
+                    self._publish_status(
+                        "D405 tracking gap at safe hover; holding for up to "
+                        f"{timeout_s:.2f}s for a fresh pose before descent"
+                    )
+                    waiting = True
+                time.sleep(min(VISION_REQUEST_POLL_S, remaining))
+                continue
+            self._require_cycle_active("after validating D405 at safe hover")
+            if waiting:
+                self._publish_status(
+                    "D405 fresh tracking recovered at safe hover after "
+                    f"{time.monotonic() - started:.3f}s"
+                )
+            return result
 
     @staticmethod
     def _pose_position(pose: TcpPose) -> np.ndarray:
@@ -5249,7 +5377,25 @@ class CosmeticBoxSingleArmNode(Node):
     ) -> TcpPose:
         """Use synchronized, consensus-filtered tracking before descent."""
 
-        observations, age_s = self._fresh_pregrasp_observations(previous_count)
+        current = self._current_command_pose()
+        min_hover_clearance = max(
+            0.005,
+            float(self.get_parameter("pregrasp_min_hover_clearance_m").value),
+        )
+        # Clearance is checked against the already accepted target pose.  A
+        # noisy live depth sample must not create a new descent target or make
+        # the safety check depend on a different frame.
+        if current.z - target.z < min_hover_clearance:
+            raise RecoverableGraspError(
+                stage="pregrasp revalidation",
+                message=(
+                    f"safe hover clearance is only {(current.z - target.z)*1000:.1f}mm, "
+                    f"below required {min_hover_clearance*1000:.1f}mm; "
+                    "will return to startup before descent"
+                ),
+                needs_vertical_retreat=False,
+            )
+        observations, age_s = self._wait_for_fresh_pregrasp_observations(previous_count)
         raw_live_target = self._apply_grasp_z_safety(
             observations[-1].pose,
             z_offset_m,
@@ -5284,24 +5430,6 @@ class CosmeticBoxSingleArmNode(Node):
             angle_tolerance,
             float(self.get_parameter("pregrasp_max_correction_angle_deg").value),
         )
-        current = self._current_command_pose()
-        min_hover_clearance = max(
-            0.005,
-            float(self.get_parameter("pregrasp_min_hover_clearance_m").value),
-        )
-        # Clearance is checked against the already accepted target pose.  A
-        # noisy live depth sample must not create a new descent target or make
-        # the safety check depend on a different frame.
-        if current.z - target.z < min_hover_clearance:
-            raise RecoverableGraspError(
-                stage="pregrasp revalidation",
-                message=(
-                    f"safe hover clearance is only {(current.z - target.z)*1000:.1f}mm, "
-                    f"below required {min_hover_clearance*1000:.1f}mm; "
-                    "will return to startup before descent"
-                ),
-                needs_vertical_retreat=False,
-            )
         self.get_logger().info(
             f"Pregrasp target check: age={age_s*1000:.0f}ms, "
             f"position_delta={raw_position_delta*1000:.1f}mm, "
