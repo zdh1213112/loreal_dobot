@@ -868,7 +868,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, NearCubeMotionSafet
         # the normal pickup attitude. D405 then reacquires the now-side-facing
         # barcode and the ordinary side-barcode placement branch takes over.
         self.declare_parameter("bottom_near_cube_flip_enabled", True)
-        self.declare_parameter("bottom_near_cube_max_dimension_ratio", 1.35)
+        self.declare_parameter("bottom_near_cube_max_dimension_ratio", 1.45)
         # About 15 mm of extra centre-height clears a 70 mm cube while it
         # rolls through 45 degrees. Keep a modest margin without pushing the
         # tilted Tool-1 pose unnecessarily far toward the reach boundary.

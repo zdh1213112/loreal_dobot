@@ -61,6 +61,7 @@ from .offset_grasp_geometry_v3 import camera_rotation_at_target_tcp, plan_offset
 
 from .controller_v3 import DobotNova5Controller, TcpPose
 from .d405_pipeline_performance import post_stop_wait_diagnostics
+from .alarm_light_display_v5 import AlarmLightDisplayMixin
 from .turntable_barcode_recheck import TurntableBarcodeRecheckMixin
 from .near_cube_motion_safety import (
     with_near_cube_preflight_session,
@@ -398,7 +399,7 @@ class EmptyTurntableRecovery:
     began_epoch: float
 
 
-class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, NearCubeMotionSafetyMixin, Node):
+class CosmeticBoxSingleArmNode(AlarmLightDisplayMixin, TurntableBarcodeRecheckMixin, NearCubeMotionSafetyMixin, Node):
     def __init__(self) -> None:
         super().__init__("nova5_cosmetic_box_single_arm_cycle_v5")
 
@@ -899,7 +900,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, NearCubeMotionSafet
         # the normal pickup attitude. D405 then reacquires the now-side-facing
         # barcode and the ordinary side-barcode placement branch takes over.
         self.declare_parameter("bottom_near_cube_flip_enabled", True)
-        self.declare_parameter("bottom_near_cube_max_dimension_ratio", 1.35)
+        self.declare_parameter("bottom_near_cube_max_dimension_ratio", 1.45)
         # About 15 mm of extra centre-height clears a 70 mm cube while it
         # rolls through 45 degrees. Keep a modest margin without pushing the
         # tilted Tool-1 pose unnecessarily far toward the reach boundary.
@@ -989,6 +990,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, NearCubeMotionSafet
             raise ValueError("handeye_flange_to_cam must contain 16 values")
         self.handeye_flange_to_cam = np.asarray(handeye_values, dtype=np.float64).reshape(4, 4)
 
+        self._configure_alarm_light_display()
         self.controller = DobotNova5Controller(
             robot_ip=str(self.get_parameter("robot_ip").value),
             dashboard_port=int(self.get_parameter("dashboard_port").value),
@@ -12804,6 +12806,13 @@ class CosmeticBoxControlWindow(QMainWindow):
         form.addRow("最新视觉", self.vision_feedback_label)
         form.addRow("转盘 / D435", self.turntable_status_label)
         form.addRow("流程", self.cycle_status_label)
+        if getattr(self.node, "_alarm_light_enabled", False):
+            self.alarm_status_label = QLabel("状态灯正在连接")
+            self.alarm_status_label.setWordWrap(True)
+            form.addRow("状态灯", self.alarm_status_label)
+            silence = QPushButton("确认报警 / 静音（不复位、不启动）")
+            silence.clicked.connect(lambda: self.node.acknowledge_alarm_light())
+            form.addRow(silence)
         layout.addWidget(box)
 
     def _new_double(self, value: float, minimum=-360.0, maximum=360.0, decimals=3, step=1.0) -> QDoubleSpinBox:
@@ -13710,6 +13719,11 @@ class CosmeticBoxControlWindow(QMainWindow):
 
     def refresh_status(self) -> None:
         self.cycle_status_label.setText(self.node.last_status)
+        if hasattr(self, "alarm_status_label"):
+            text = self.node._alarm_output_text
+            if time.monotonic() - self.node._alarm_output_at > 4.0:
+                text = "状态灯进程暂无新状态，请检查灯控进程"
+            self.alarm_status_label.setText(text)
         with self.node.turntable_lock:
             turntable_state = self.node.turntable_state
             camera_ready = self.node.turntable_camera_ready

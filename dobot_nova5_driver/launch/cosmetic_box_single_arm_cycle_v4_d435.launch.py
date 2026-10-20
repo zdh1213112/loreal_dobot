@@ -346,7 +346,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "bottom_near_cube_max_dimension_ratio",
-                default_value="1.35",
+                default_value="1.45",
                 description=(
                     "Maximum max/min ratio across D405 length, physical width "
                     "and height for the near-cube bottom flip"

@@ -28,6 +28,7 @@ setup(
             [
                 "README_cosmetic_box_single_arm.md",
                 "README_cosmetic_box_single_arm_v5.md",
+                "README_status_light_v5.md",
                 "README_d405_grasp_retry_v4_v5.md",
                 "README_near_cube_motion_safety_v4_v5.md",
                 "README_d405_localization_performance_v4_v5.md",
@@ -76,6 +77,7 @@ setup(
             "nova5_cosmetic_box_cycle_v3_fast = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v3_fast:main",
             "nova5_cosmetic_box_cycle_v4 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v4:main",
             "nova5_cosmetic_box_cycle_v5 = dobot_nova5_driver.nova5_cosmetic_box_single_arm_cycle_v5:main",
+            "station_alarm_light_v5 = dobot_nova5_driver.alarm_light_node_v5:main",
         ],
     },
 )

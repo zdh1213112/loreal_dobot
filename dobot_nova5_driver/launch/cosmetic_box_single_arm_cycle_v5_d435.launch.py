@@ -2,6 +2,7 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -23,6 +24,20 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/home/zdh/miniconda3/envs/ffs_ros/bin/python",
                 description="Python environment containing CUDA FFS, SAM2, RealSense, Open3D and ROS 2",
             ),
+            DeclareLaunchArgument(
+                "alarm_light_enabled", default_value="false", choices=["true", "false"],
+                description="Enable the independent V5 light using existing workflow topics only",
+            ),
+            DeclareLaunchArgument("alarm_light_port", default_value="/dev/ttyUSB0",
+                                  description="Dedicated light serial port; prefer /dev/serial/by-id/..."),
+            DeclareLaunchArgument("alarm_light_device_id", default_value="1"),
+            DeclareLaunchArgument("alarm_light_buzzer_enabled", default_value="true",
+                                  choices=["true", "false"]),
+            DeclareLaunchArgument("alarm_light_warning_beep_enabled", default_value="true",
+                                  choices=["true", "false"],
+                                  description="One short tone per recoverable yellow-warning episode"),
+            DeclareLaunchArgument("alarm_light_no_target_warning_count", default_value="3",
+                                  description="Consecutive failed target attempts before yellow warning"),
             DeclareLaunchArgument(
                 "turntable_d435_serial",
                 default_value="254322071102",
@@ -367,7 +382,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "bottom_near_cube_max_dimension_ratio",
-                default_value="1.35",
+                default_value="1.45",
                 description=(
                     "Maximum max/min ratio across D405 length, physical width "
                     "and height for the near-cube bottom flip"
@@ -861,6 +876,21 @@ def generate_launch_description() -> LaunchDescription:
                     "length during barcode-up placement"
                 ),
             ),
+            Node(
+                package="dobot_nova5_driver", executable="station_alarm_light_v5",
+                name="station_alarm_light_v5", output="screen",
+                # Reuse the existing environment, which already has pyserial;
+                # this process imports no camera, Qt, torch or GPU modules.
+                prefix=[LaunchConfiguration("vision_python")],
+                condition=IfCondition(LaunchConfiguration("alarm_light_enabled")),
+                parameters=[{
+                    "port": ParameterValue(LaunchConfiguration("alarm_light_port"), value_type=str),
+                    "device_id": ParameterValue(LaunchConfiguration("alarm_light_device_id"), value_type=int),
+                    "buzzer_enabled": ParameterValue(LaunchConfiguration("alarm_light_buzzer_enabled"), value_type=bool),
+                    "warning_beep_enabled": ParameterValue(LaunchConfiguration("alarm_light_warning_beep_enabled"), value_type=bool),
+                    "no_target_warning_count": ParameterValue(LaunchConfiguration("alarm_light_no_target_warning_count"), value_type=int),
+                }],
+            ),
             ExecuteProcess(
                 cmd=[
                     LaunchConfiguration("vision_python"),
@@ -1073,6 +1103,8 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
                 parameters=[
                     {
+                        "alarm_light_enabled": ParameterValue(
+                            LaunchConfiguration("alarm_light_enabled"), value_type=bool),
                         "turntable_do_index": ParameterValue(
                             LaunchConfiguration("turntable_do_index"),
                             value_type=int,

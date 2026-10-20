@@ -31,6 +31,12 @@ Y=400 mm 处继续校验已有许可。此话题是可领取通知，不替代�
 本流程控制 `192.168.111.101`；对 `192.168.111.102` 只打开 `30004` feedback
 读取 TCP 做 X/Y/Z 安全联锁，不打开 `29999` Dashboard，也不发送 102 运动指令。
 
+## 可选状态灯
+
+V5 launch 支持 `alarm_light_enabled:=true/false`，默认 `false`。
+启用时可设置 `alarm_light_port:=/dev/ttyUSB0`；详细灯色、蜂鸣器、
+状态判定和静音操作见 [V5 状态灯说明](README_status_light_v5.md)。
+
 ## 流程
 
 转盘启用时按“侧面码 → 顶面码 → 底面码”执行：侧面未确认后，继续在
