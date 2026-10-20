@@ -542,7 +542,7 @@ def test_guard_wait_checks_empty_table_before_101_moving():
     node = empty_event_node()
     node.secondary_guard_ack_sequence = -1
     node._read_secondary_y_clearance = lambda: {
-        "right_y_m": 0.344,
+        "right_y_m": 0.344, "right_x_m": 0.485, "right_z_m": 0.165,
         "gap_y_m": 0.300,
     }
     node._confirm_empty_turntable = MagicMock(return_value=True)
@@ -1252,3 +1252,101 @@ def test_reset_requires_stopped_worker_and_retired_102():
     node.reset_secondary_collision_latch()
     assert not node.secondary_protective_stop_latched.is_set()
     assert not node.cycle_enabled
+
+
+def test_post_place_handoff_keeps_101_at_startup_until_both_phase_acks(monkeypatch):
+    node = stopped_node()
+    node.running = True
+    node.secondary_guard_ack_sequence = -1
+    node.secondary_post_place_fetch = True
+    node.controller.robot_mode = 5
+    node.controller.current_joint = lambda: [0.] * 6
+    node._six_values = lambda _name: [0.] * 6
+    state = dict(now=0., y=.302, queued_y=.310, mode=None, strict_sent_at=None)
+    phases = []
+    measurement = dict(right_y_m=.302, right_x_m=.485, right_z_m=.165, gap_y_m=.300)
+    node._read_secondary_y_clearance = lambda: dict(measurement, right_y_m=state['y'])
+
+    def publish(msg):
+        state['mode'] = int(msg.data[4])
+        if not phases or phases[-1] != state['mode']:
+            phases.append(state['mode'])
+        if state['mode'] == 2:
+            state['strict_sent_at'] = state['now']
+        assert not node.secondary_pick_motion_active
+
+    node.secondary_guard_xyz_publisher.publish.side_effect = publish
+
+    def sleep(seconds):
+        state['now'] += seconds
+        assert state['now'] < 1.0
+        assert not node.secondary_pick_motion_active
+        if state['now'] >= .02:
+            state['y'] = .299
+        if state['now'] >= .04:
+            state['y'] = .280
+        if state['now'] >= .06:
+            state['queued_y'] = .275
+        if state['mode'] == 3 and state['y'] <= .290 and state['queued_y'] <= .290:
+            node.secondary_guard_ack_sequence = node.secondary_guard_sequence
+        if state['mode'] == 2 and state['now'] >= state['strict_sent_at'] + .08:
+            node.secondary_guard_ack_sequence = node.secondary_guard_sequence
+
+    monkeypatch.setattr(cycle_v5, 'time', SimpleNamespace(monotonic=lambda: state['now'], sleep=sleep))
+    node._close_secondary_zone_for_pick()
+    assert phases == [3, 2]
+    assert node.secondary_pick_motion_active
+    assert state['now'] - state['strict_sent_at'] >= .18 - 1e-9
+    assert not node.secondary_pick_guard_waiting_for_exit
+
+
+def test_post_place_handoff_requires_measured_stationary_startup():
+    node = stopped_node()
+    node.controller.robot_mode = 5
+    node.controller.current_joint = lambda: [0.] * 6
+    node._six_values = lambda _name: [0.] * 6
+    assert node._at_startup_for_post_place_handoff()
+    node.controller.robot_mode = 7
+    assert not node._at_startup_for_post_place_handoff()
+    node.controller.robot_mode = 5
+    node.controller.current_joint = lambda: [20.] * 6
+    assert not node._at_startup_for_post_place_handoff()
+
+
+def test_cancelled_post_place_wait_closes_the_exit_phase(monkeypatch):
+    node = stopped_node()
+    node.running = True
+    node.secondary_post_place_fetch = True
+    node.controller.robot_mode = 5
+    node.controller.current_joint = lambda: [0.] * 6
+    node._six_values = lambda _name: [0.] * 6
+    node._read_secondary_y_clearance = lambda: {
+        'right_y_m': .302, 'right_x_m': .485, 'right_z_m': .165, 'gap_y_m': .3,
+    }
+    monkeypatch.setattr(cycle_v5, 'time', SimpleNamespace(monotonic=lambda: 1., sleep=lambda _s: setattr(node, 'cycle_enabled', False)))
+    with pytest.raises(RuntimeError, match='cycle cancelled'):
+        node._close_secondary_zone_for_pick()
+    assert not node.secondary_pick_guard_waiting_for_exit
+    assert node.secondary_pick_guard_active
+    assert node.secondary_guard_xyz_publisher.publish.call_args.args[0].data[4] == 2.
+
+
+def test_heartbeat_loss_revokes_exit_permission_while_101_remains_at_startup(monkeypatch):
+    node = stopped_node()
+    node.running = True
+    node.secondary_post_place_fetch = True
+    node.controller.robot_mode = 5
+    node.controller.current_joint = lambda: [0.] * 6
+    node._six_values = lambda _name: [0.] * 6
+    node._secondary_vla_heartbeat_fresh = lambda: False
+    observed = []
+
+    def stop_after_wait(_seconds):
+        observed.append(node.secondary_pick_guard_waiting_for_exit)
+        node.cycle_enabled = False
+
+    monkeypatch.setattr(cycle_v5, 'time', SimpleNamespace(monotonic=lambda: 1., sleep=stop_after_wait))
+    with pytest.raises(RuntimeError, match='cycle cancelled'):
+        node._close_secondary_zone_for_pick()
+    assert observed == [False]
+    assert node.secondary_pick_guard_active

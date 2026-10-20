@@ -305,12 +305,12 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "secondary_collision_x_lt_m",
-                default_value="0.535",
+                default_value="0.515",
                 description="102 User-0 TCP danger region requires X below this value",
             ),
             DeclareLaunchArgument(
                 "secondary_collision_z_gt_m",
-                default_value="0.075",
+                default_value="0.140",
                 description="102 User-0 TCP danger region requires Z above this value",
             ),
             DeclareLaunchArgument(
@@ -379,6 +379,26 @@ def generate_launch_description() -> LaunchDescription:
                 description=(
                     "Short vertical clearance used by the near-cube Tool-Rx flip"
                 ),
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_preflight_linear_step_m", default_value="0.005",
+                description="Near-cube path sampling distance; read-only kinematic preflight (m)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_preflight_rotation_step_deg", default_value="10.0",
+                description="Near-cube orientation sampling step (degrees)",
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_preflight_fast_jacobian", default_value="true",
+                description="Use a controller-verified local Jacobian with automatic query fallback",
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_preflight_fast_ik", default_value="true",
+                description="Use verified local IK for interior preflight samples, with controller FK audits and controller IK at segment endpoints",
+            ),
+            DeclareLaunchArgument(
+                "bottom_near_cube_preflight_min_sigma", default_value="0.025",
+                description="Minimum normalized Jacobian singular value for near-cube preflight",
             ),
             DeclareLaunchArgument(
                 "bottom_near_cube_preflight_recovery_lift_m",
@@ -1178,6 +1198,21 @@ def generate_launch_description() -> LaunchDescription:
                         "bottom_near_cube_flip_lift_m": ParameterValue(
                             LaunchConfiguration("bottom_near_cube_flip_lift_m"),
                             value_type=float,
+                        ),
+                        "bottom_near_cube_preflight_linear_step_m": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_preflight_linear_step_m"), value_type=float,
+                        ),
+                        "bottom_near_cube_preflight_rotation_step_deg": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_preflight_rotation_step_deg"), value_type=float,
+                        ),
+                        "bottom_near_cube_preflight_fast_jacobian": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_preflight_fast_jacobian"), value_type=bool,
+                        ),
+                        "bottom_near_cube_preflight_fast_ik": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_preflight_fast_ik"), value_type=bool,
+                        ),
+                        "bottom_near_cube_preflight_min_sigma": ParameterValue(
+                            LaunchConfiguration("bottom_near_cube_preflight_min_sigma"), value_type=float,
                         ),
                         "bottom_near_cube_preflight_recovery_lift_m": ParameterValue(
                             LaunchConfiguration(

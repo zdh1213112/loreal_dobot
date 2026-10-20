@@ -60,6 +60,10 @@ from .offset_grasp_geometry_v3 import camera_rotation_at_target_tcp, plan_offset
 from .controller_v3 import DobotNova5Controller, TcpPose
 from .d405_pipeline_performance import post_stop_wait_diagnostics
 from .turntable_barcode_recheck import TurntableBarcodeRecheckMixin
+from .near_cube_motion_safety import (
+    with_near_cube_preflight_session,
+    NEAR_CUBE_SAFETY_DEFAULTS, NearCubeMotionSafetyMixin, NearCubePreflightError,
+)
 from .dobot_dh_api_v3 import (
     GRIP_DROPPED,
     GRIP_GRIPPED,
@@ -325,8 +329,17 @@ class CycleTiming:
     cycle_id: str
     started_at: float = field(default_factory=time.monotonic)
     stages: list[dict[str, object]] = field(default_factory=list)
+    stage_intervals: list[tuple[float, float]] = field(default_factory=list)
+    unpositioned_duration_s: float = 0.0
 
-    def add_stage(self, name: str, duration_s: float, outcome: str) -> None:
+    def add_stage(
+        self, name: str, duration_s: float, outcome: str,
+        *, started_at: Optional[float] = None,
+    ) -> None:
+        if started_at is None:
+            self.unpositioned_duration_s += round(float(duration_s), 4)
+        else:
+            self.stage_intervals.append((float(started_at), float(started_at) + duration_s))
         self.stages.append(
             {
                 "stage": str(name),
@@ -336,8 +349,17 @@ class CycleTiming:
         )
 
     def summary(self, outcome: str) -> dict[str, object]:
-        total_s = time.monotonic() - self.started_at
-        accounted_s = sum(float(stage["duration_s"]) for stage in self.stages)
+        finished_at = time.monotonic()
+        total_s = finished_at - self.started_at
+        # Parent stages include their children. Count the union of measured
+        # intervals so nested recovery timings do not inflate wall time.
+        accounted_s = self.unpositioned_duration_s
+        covered_until = self.started_at
+        for start, end in sorted(self.stage_intervals):
+            interval_start = max(start, self.started_at, covered_until)
+            interval_end = min(end, finished_at)
+            accounted_s += max(0.0, interval_end - interval_start)
+            covered_until = max(covered_until, interval_end)
         return {
             "event": "cycle_summary",
             "cycle_id": self.cycle_id,
@@ -360,7 +382,7 @@ class PregraspObservation:
     tcp_linear_speed_mps: Optional[float] = None
 
 
-class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
+class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, NearCubeMotionSafetyMixin, Node):
     def __init__(self) -> None:
         super().__init__("nova5_cosmetic_box_single_arm_cycle_v3")
 
@@ -851,6 +873,8 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         # rolls through 45 degrees. Keep a modest margin without pushing the
         # tilted Tool-1 pose unnecessarily far toward the reach boundary.
         self.declare_parameter("bottom_near_cube_flip_lift_m", 0.030)
+        for name, default in NEAR_CUBE_SAFETY_DEFAULTS.items():
+            self.declare_parameter(name, default)
         # If the tilted near-cube preflight is unreachable, move the box once
         # toward User X- while holding it upright, put it back on the table,
         # and retry the normal flip sequence at the new XY.
@@ -975,6 +999,8 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         self.latest_pregrasp_pose: Optional[TcpPose] = None
         self.latest_pregrasp_pose_received_at = 0.0
         self.pregrasp_observations: deque[PregraspObservation] = deque(maxlen=40)
+        self.d405_transform_suspended = False
+        self.near_cube_held_motion_fault = ""
         self.d405_reacquire_request_epoch = 0.0
         self.d405_reacquire_applied_epoch = 0.0
         self.d405_reacquire_capture_epoch = 0.0
@@ -1785,7 +1811,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
             raise
         finally:
             duration_s = time.monotonic() - started_at
-            timing.add_stage(stage, duration_s, outcome)
+            timing.add_stage(stage, duration_s, outcome, started_at=started_at)
             self._emit_timing(
                 {
                     "event": "stage",
@@ -2245,6 +2271,13 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 return
 
             with self.secondary_safety_lock:
+                if getattr(self, "near_cube_held_motion_fault", ""):
+                    self.secondary_auto_resume_requested.clear()
+                    self._publish_status(
+                        "automatic restart blocked by near-cube held-motion fault; "
+                        "manual material recovery is required"
+                    )
+                    return
                 if (
                     not self.running
                     or self.secondary_safety_shutdown.is_set()
@@ -2611,6 +2644,8 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 self.secondary_safety_shutdown.wait(0.05)
 
     def _transform_vision_pose(self, msg: PoseStamped, source: str) -> Optional[TcpPose]:
+        if not self._d405_transform_allowed():
+            return None
         if msg.header.frame_id.strip() != str(self.get_parameter("camera_frame_id").value):
             self.get_logger().error(
                 f"Ignoring {source} vision frame {msg.header.frame_id!r}"
@@ -3924,6 +3959,8 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
             or early_top_enabled
         ):
             enabled = False
+        if enabled and not self._resume_d405_pose_processing():
+            enabled = False
         if enabled:
             self._mark_d405_reacquisition()
         message = Bool()
@@ -4383,6 +4420,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                     pending_material_event_number = None
             self._publish_status("cycle stopped")
         except Exception as exc:
+            self._suspend_d405_after_fault(str(exc))
             self._set_top_surface_barcode_window(False)
             with self.secondary_safety_lock:
                 resume_pending = self.secondary_auto_resume_requested.is_set()
@@ -4409,6 +4447,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         require_cycle_active: bool = False,
         open_gripper: bool = True,
     ) -> None:
+        self._require_near_cube_recovery_complete()
         motion = self._motion_profile()
         if require_cycle_active:
             self._require_cycle_active("before startup joint motion")
@@ -4894,6 +4933,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 self._finish_cycle_timing("success")
                 self._publish_status("single cycle completed")
         except Exception:
+            self._suspend_d405_after_fault("single-cycle fault")
             self._set_top_surface_barcode_window(False)
             self._finish_cycle_timing("fault")
             raise
@@ -4905,6 +4945,8 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 self._set_d405_pretracking(False)
 
     def _request_vision_target(self, require_cycle_enabled: bool = True) -> Optional[tuple[TcpPose, float, float, float]]:
+        if not self._resume_d405_pose_processing():
+            return None
         self._mark_d405_reacquisition()
         with self.data_lock:
             previous_pose = self.pose_count
@@ -7452,58 +7494,21 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         flip_rx_deg: float,
         restore_rx_deg: float,
     ) -> None:
-        """Validate every remaining low flip pose before closing the jaws."""
-
+        """Screen every linear/rotational segment before closing the jaws."""
         current = self._current_command_pose()
-        user_index = int(self.get_parameter("user_index").value)
-        tool_index = int(self.get_parameter("command_tool_index").value)
         lifted = TcpPose(
-            current.x,
-            current.y,
-            grasp_z + lift_m,
-            current.rx,
-            current.ry,
-            current.rz,
-        )
-        lifted_joints = self.controller.inverse_kinematics(
-            lifted,
-            user_index=user_index,
-            tool_index=tool_index,
-            joint_near=self.controller.current_joint(),
+            current.x, current.y, grasp_z + lift_m,
+            current.rx, current.ry, current.rz,
         )
         flipped = self._tool_rx_target_pose(lifted, flip_rx_deg)
-        flipped_joints = self.controller.inverse_kinematics(
-            flipped,
-            user_index=user_index,
-            tool_index=tool_index,
-            joint_near=lifted_joints,
-        )
         returned = TcpPose(
-            flipped.x,
-            flipped.y,
-            grasp_z,
-            flipped.rx,
-            flipped.ry,
-            flipped.rz,
-        )
-        returned_joints = self.controller.inverse_kinematics(
-            returned,
-            user_index=user_index,
-            tool_index=tool_index,
-            joint_near=flipped_joints,
+            flipped.x, flipped.y, grasp_z, flipped.rx, flipped.ry, flipped.rz,
         )
         restored = self._tool_rx_target_pose(returned, restore_rx_deg)
-        self.controller.inverse_kinematics(
-            restored,
-            user_index=user_index,
-            tool_index=tool_index,
-            joint_near=returned_joints,
-        )
-        self._publish_status(
-            "near-cube bottom flip preflight passed before grasp: "
-            f"lift={lift_m*1000:.1f}mm, Tool Rx={flip_rx_deg:+.1f}deg, "
-            "table return and pickup-attitude restore are reachable"
-        )
+        self._check_near_cube_path(current, [
+            ("short lift", lifted), ("Tool-Rx flip", flipped),
+            ("table return", returned), ("pickup attitude restore", restored),
+        ], "near-cube bottom flip")
 
     def _relocate_near_cube_after_preflight_failure(
         self,
@@ -7554,35 +7559,15 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         user_index = int(self.get_parameter("user_index").value)
         tool_index = int(self.get_parameter("command_tool_index").value)
 
-        # Check the complete recovery chain before closing the jaws.  The
-        # shifted and dropped targets use the joints returned by the preceding
-        # target so the controller keeps one continuous branch.
-        current_joints = self.controller.current_joint()
-        lifted_joints = self.controller.inverse_kinematics(
-            TcpPose(
-                current.x,
-                current.y,
-                lifted_z,
-                current.rx,
-                current.ry,
-                current.rz,
-            ),
-            user_index=user_index,
-            tool_index=tool_index,
-            joint_near=current_joints,
-        )
-        shifted_joints = self.controller.inverse_kinematics(
-            shifted,
-            user_index=user_index,
-            tool_index=tool_index,
-            joint_near=lifted_joints,
-        )
-        self.controller.inverse_kinematics(
-            dropped,
-            user_index=user_index,
-            tool_index=tool_index,
-            joint_near=shifted_joints,
-        )
+        # The upright fallback is also checked as complete sampled paths
+        # before it closes on the box; moving it inward is not assumed safe.
+        self._check_near_cube_path(current, [
+            ("upright recovery lift", TcpPose(
+                current.x, current.y, lifted_z, current.rx, current.ry, current.rz,
+            )),
+            ("recovery User X- shift", shifted),
+            ("recovery table return", dropped),
+        ], "near-cube relocation")
         self._publish_status(
             "near-cube flip preflight fallback verified: grasp upright, "
             f"lift {lift_m*1000.0:.1f}mm, User X- shift {shift_m*1000.0:.1f}mm, "
@@ -7597,14 +7582,14 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
             )
         with self._timed_stage("bottom_near_cube_preflight_recovery_grasp_confirm"):
             self._confirm_grasp_before_lift(max_opening, max_opening)
-        with self._timed_stage("bottom_near_cube_preflight_recovery_lift"):
+        with self._timed_stage("bottom_near_cube_preflight_recovery_lift"), self._near_cube_held_motion_guard("relocation lift"):
             self._bottom_center_linear_z(
                 lifted_z,
                 motion,
                 "near-cube preflight recovery lift",
                 lifting=True,
             )
-        with self._timed_stage("bottom_near_cube_preflight_recovery_shift"):
+        with self._timed_stage("bottom_near_cube_preflight_recovery_shift"), self._near_cube_held_motion_guard("relocation shift"):
             self._require_cycle_active("before near-cube preflight recovery User X- shift")
             self.controller.move_linear_tcp(
                 shifted,
@@ -7627,7 +7612,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 raise RuntimeError(
                     "near-cube preflight recovery User X- shift target was not reached"
                 )
-        with self._timed_stage("bottom_near_cube_preflight_recovery_lower"):
+        with self._timed_stage("bottom_near_cube_preflight_recovery_lower"), self._near_cube_held_motion_guard("relocation lower"):
             self._bottom_center_linear_z(
                 current.z,
                 motion,
@@ -7883,6 +7868,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         ):
             raise RuntimeError("Bottom recovery did not reach J6 zero")
 
+    @with_near_cube_preflight_session
     def _execute_turntable_near_cube_bottom_flip(
         self,
         grasp_pose: TcpPose,
@@ -7968,6 +7954,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                     shift_m=recovery_shift_m,
                 )
             with self._timed_stage("bottom_near_cube_tool_rx_minus_45_retry"):
+                self._check_near_cube_tool_rx(initial_rx_deg, "relocated pickup attitude")
                 self._bottom_center_tool_rx(
                     initial_rx_deg,
                     "near-cube retry pickup Tool-Rx rotation",
@@ -7980,6 +7967,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
 
         with self._timed_stage("bottom_near_cube_tool_rx_minus_45_pick"):
             try:
+                self._check_near_cube_tool_rx(initial_rx_deg, "initial pickup attitude")
                 self._bottom_center_tool_rx(
                     initial_rx_deg,
                     "near-cube bottom flip pickup Tool-Rx rotation",
@@ -7989,13 +7977,14 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 # detected XY.  At this point the jaws are open and the TCP
                 # is still upright, so the same one-time relocation recovery
                 # is safe to use before retrying the pickup attitude.
-                if "InverseKin failed" not in str(exc):
+                if self.controller.robot_mode in (9, 11):
+                    raise
+                if not isinstance(exc, NearCubePreflightError) and "InverseKin failed" not in str(exc):
                     raise
                 relocate_and_retry(
                     restore_upright=False,
                     reason=(
-                        "near-cube initial Tool-Rx -45deg inverse-kinematics "
-                        "preflight failed"
+                        f"near-cube initial Tool-Rx -45deg path preflight failed: {exc}"
                     ),
                 )
 
@@ -8022,7 +8011,10 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                             f"{requested_lift_m*1000:.1f}->{candidate_lift_m*1000:.1f}mm"
                         )
                     return candidate_lift_m
-                except RuntimeError as exc:
+                except NearCubePreflightError as exc:
+                    self._publish_status(
+                        f"near-cube preflight rejected lift={candidate_lift_m*1000:.1f}mm: {exc}"
+                    )
                     last_preflight_error = exc
             assert last_preflight_error is not None
             raise last_preflight_error
@@ -8030,7 +8022,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         with self._timed_stage("bottom_near_cube_motion_preflight"):
             try:
                 lift_m = run_preflight()
-            except RuntimeError as _first_preflight_error:
+            except NearCubePreflightError as _first_preflight_error:
                 # The jaws are still open. Recover the known upright attitude,
                 # move the box once toward User X-, and retry at the new XY.
                 if recovery_used:
@@ -8048,12 +8040,12 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 relocate_and_retry(
                     restore_upright=True,
                     reason=(
-                        "near-cube flip preflight failed at the original XY"
+                        f"near-cube flip preflight failed at the original XY: {_first_preflight_error}"
                     ),
                 )
                 try:
                     lift_m = run_preflight()
-                except RuntimeError:
+                except NearCubePreflightError:
                     # The retry preflight leaves the jaws open at -45deg;
                     # restore the upright attitude before propagating the fault.
                     try:
@@ -8073,14 +8065,14 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         with self._timed_stage("bottom_near_cube_grasp_confirm"):
             self._confirm_grasp_before_lift(max_opening, max_opening)
 
-        with self._timed_stage("bottom_near_cube_short_lift"):
+        with self._timed_stage("bottom_near_cube_short_lift"), self._near_cube_held_motion_guard("short_lift"):
             self._bottom_center_linear_z(
                 grasp_pose.z + lift_m,
                 motion,
                 "near-cube bottom flip table-clear lift",
                 lifting=True,
             )
-        with self._timed_stage("bottom_near_cube_tool_rx_plus_90"):
+        with self._timed_stage("bottom_near_cube_tool_rx_plus_90"), self._near_cube_held_motion_guard("tool_rx_plus_90"):
             self._validate_grasp_feedback(
                 "before near-cube Tool-Rx +90deg flip", max_opening
             )
@@ -8095,7 +8087,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
         # Returning to the original grasp TCP Z places the near-cube back on
         # the same support surface without embedding the configured Tool-1
         # turntable surface Z directly into a TCP-centre command.
-        with self._timed_stage("bottom_near_cube_return_table"):
+        with self._timed_stage("bottom_near_cube_return_table"), self._near_cube_held_motion_guard("return_table"):
             self._bottom_center_linear_z(
                 grasp_pose.z,
                 motion,
