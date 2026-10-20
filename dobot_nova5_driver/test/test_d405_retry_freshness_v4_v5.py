@@ -2,6 +2,7 @@
 
 import ast
 import importlib
+import json
 import logging
 import threading
 from collections import deque
@@ -123,6 +124,69 @@ def test_post_stop_fresh_fast_path_has_no_added_wait(rig):
     rig.sample(.01)
     assert rig.node._wait_for_pretracked_target_after_stop()[0] == rig.pose
     assert rig.clock.sleeps == []
+
+
+def timeout_diagnostic(rig):
+    messages = [call.args[0] for call in rig.node.get_logger().warning.call_args_list]
+    return json.loads(next(message.split('diagnostics=', 1)[1]
+                           for message in messages if 'diagnostics=' in message))
+
+
+def test_post_stop_timeout_reports_pending_ack_without_relaxing_barrier(rig):
+    rig.node._mark_d405_reacquisition()
+    rig.sample(.002)
+    rig.sample(.001)
+    assert rig.node._wait_for_pretracked_target_after_stop() is None
+    report = timeout_diagnostic(rig)
+    assert 'waiting_for_acquisition_ack' in report['waiting_for']
+    assert not hasattr(rig.node, 'last_accepted_target')
+
+
+def test_two_stable_messages_do_not_replace_the_required_tracking_pair(rig):
+    delivered = [False]
+
+    def deliver():
+        if not delivered[0]:
+            delivered[0] = True
+            rig.node.pose_count += 2
+            rig.sample()
+
+    rig.clock.on_sleep = deliver
+    assert rig.node._wait_for_pretracked_target_after_stop() is None
+    report = timeout_diagnostic(rig)
+    assert report['stable_topic_messages_since_wait'] == 2
+    assert report['fresh_tracking_samples'] == 1
+    assert 'insufficient_fresh_tracking_samples' in report['waiting_for']
+
+
+@pytest.mark.parametrize('failure,expected', [
+    ('position', 'position_unstable'), ('angle', 'angle_unstable'),
+    ('height', 'height_out_of_range'), ('length', 'length_out_of_range'),
+    ('aspect', 'invalid_aspect'),
+])
+def test_post_stop_timeout_preserves_last_rejected_pair_reason(rig, failure, expected):
+    first = rig.sample(.002)
+    last = rig.sample(.001)
+    if failure == 'position':
+        changed = rig.mod.TcpPose(rig.pose.x + .05, rig.pose.y, rig.pose.z, 180., 0., 0.)
+        rig.node.pregrasp_observations[-1] = rig.mod.PregraspObservation(
+            count=last.count, pose=changed, frame_time_s=last.frame_time_s,
+            received_at_monotonic=last.received_at_monotonic, tcp_linear_speed_mps=0.)
+    elif failure == 'angle':
+        changed = rig.mod.TcpPose(rig.pose.x, rig.pose.y, rig.pose.z, 180., 0., 50.)
+        rig.node.pregrasp_observations[-1] = rig.mod.PregraspObservation(
+            count=last.count, pose=changed, frame_time_s=last.frame_time_s,
+            received_at_monotonic=last.received_at_monotonic, tcp_linear_speed_mps=0.)
+    elif failure == 'height':
+        rig.node.latest_height_m = .2
+    elif failure == 'length':
+        rig.node.latest_length_m = .5
+    else:
+        rig.node.latest_aspect_ratio = float('nan')
+    assert rig.node._wait_for_pretracked_target_after_stop() is None
+    report = timeout_diagnostic(rig)
+    assert expected in report['last_pair_check']['failed_checks']
+    assert not hasattr(rig.node, 'last_accepted_target')
 
 
 def test_retry_waits_for_camera_reset_and_new_samples_before_departure(rig):
@@ -295,7 +359,8 @@ def test_camera_ack_occurs_in_capture_loop_and_does_not_lose_later_reset(rig):
     selected = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     ns = dict(time=rig.clock, Bool=SimpleNamespace, String=SimpleNamespace,
               logging=logging, acquisition_request_epoch_s=0., acquisition_applied_epoch_s=0.,
-              vision_result_pub=MagicMock(), trigger_requested=False)
+              vision_result_pub=MagicMock(), trigger_requested=False,
+              localization_timing=MagicMock())
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(script), 'exec'), ns)
     ns['pretracking_enable_callback'](SimpleNamespace(data=True))
     ns['vision_result_pub'].publish.assert_not_called()

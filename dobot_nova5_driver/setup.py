@@ -29,6 +29,7 @@ setup(
                 "README_cosmetic_box_single_arm.md",
                 "README_cosmetic_box_single_arm_v5.md",
                 "README_d405_grasp_retry_v4_v5.md",
+                "README_d405_localization_performance_v4_v5.md",
                 "README_d435_confirmation_v4_v5.md",
                 "README_cosmetic_box_turntable_v3.md",
                 "README_cosmetic_box_turntable_v3_fast_d435.md",

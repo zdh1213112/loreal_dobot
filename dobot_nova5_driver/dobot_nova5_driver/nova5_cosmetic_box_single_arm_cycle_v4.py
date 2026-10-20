@@ -58,6 +58,7 @@ except ImportError:
 from .offset_grasp_geometry_v3 import camera_rotation_at_target_tcp, plan_offset
 
 from .controller_v3 import DobotNova5Controller, TcpPose
+from .d405_pipeline_performance import post_stop_wait_diagnostics
 from .turntable_barcode_recheck import TurntableBarcodeRecheckMixin
 from .dobot_dh_api_v3 import (
     GRIP_DROPPED,
@@ -3509,6 +3510,8 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 at_startup = self.early_top_at_startup
             should_observe = (
                 at_startup
+                and not barcode
+                and not visible_barcode()
                 and bool(self.get_parameter("d405_early_top_barcode_enabled").value)
                 and bool(self.get_parameter("top_surface_barcode_enabled").value)
             )
@@ -3669,14 +3672,23 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                         "stopping turntable but keeping D435 armed through settling"
                     )
             finally:
-                with self.turntable_lock:
-                    state = self.turntable_state
-                if state == "RUNNING":
-                    self._toggle_turntable("RUNNING", "STOPPED", "stop")
-                if turntable_was_started and self.turntable_state == "STOPPED":
-                    self.last_turntable_stop_monotonic = time.monotonic()
-                    self.last_turntable_stop_epoch = time.time()
-                    self._notify_d405_post_stop_revalidate()
+                # Side confirmation has priority. Stop unnecessary top work
+                # before the blocking stop pulse, not after stop/settle.
+                try:
+                    if top_window_armed and (barcode or visible_barcode()):
+                        self._set_top_surface_barcode_window(False)
+                        top_window_armed = False
+                finally:
+                    # A ROS disarm publication error must never skip the
+                    # hardware stop pulse or post-stop freshness barrier.
+                    with self.turntable_lock:
+                        state = self.turntable_state
+                    if state == "RUNNING":
+                        self._toggle_turntable("RUNNING", "STOPPED", "stop")
+                    if turntable_was_started and self.turntable_state == "STOPPED":
+                        self.last_turntable_stop_monotonic = time.monotonic()
+                        self.last_turntable_stop_epoch = time.time()
+                        self._notify_d405_post_stop_revalidate()
 
             settle_s = max(
                 0.0,
@@ -3954,6 +3966,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                 self.last_turntable_stop_handoff_count,
                 getattr(self, "d405_reacquire_handoff_count", 0),
             )
+            baseline_stable_count = self.pose_count
         max_age_s = max(0.05, float(self.get_parameter("pregrasp_pose_max_age_s").value))
         required = max(1, int(self.get_parameter("d405_post_stop_samples").value))
         timeout_s = max(
@@ -3961,6 +3974,7 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
             float(self.get_parameter("d405_post_stop_wait_timeout_s").value),
         )
         deadline = time.monotonic() + timeout_s
+        last_pair_check = None
         self._publish_status(
             "turntable stopped; consuming fresh post-stop D405 tracking frames"
         )
@@ -4036,6 +4050,17 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                         (sample.pose.rz, averaged.rz),
                     )
                 )
+                # Diagnostic only: accepting this pair still uses exactly the
+                # original conditions below. Keep the last evaluated pair so
+                # its failure is visible even if it ages out before timeout.
+                last_pair_check = {
+                    "checked_at_epoch": now_epoch,
+                    "position_spread_mm": position_spread * 1000.0,
+                    "angle_spread_deg": angle_spread,
+                    "aspect_ratio": float(aspect_ratio),
+                    "height_m": float(height_m),
+                    "length_m": float(length_m),
+                }
                 if (
                     position_spread
                     <= float(self.get_parameter("vision_position_stability_m").value)
@@ -4063,9 +4088,52 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, Node):
                         )
                         return averaged, width_m, height_m, length_m
             time.sleep(VISION_REQUEST_POLL_S)
+        with self.data_lock:
+            request_epoch = getattr(self, "d405_reacquire_request_epoch", 0.0)
+            applied_epoch = getattr(self, "d405_reacquire_applied_epoch", 0.0)
+            diagnostics = post_stop_wait_diagnostics(
+                observations=list(self.pregrasp_observations),
+                baseline_count=baseline_count, stop_s=stop_s,
+                frame_barrier=max(
+                    float(self.last_turntable_stop_epoch), request_epoch,
+                    getattr(self, "d405_reacquire_capture_epoch", 0.0),
+                ),
+                request_epoch=request_epoch, applied_epoch=applied_epoch,
+                now_monotonic=time.monotonic(), now_epoch=time.time(),
+                max_age_s=max_age_s, required=required,
+                handoff_fresh=self.handoff_state_count > baseline_handoff,
+                handoff_clear=bool(self.latest_handoff_clear),
+                handoff_state=getattr(self, "latest_handoff_state", "UNKNOWN"),
+                metadata={
+                    "width": self.latest_width_m, "length": self.latest_length_m,
+                    "height": self.latest_height_m, "aspect": self.latest_aspect_ratio,
+                },
+                stable_messages_since_wait=self.pose_count - baseline_stable_count,
+                last_pair_check=last_pair_check,
+            )
+        if last_pair_check is not None:
+            last_pair_check["limits"] = {
+                "position_spread_mm": float(self.get_parameter("vision_position_stability_m").value) * 1000.0,
+                "angle_spread_deg": float(self.get_parameter("vision_angle_stability_deg").value),
+                "height_m": [float(self.get_parameter("min_box_height_m").value), float(self.get_parameter("max_box_height_m").value)],
+                "length_m": [float(self.get_parameter("min_box_length_m").value), float(self.get_parameter("max_box_length_m").value)],
+            }
+            limits = last_pair_check["limits"]
+            last_pair_check["failed_checks"] = [
+                name for name, passed in (
+                    ("position_unstable", last_pair_check["position_spread_mm"] <= limits["position_spread_mm"]),
+                    ("angle_unstable", last_pair_check["angle_spread_deg"] <= limits["angle_spread_deg"]),
+                    ("invalid_aspect", math.isfinite(last_pair_check["aspect_ratio"]) and last_pair_check["aspect_ratio"] >= 1.0),
+                    ("height_out_of_range", limits["height_m"][0] <= last_pair_check["height_m"] <= limits["height_m"][1]),
+                    ("length_out_of_range", limits["length_m"][0] <= last_pair_check["length_m"] <= limits["length_m"][1]),
+                ) if not passed
+            ]
+            for name, value in list(last_pair_check.items()):
+                if isinstance(value, float) and not math.isfinite(value):
+                    last_pair_check[name] = str(value)
         self.get_logger().warning(
             "No valid post-stop D405 tracking target arrived within "
-            f"{timeout_s:.2f}s"
+            f"{timeout_s:.2f}s; diagnostics=" + json.dumps(diagnostics)
         )
         if bool(self.get_parameter("d405_pretracking_fallback_request").value):
             return self._request_vision_target(require_cycle_enabled=require_cycle_enabled)

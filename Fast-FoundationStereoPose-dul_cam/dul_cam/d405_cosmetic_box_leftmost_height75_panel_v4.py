@@ -16,6 +16,7 @@ Differences from ``d405_local_ransac_coarse_lock_wait_lock_manual_roi_exposure_p
 * embeds the V3 D435 turntable-barcode preview and forwards its ROI gestures.
 """
 
+import copy
 import json
 import logging
 import os
@@ -50,6 +51,11 @@ from dobot_nova5_driver.handoff_clearance_v3 import (
     measure_voxel_overlap,
 )
 from dobot_nova5_driver.gripper_width_policy_v3 import select_gripper_width
+from dobot_nova5_driver.d405_pipeline_performance import (
+    DiagnosticWriter,
+    LocalizationTiming,
+    paint_depth_sorted_points,
+)
 from dobot_nova5_driver.top_surface_geometry_v3 import (
     fit_top_surface_axes,
     normalized_plane,
@@ -383,6 +389,7 @@ d435_preview_lock = threading.Lock()
 combined_mouse_owner = None
 d405_output_save_queue = Queue()
 d405_output_save_stop = object()
+localization_timing = LocalizationTiming()
 
 
 def initialize_initial_position_frame_output() -> None:
@@ -1096,17 +1103,38 @@ def is_current_acquisition_frame(frame_stamp_s: float) -> bool:
     )
 
 
+def d405_reacquisition_pending(stage: str) -> bool:
+    """Yield at a stage boundary, never interrupt an in-flight GPU call."""
+    pending = acquisition_request_epoch_s > acquisition_applied_epoch_s
+    if pending:
+        logging.info(
+            "[D405 reacquire] skipping old iteration after %s; "
+            "pending_request_epoch=%.9f, applied_request_epoch=%.9f",
+            stage, acquisition_request_epoch_s, acquisition_applied_epoch_s,
+        )
+    return pending
+
+
 def acknowledge_d405_acquisition() -> None:
     """Report the applied reset and the earliest permissible frame timestamp."""
 
     global acquisition_applied_epoch_s, acquisition_capture_epoch_s
     request_epoch = acquisition_request_epoch_s
     capture_epoch = time.time()
+    was_pending = request_epoch > acquisition_applied_epoch_s
     acquisition_applied_epoch_s = request_epoch
     acquisition_capture_epoch_s = capture_epoch
+    localization_timing.start()
     message = String()
     message.data = f"acquisition_started:{request_epoch:.9f}:{capture_epoch:.9f}"
     vision_result_pub.publish(message)
+    if was_pending:
+        logging.info(
+            "[D405 acquisition] request_to_start_ms=%.1f; "
+            "request_epoch=%.9f, capture_barrier_epoch=%.9f",
+            max(0.0, capture_epoch - request_epoch) * 1000.0,
+            request_epoch, capture_epoch,
+        )
 
 
 def pretracking_enable_callback(msg: Bool) -> None:
@@ -1204,25 +1232,19 @@ def publish_top_surface_barcode(value: str) -> None:
     top_surface_barcode_result_pub.publish(result)
 
 
-def save_top_barcode_debug_frame(
+def write_top_barcode_debug_frame(
     image: np.ndarray,
     mask: np.ndarray | None,
     target_corners: np.ndarray | None,
     debug: dict,
     hit,
     *,
-    force: bool = False,
     capture: dict | None = None,
+    requested: bool = False,
+    model_path: str = "",
+    confidence_threshold: float = 0.40,
 ) -> None:
-    """Write an annotated top-barcode frame and expose its decoder evidence."""
-
-    global top_surface_barcode_last_debug_write_at
-    now = time.monotonic()
-    if capture is None and not force and now - top_surface_barcode_last_debug_write_at < TOP_BARCODE_DEBUG_WRITE_PERIOD_S:
-        return
-    top_surface_barcode_last_debug_write_at = now
-    if image is None or np.asarray(image).size == 0:
-        return
+    """Render/write an owned diagnostic snapshot in the background thread."""
     annotated = np.asarray(image).copy()
     if annotated.ndim != 3:
         annotated = cv2.cvtColor(annotated, cv2.COLOR_GRAY2BGR)
@@ -1259,7 +1281,7 @@ def save_top_barcode_debug_frame(
     if accepted is not None and len(accepted) == 4:
         x, y, w, h = [int(v) for v in accepted]
         cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 3, cv2.LINE_AA)
-    state = "ARMED" if top_surface_barcode_requested else "DISARMED"
+    state = "ARMED" if requested else "DISARMED"
     result_text = f"TOP BARCODE {state} | {debug.get('message', 'unknown')}"
     cv2.rectangle(annotated, (4, 4), (min(annotated.shape[1] - 4, 1000), 42), (0, 0, 0), -1)
     cv2.putText(annotated, result_text[:150], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0) if hit else (0, 220, 255), 1, cv2.LINE_AA)
@@ -1289,13 +1311,47 @@ def save_top_barcode_debug_frame(
             metadata = dict(capture, debug=debug,
                             detected=hit is not None,
                             value=None if hit is None else hit.value,
-                            model_path=top_surface_barcode_detector.model_path,
-                            confidence_threshold=top_surface_barcode_detector.model_confidence)
+                            model_path=model_path,
+                            confidence_threshold=confidence_threshold)
             with open(os.path.join(folder, stem + ".json"), "w", encoding="utf-8") as handle:
                 json.dump(metadata, handle, ensure_ascii=False, indent=2)
 
     except (OSError, cv2.error) as exc:
         logging.warning(f"[top-barcode] debug frame save failed: {exc}")
+
+
+def save_top_barcode_debug_frame(
+    image, mask, target_corners, debug, hit, *, force=False, capture=None,
+) -> None:
+    """Snapshot inputs without PNG compression or disk I/O in the camera loop."""
+
+    global top_surface_barcode_last_debug_write_at
+    now = time.monotonic()
+    if capture is None and not force and now - top_surface_barcode_last_debug_write_at < TOP_BARCODE_DEBUG_WRITE_PERIOD_S:
+        return
+    if image is None or np.asarray(image).size == 0:
+        return
+    top_surface_barcode_last_debug_write_at = now
+    top_barcode_debug_writer.submit(
+        np.asarray(image).copy(),
+        None if mask is None else np.asarray(mask).copy(),
+        None if target_corners is None else np.asarray(target_corners).copy(),
+        copy.deepcopy(debug),
+        copy.deepcopy(hit),
+        capture=copy.deepcopy(capture),
+        requested=bool(top_surface_barcode_requested),
+        model_path=top_surface_barcode_detector.model_path,
+        confidence_threshold=top_surface_barcode_detector.model_confidence,
+    )
+
+
+def top_barcode_attempt_current(capture) -> bool:
+    """Never complete an attempt after its observation window was superseded."""
+    return (
+        top_surface_barcode_requested
+        and capture["session"] == top_barcode_capture_session
+        and capture["acquisition"] == acquisition_request_epoch_s
+    )
 
 
 def clamp_image_point(x: int, y: int) -> tuple[int, int]:
@@ -1705,11 +1761,8 @@ def render_cloud(
     scale = 520.0
     px = (CLOUD_VIEW_W * 0.52 + view[:, 0] * scale).astype(np.int32)
     py = (CLOUD_VIEW_H * 0.58 - view[:, 1] * scale).astype(np.int32)
-    valid = (px >= 0) & (px < CLOUD_VIEW_W) & (py >= 0) & (py < CLOUD_VIEW_H)
     bgr = np.clip(cols[:, ::-1] * 255.0, 0, 255).astype(np.uint8)
-    for idx in np.argsort(view[:, 2])[::-1]:
-        if valid[idx]:
-            canvas[py[idx], px[idx]] = bgr[idx]
+    paint_depth_sorted_points(canvas, px, py, view[:, 2], bgr)
     target_count = 0
     if tracked_target_points is not None:
         target_pts = np.asarray(tracked_target_points, dtype=np.float64)
@@ -2023,6 +2076,8 @@ top_surface_barcode_last_hit = None
 top_surface_barcode_last_debug_at = 0.0
 top_surface_barcode_last_debug_write_at = 0.0
 
+top_barcode_debug_writer = DiagnosticWriter(write_top_barcode_debug_frame)
+
 if ENABLE_LOCAL_WINDOWS:
     cv2.namedWindow(LOCAL_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(LOCAL_WINDOW_NAME, LOCAL_TOP_WIDTH, LOCAL_WINDOW_HEIGHT)
@@ -2097,6 +2152,7 @@ try:
             pending_stable_target_samples.clear()
             publish_handoff_clearance("WAIT_TARGET", clear=False)
             flush_frames = 0 if is_fast_reacquire else CAPTURE_FLUSH_FRAMES
+            capture_started = time.perf_counter()
             if is_fast_reacquire:
                 logging.info(
                     "[D405] Starting immediate in-request reacquisition from the "
@@ -2130,10 +2186,18 @@ try:
             # Match the reliable V3 fast acquisition: run YOLO on the entire
             # frame, then use the manual ROI only to accept/reject candidate
             # centres. A rotating box can cross the padded compute ROI edge.
+            localization_timing.record("capture", capture_started)
+            if d405_reacquisition_pending("capture"):
+                continue
+            yolo_started = time.perf_counter()
             processing_roi = None
             results = yolo_model(detection_color, conf=0.6, verbose=False)#置信度参数设置目前0.6
+            if d405_reacquisition_pending("object_yolo"):
+                continue
             if results and results[0].obb is not None and len(results[0].obb) > 0:
                 detected_obbs = results[0].obb.xyxyxyxy.cpu().numpy()
+                if d405_reacquisition_pending("object_yolo_transfer"):
+                    continue
                 roi_for_request = get_manual_roi()
                 if roi_for_request is not None:
                     left, top, right, bottom = roi_for_request
@@ -2174,6 +2238,9 @@ try:
                 last_yolo_obbs = None
                 logging.warning("[YOLO] No cosmetic box detected.")
                 publish_vision_result(False, "no_cosmetic_box")
+            localization_timing.record("object_yolo", yolo_started)
+            if d405_reacquisition_pending("object_yolo_result"):
+                continue
             trigger_requested = False
             if pretracking_enabled:
                 standby_next_reacquire_at = (
@@ -2189,6 +2256,8 @@ try:
             else pipeline.wait_for_frames()
         )
         camera_frame_index += 1
+        if localization_timing.active:
+            localization_timing.frames += 1
         # Use the D405 device capture time mapped to the host Unix clock.  The
         # Dobot feedback history uses the controller's Unix-ms TimeStamp, so
         # both sides now refer to the same physical instant rather than the
@@ -2197,6 +2266,8 @@ try:
         frame_stamp_s, _ = frame_capture_stamp(frames, frame_return_s)
         frame_stamp = host_seconds_to_ros_time(frame_stamp_s)
         color_bgr = np.asanyarray(frames.get_color_frame().get_data())
+        if d405_reacquisition_pending("next_capture"):
+            continue
 
         if reset_requested:
             try:
@@ -2228,6 +2299,7 @@ try:
                 clear_target_display_requested = False
             reset_requested = False
 
+        sam_track_started = time.perf_counter()
         if sam_initialized:
             object_ids, mask_logits = sam2_predictor.track(color_bgr)
             current_mask = (
@@ -2239,6 +2311,9 @@ try:
             )
             tracking_frames_without_height += 1
 
+        localization_timing.record("sam_track", sam_track_started)
+        if d405_reacquisition_pending("sam_track"):
+            continue
         # The 2-D hit is only a candidate. The current frame's FFS top-plane
         # fit below must verify its actual 3-D barcode footprint before any
         # result can be sent to the robot.
@@ -2247,6 +2322,7 @@ try:
         top_barcode_plane = None
         top_barcode_points = None
         top_barcode_uv = None
+        top_decode_started = time.perf_counter()
         if (
             top_surface_barcode_requested
             and not top_surface_barcode_reported
@@ -2256,6 +2332,7 @@ try:
         ):
             top_surface_barcode_last_attempt_at = time.monotonic()
             top_barcode_capture = {"session": top_barcode_capture_session,
+                       "acquisition": acquisition_request_epoch_s,
                        "attempt_ns": time.time_ns(), "phase": top_barcode_capture_phase,
                        "robot_status": latest_cycle_status}
             try:
@@ -2266,6 +2343,9 @@ try:
                     # target. The display corners update later in the loop
                     # and can clip the expanding face during descent.
                     None,
+                    cancel_check=lambda capture=top_barcode_capture: (
+                        not top_barcode_attempt_current(capture)
+                    ),
                 )
                 top_surface_barcode_last_debug = dict(
                     top_surface_barcode_detector.last_debug
@@ -2300,10 +2380,14 @@ try:
                 if now - top_surface_barcode_last_hit_at > 2.0:
                     logging.warning(f"[top-barcode] detection failed: {exc}")
                     top_surface_barcode_last_hit_at = now
+        localization_timing.record("top_barcode", top_decode_started)
+        if d405_reacquisition_pending("top_barcode"):
+            continue
 
         # A moving turntable invalidates the old selection cloud even when
         # SAM2 still follows the box. Reuse it only for a non-pretracking
         # request whose scene remains stationary during stable-frame checks.
+        stereo_started = time.perf_counter()
         reuse_selection_cloud = (
             locked_cloud_points is not None
             and pending_yolo_obbs is None
@@ -2345,6 +2429,8 @@ try:
             with torch.amp.autocast("cuda", enabled=True, dtype=AMP_DTYPE):
                 disparity = ffs_model.forward(image0_p, image1_p, iters=VALID_ITERS, test_mode=True, optimize_build_volume="pytorch1")
             disparity = padder.unpad(disparity.float()).data.cpu().numpy().reshape(crop_height, crop_width).clip(0, None)
+            if d405_reacquisition_pending("stereo_inference"):
+                continue
             disparity_finite = disparity[np.isfinite(disparity)]
             depth = fx_ir * stereo_baseline_m / (disparity + 1e-6)
             depth[(depth < ZNEAR) | (depth > ZFAR) | ~np.isfinite(depth)] = 0
@@ -2391,8 +2477,12 @@ try:
                     )
                     last_cloud_fallback_time = now
 
+        localization_timing.record("stereo_cloud", stereo_started)
+        if d405_reacquisition_pending("stereo_cloud"):
+            continue
         # Rank every YOLO box by measured camera-optical X. No ROI, coarse prior,
         # image-center fallback, or image-left heuristic is used.
+        sam_init_started = time.perf_counter()
         if pending_yolo_obbs is not None:
             valid_ratio = len(points_3d) / max(1, len(u_flat_current))
             median_depth = float(np.median(points_3d[:, 2])) if len(points_3d) else float("nan")
@@ -2514,6 +2604,10 @@ try:
             pending_sam_points = None
             pending_sam_labels = None
 
+        localization_timing.record("target_select_sam_init", sam_init_started)
+        if d405_reacquisition_pending("target_select_sam_init"):
+            continue
+        geometry_started = time.perf_counter()
         display = color_bgr.copy()
         tracked_target_points = None
         handoff_candidate_mask = None
@@ -3374,6 +3468,12 @@ try:
                                                 publish_pregrasp_pose(frame_stamp)
                                                 publish_vision_result(True, "stable_target_published")
                                                 logging.info(
+                                                    "[D405 timing] %s",
+                                                    json.dumps(localization_timing.finish(
+                                                        geometry_started=geometry_started
+                                                    )),
+                                                )
+                                                logging.info(
                                                     f"[D405] Published stable target: length={latest_sample['length']*1000:.1f}mm, "
                                                     f"width={latest_sample['box_width']*1000:.1f}mm, "
                                                     f"height={latest_sample['height']*1000:.1f}mm, "
@@ -3456,7 +3556,11 @@ try:
                 locked_cloud_colors = None
                 reset_requested = True
 
-        if top_barcode_capture is not None:
+        localization_timing.record("geometry", geometry_started)
+        if d405_reacquisition_pending("geometry"):
+            continue
+        top_debug_started = time.perf_counter()
+        if top_barcode_capture is not None and top_barcode_attempt_current(top_barcode_capture):
             if top_hit is not None:
                 evidence = verify_top_plane_barcode(
                     top_hit, top_barcode_points, top_barcode_uv, top_barcode_plane,
@@ -3535,6 +3639,10 @@ try:
                 capture=top_barcode_capture,
             )
 
+        localization_timing.record("top_verify_debug_enqueue", top_debug_started)
+        if d405_reacquisition_pending("top_verify_debug_enqueue"):
+            continue
+        preview_started = time.perf_counter()
         if last_yolo_obbs is not None and time.time() - last_yolo_time <= YOLO_BOX_DISPLAY_TTL_S:
             for index, corners in enumerate(last_yolo_obbs):
                 color = (0, 0, 255) if index == last_best_idx else (255, 0, 0)
@@ -3795,10 +3903,13 @@ try:
             local_key = cv2.waitKey(1) & 0xFF
             if local_key != 0xFF:
                 handle_key(local_key)
+        localization_timing.record("preview", preview_started)
 
 except KeyboardInterrupt:
     pass
 finally:
+    if not top_barcode_debug_writer.close(timeout=2.0):
+        logging.warning("[D405] Debug writer still draining; camera shutdown continues")
     # Drain queued diagnostic images before terminating the writer thread.
     d405_output_save_queue.join()
     d405_output_save_queue.put(d405_output_save_stop)

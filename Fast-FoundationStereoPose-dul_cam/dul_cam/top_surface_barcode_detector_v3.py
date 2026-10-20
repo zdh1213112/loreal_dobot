@@ -10,6 +10,7 @@ allows.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -204,40 +205,58 @@ class TopSurfaceBarcodeDetector:
             return False
         return bool(interior[cy, cx])
 
-    def _decode_zbar(self, image: np.ndarray, interior: np.ndarray, origin: tuple[int, int]):
+    def _decode_zbar(
+        self, image: np.ndarray, interior: np.ndarray, origin: tuple[int, int],
+        *, cancel_check: Callable[[], bool] | None = None,
+    ):
         if zbar_decode is None:
             return None
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         # The top label is often only 40--70 pixels wide in the D405 RGB
         # stream.  ZBar is much more reliable after enlarging, rotating the
         # portrait label into landscape, and trying a few contrast variants.
-        variants = [(gray, False)]
-        for scale in (2.0, 3.0, 4.0):
-            up = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            variants.extend((
-                (up, False),
-                (cv2.detailEnhance(cv2.cvtColor(up, cv2.COLOR_GRAY2BGR), sigma_s=10, sigma_r=0.15)[:, :, 0], False),
-                (cv2.normalize(up, None, 0, 255, cv2.NORM_MINMAX), False),
-            ))
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        variants.append((clahe.apply(gray), False))
-        # Try both orientations.  The barcode on a box top is frequently
-        # aligned along the long axis, which appears portrait in the camera.
-        expanded_variants = []
-        for variant, transformed in variants:
-            expanded_variants.extend((
-                (variant, transformed),
-                (cv2.rotate(variant, cv2.ROTATE_90_CLOCKWISE), True),
-                (cv2.rotate(variant, cv2.ROTATE_90_COUNTERCLOCKWISE), True),
-            ))
-        variants = expanded_variants
-        for variant, transformed in variants:
+        def originals():
+            # Keep all 11 originals and their original order. Construct them
+            # lazily: a raw-image success needs no upscaling/detailEnhance,
+            # and a cancelled top window must not finish 33 stale attempts.
+            yield gray
+            for scale in (2.0, 3.0, 4.0):
+                if cancel_check is not None and cancel_check():
+                    return
+                up = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                yield up
+                if cancel_check is not None and cancel_check():
+                    return
+                yield cv2.detailEnhance(
+                    cv2.cvtColor(up, cv2.COLOR_GRAY2BGR), sigma_s=10, sigma_r=0.15
+                )[:, :, 0]
+                if cancel_check is not None and cancel_check():
+                    return
+                yield cv2.normalize(up, None, 0, 255, cv2.NORM_MINMAX)
+            if cancel_check is None or not cancel_check():
+                yield cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+
+        def variants():
+            for original in originals():
+                yield original, False
+                if cancel_check is not None and cancel_check():
+                    return
+                yield cv2.rotate(original, cv2.ROTATE_90_CLOCKWISE), True
+                if cancel_check is not None and cancel_check():
+                    return
+                yield cv2.rotate(original, cv2.ROTATE_90_COUNTERCLOCKWISE), True
+
+        for variant, transformed in variants():
+            if cancel_check is not None and cancel_check():
+                return None
             if variant.size == 0:
                 continue
             try:
                 hits = zbar_decode(variant)
             except Exception:
                 continue
+            if cancel_check is not None and cancel_check():
+                return None
             scale = variant.shape[1] / max(1, gray.shape[1])
             for hit in hits:
                 if "QRCODE" in str(getattr(hit, "type", "")).upper():
@@ -435,6 +454,8 @@ class TopSurfaceBarcodeDetector:
         image: np.ndarray,
         mask: np.ndarray,
         target_corners: np.ndarray | None = None,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> TopSurfaceBarcode | None:
         self.last_debug = {
             "interior_bbox": None,
@@ -444,6 +465,15 @@ class TopSurfaceBarcodeDetector:
             "decoder": "none",
             "message": "invalid image",
         }
+        def cancelled():
+            if cancel_check is not None and cancel_check():
+                self.last_debug["message"] = "observation window superseded"
+                self.last_debug["accepted_candidate"] = None
+                return True
+            return False
+
+        if cancelled():
+            return None
         if image is None or np.asarray(image).size == 0:
             return None
         interior = self._interior_mask(mask, target_corners)
@@ -472,6 +502,8 @@ class TopSurfaceBarcodeDetector:
             int(local_ys.max()),
         ) if len(local_xs) else None
         result = self._decode_yolo(crop, local_interior)
+        if cancelled():
+            return None
         self.last_debug = self._map_debug_to_global(self.last_debug, origin)
         if result is not None:
             if result.rect is not None:
@@ -505,6 +537,8 @@ class TopSurfaceBarcodeDetector:
         )
         self.last_debug["candidate_boxes"] = []
         padded_result = self._decode_yolo(padded, padded_mask)
+        if cancelled():
+            return None
         self.last_debug = self._map_debug_to_global(
             self.last_debug, (origin[0] - pad, origin[1] - pad)
         )
@@ -520,7 +554,11 @@ class TopSurfaceBarcodeDetector:
                     ),
                 )
             return padded_result
-        result = self._decode_zbar(crop, local_interior, (0, 0))
+        result = self._decode_zbar(
+            crop, local_interior, (0, 0), cancel_check=cancel_check
+        )
+        if cancelled():
+            return None
         if result is not None:
             if result.rect is not None:
                 result = TopSurfaceBarcode(
@@ -537,6 +575,8 @@ class TopSurfaceBarcodeDetector:
             self.last_debug["message"] = f"decoded {result.value}"
             return result
         result = self._decode_opencv(crop, interior, origin)
+        if cancelled():
+            return None
         if result is not None:
             self.last_debug["decoder"] = "OpenCV"
             self.last_debug["accepted_candidate"] = result.rect
