@@ -236,6 +236,56 @@ def test_explicit_safety_pause_is_fault_and_camera_fault_cannot_be_cleared_by_cy
     assert not policy.decide().fault
 
 
+def vla_packet(state="warning", *, session="102-run-a", seq=1, stamp=50_000_000_000):
+    return dict(source="vla102", session=session, seq=seq, stamp_ns=stamp,
+                state=state, code="vla102_repeated_motion" if state == "warning" else "vla102_" + state,
+                reason="102 疑似动作循环" if state == "warning" else "102 状态")
+
+
+def test_101_success_or_pause_cannot_overwrite_102_warning_or_fault():
+    policy = StationPolicy(clock_ns=lambda: 50_000_000_000)
+    assert policy.receive_vla102(vla_packet())
+    policy.receive_timing(dict(event="cycle_start", cycle_id="continuous-1"))
+    policy.receive_timing(dict(event="cycle_summary", cycle_id="continuous-1", outcome="success"))
+    assert policy.decide().code == "vla102_repeated_motion"
+    assert policy.receive_vla102(vla_packet("fault", seq=2))
+    policy.receive_cycle_status("cycle stopped")
+    assert policy.decide().fault
+    assert policy.receive_vla102(vla_packet("normal", seq=3))
+    assert policy.decide().code == "operator_pause"
+
+
+def test_102_normal_message_cannot_clear_an_independent_101_problem():
+    policy = StationPolicy(clock_ns=lambda: 50_000_000_000)
+    policy.receive_cycle_status("D405 finger corridor BLOCKED; waiting for obstacle clearance")
+    assert policy.receive_vla102(vla_packet("normal"))
+    assert policy.decide().code == "grasp_obstacle"
+    policy.receive_cycle_status("FAULT: existing robot safety error")
+    assert policy.receive_vla102(vla_packet("normal", seq=2))
+    assert policy.decide().fault
+
+
+def test_old_102_sessions_sequences_and_invalid_packets_are_ignored():
+    policy = StationPolicy(clock_ns=lambda: 50_000_000_000)
+    assert policy.receive_vla102(vla_packet(seq=10))
+    for packet in ([], {}, vla_packet("normal", seq=9),
+                   vla_packet("normal", session="old-run", stamp=49_999_999_999),
+                   vla_packet("normal", stamp=1), {**vla_packet(), "seq": True},
+                   {**vla_packet(), "source": "unknown"}, {**vla_packet(), "state": "unknown"}):
+        assert not policy.receive_vla102(packet)
+        assert policy.decide().warning
+    assert policy.receive_vla102(vla_packet("initializing", session="102-run-b", stamp=50_000_000_001))
+    assert policy.decide().state == "initializing"
+
+
+def test_vla_warning_silence_does_not_create_a_new_fault_or_clear_existing_warning():
+    policy = StationPolicy(clock_ns=lambda: 50_000_000_000)
+    policy.receive_vla102(vla_packet())
+    for now in (1, 30, 300):
+        assert policy.decide(now).warning
+        assert not policy.decide(now).fault
+
+
 def test_operator_pause_is_not_overwritten_by_a_late_normal_stage():
     policy = StationPolicy()
     policy.receive_cycle_status("continuous cycle started")

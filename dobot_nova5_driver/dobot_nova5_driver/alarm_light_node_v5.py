@@ -6,7 +6,7 @@ import time
 
 from .alarm_light_v5 import (
     CYCLE_STATUS_TOPIC, CYCLE_TIMING_TOPIC, D435_READY_TOPIC, D435_STATUS_TOPIC,
-    HANDOFF_STATE_TOPIC, PROCESS_TOPICS, Indication, SoundPolicy, StationPolicy, finite_positive,
+    HANDOFF_STATE_TOPIC, VLA102_STATE_TOPIC, PROCESS_TOPICS, Indication, SoundPolicy, StationPolicy, finite_positive,
     light_pattern, pattern_commands,
 )
 
@@ -126,6 +126,9 @@ def main(args=None):
             # Best effort/depth one adds no reliable backpressure to D405.
             self.create_subscription(String, HANDOFF_STATE_TOPIC, self.receive_handoff,
                 QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+            self.create_subscription(String, VLA102_STATE_TOPIC, self.receive_vla102,
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+                           durability=DurabilityPolicy.TRANSIENT_LOCAL))
             self.create_subscription(String, D435_STATUS_TOPIC,
                 lambda msg: self.policy.receive_d435_status(msg.data), 10)
             self.create_subscription(Bool, D435_READY_TOPIC,
@@ -176,6 +179,17 @@ def main(args=None):
                 self.warning_tone_timer.cancel()
                 self.destroy_timer(self.warning_tone_timer)
                 self.warning_tone_timer = None
+
+        def receive_vla102(self, message):
+            if len(message.data) > 8192:
+                return
+            try:
+                previous = self.policy.decide()
+                self.policy.receive_vla102(json.loads(message.data))
+                if self.policy.decide() != previous:
+                    self.update(check_graph=False)
+            except (ValueError, TypeError):
+                pass
 
         def finish_warning_tone(self):
             self.stop_warning_tone_timer()

@@ -96,9 +96,49 @@ ros2 topic echo /station_v5/alarm_status
 
 ## 负载与故障隔离
 
+### 102 VLA 提醒接入
+
+101 launch 的 `alarm_light_enabled:=true` 启动整站灯控；102 不由此 launch 启动，
+需在原 `examples.dobot_nova5_dh_v5.main` 命令后同时增加：
+
+```text
+--args.turntable-interlock --args.alarm-light-enabled
+```
+
+102 侧该开关也默认关闭。启用后只对 V5 做适配，不修改通用 RTC/相机库：
+
+| 102 提醒 | 条件 |
+| --- | --- |
+| 疑似重复动作无进展 | 约 15 秒内跨至少三次新推理、十次交付动作，重复轨迹或实测 TCP 长期停留在每轴 35 mm 内（姿态各分量跨度小于 0.15），无有效交接进度线索；包括持续执行近似相同目标，排除正常许可等待、保护避让、预热、主动停机 |
+| 推理动作等待恢复 | 连续三次推理失败，或 RTC 已预热后实际队列断供等待超过 0.5 秒；队列低、普通推理延迟不触发 |
+| 视觉输入过期 | 核验真实 RealSense 帧号、采集时间和本次观测对应帧龄，超过 1.5 秒；静态画面不等于旧帧 |
+
+这些情况黄闪、首次短鸣一次，不自动停机、开爪或回零，也不表示已确诊空抓/掉料。
+已有反馈故障保护和原运行报错停止仍按红灯处理。102 参数可分别通过
+`--args.alarm-light-repeat-window-s`、`--args.alarm-light-repeat-position-span-m`（默认 `0.035` 米）、
+`--args.alarm-light-inference-failures`、
+`--args.alarm-light-starvation-s`、`--args.alarm-light-frame-max-age-s` 调整。
+15 秒重复动作窗口和 35 mm 每轴跨度应结合现场正常动作标定。
+102 启动日志显示启用状态与阈值；状态变化或约十秒输出一次 `102 VLA monitor`
+诊断，列出窗口时长、新推理块数、交付动作数和实测 XYZ 跨度。
+`/station_v5/vla102_state` 的 `repeat` 字段包含同一份数值依据，不增加逐帧监测日志。
+
+102 使用现有 ROS 联锁执行器发布 `/station_v5/vla102_state`，无新采样线程，
+无图片复制或落盘。灯控按来源独立保存状态：101 成功不能清除 102 警示，
+102 正常也不能清除 101 故障；旧会话、旧序号、过期缓存消息不覆盖新状态。
+未启用 102 监测时保留原 101 灯控行为，不推断 102 已经健康；消息静默本身不新增故障。
+
+重新规划或 broker reset 会更新监测代次、清理上一阶段的黄色提示；已发出的推理
+仍按其开始时的代次处理，迟到结果不能改变新阶段的提示。已有红色流程故障继续保留。
+解耦模式下，外层缓冲仍交付动作时不提示内层队列断供。监测/发布回调异常不阻断
+原来的动作、停止和断开连接；退出后排队中的旧发布回调不能覆盖最终故障状态。
+
+### 通信与线程隔离
+
 - 灯控只订阅已有的 `/cosmetic_pick_cycle_status`、
   `/cosmetic_pick_cycle_timing`、`/turntable_barcode_camera_status` 和
   `/turntable_barcode_camera_ready`，以及现有的障碍物判定 JSON。
+  可选 102 监测只增加上述小型状态 JSON 的订阅。
   障碍物订阅使用 best-effort、depth=1，不增加相机的可靠传输背压。
   主流程没有新增状态发布定时器、
   阶段钩子、反馈采样、机械臂连接、相机订阅或相机上报。

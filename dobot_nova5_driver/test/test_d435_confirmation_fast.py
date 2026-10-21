@@ -26,7 +26,8 @@ def scanner():
     tree = ast.parse(p.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'D435TurntableBarcodeNode')
     names = {'_accept_hit', '_rect_iou', '_moving_stripe_spatially_consistent',
-             '_trigger_callback', '_publish_candidate_hint', '_reset_candidate_for_roi_change'}
+             '_trigger_callback', '_publish_candidate_hint', '_reset_candidate_for_roi_change',
+             '_record_confirmation'}
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     clock = SimpleNamespace(now=100.)
     clock.monotonic = lambda: clock.now
@@ -83,6 +84,33 @@ def test_same_frame_cannot_be_counted_twice(scanner):
     assert not node._accept_hit(hit('yolo_tiled'), 1, 1)
     clock.now += .02
     assert node._accept_hit(hit(), 1, 2)
+
+
+def test_confirmation_review_uses_the_hit_that_actually_published_success(scanner):
+    node, clock = scanner
+    recorded = []
+    node.confirmation_review = SimpleNamespace(record=lambda image, metadata: recorded.append((image, metadata)))
+    node.detector = SimpleNamespace(image_size=640, active_provider='CUDAExecutionProvider', detail_roi=(155, 65, 1120, 565))
+    node.camera_settings_text = 'AE=OFF exposure=120 gain=128'
+    node._roi_bounds = lambda image: (0, 0, image.shape[1], image.shape[0])
+    original_get = node.get_parameter
+    extra = dict(model_path='barcode.onnx', model_confidence=.40)
+    node.get_parameter = lambda key: SimpleNamespace(value=extra[key]) if key in extra else original_get(key)
+    node.get_logger = lambda: SimpleNamespace(warning=Mock())
+    assert not node._accept_hit(hit(), 1, 1)
+    assert getattr(node, 'last_confirmation_evidence', None) is None
+    clock.now += .03
+    assert node._accept_hit(hit(confidence=.67), 1, 2)
+    color_frame = SimpleNamespace(get_frame_number=lambda: 105,
+        get_timestamp=lambda: 3500., get_frame_timestamp_domain=lambda: 'hardware_clock')
+    image = np.zeros((120, 200, 3), dtype=np.uint8)
+    node._record_confirmation(image, 12.5, color_frame)
+    assert len(recorded) == 1
+    metadata = recorded[0][1]
+    assert metadata['confidence'] == .67 and metadata['independent_hits'] == 2
+    assert metadata['detection_frame_id'] == 2 and metadata['camera_frame_number'] == 105
+    assert metadata['source'] == 'yolo_detail' and metadata['capture_received_unix_ns'] == 12_500_000_000
+    node.result_publisher.publish.assert_called_once()
 
 
 def test_different_location_and_expired_evidence_restart_counts(scanner):

@@ -83,6 +83,7 @@ def barcode_region_has_parallel_bar_structure(
     minimum_runs: int = 6,
     minimum_line_coverage: float = 0.22,
     minimum_direction_dominance: float = 1.15,
+    minimum_orientation_coherence: float = 0.30,
 ) -> bool:
     """Require repeated, substantially parallel edges in a YOLO proposal.
 
@@ -151,10 +152,25 @@ def barcode_region_has_parallel_bar_structure(
         )
 
     # Vertical bars have X gradients continuing through rows; horizontal bars
-    # have Y gradients continuing through columns.
-    return axis_has_bars(gradient_x, gradient_y, collapse_axis=0) or axis_has_bars(
-        gradient_y, gradient_x, collapse_axis=1
-    )
+    # have Y gradients continuing through columns. Keep the permissive line
+    # coverage for tilted/perspective labels: raising it loses genuine bars.
+    if not (axis_has_bars(gradient_x, gradient_y, collapse_axis=0) or
+            axis_has_bars(gradient_y, gradient_x, collapse_axis=1)):
+        return False
+
+    # Dense package text under shiny wrap passed the edge-run counts at .493
+    # confidence. Its many short edges are not one coherent family of bars.
+    # Suppress pixel noise first so faint/blurred real labels retain their
+    # dominant orientation, then inspect the signed-gradient structure tensor.
+    # The eigenvalue contrast is invariant to the bars' in-plane rotation.
+    smooth = cv2.GaussianBlur(gray, (0, 0), 1.5)
+    signed_x = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3)
+    signed_y = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3)
+    xx = float(np.mean(signed_x * signed_x))
+    yy = float(np.mean(signed_y * signed_y))
+    xy = float(np.mean(signed_x * signed_y))
+    coherence = float(np.hypot(xx - yy, 2.0 * xy)) / max(1e-6, xx + yy)
+    return coherence >= max(0.0, min(1.0, float(minimum_orientation_coherence)))
 
 
 def scanner_proposal_has_bars(image, polygon, rect) -> bool:

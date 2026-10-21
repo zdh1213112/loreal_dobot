@@ -69,6 +69,14 @@ def generate_launch_description() -> LaunchDescription:
                 description="Spatially consistent YOLO frames required before D435 confirms a barcode",
             ),
             DeclareLaunchArgument(
+                "turntable_d435_confirmation_review", default_value="true", choices=["true", "false"],
+                description="Keep a five-second historical confirmation preview (independent of saving)",
+            ),
+            DeclareLaunchArgument(
+                "turntable_d435_confirmation_save", default_value="false", choices=["true", "false"],
+                description="Automatically save bounded confirmation evidence to disk (independent of preview)",
+            ),
+            DeclareLaunchArgument(
                 "turntable_d435_model_path",
                 # default_value="/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_0929.onnx",
                 # default_value="/home/zdh/ffs_ws/src/Fast-FoundationStereoPose-dul_cam/models/best_d435_barcode_1013.onnx",
@@ -958,6 +966,16 @@ def generate_launch_description() -> LaunchDescription:
                     [
                         "model_confidence:=",
                         LaunchConfiguration("turntable_d435_confidence"),
+                    ],
+                    "-p",
+                    [
+                        "confirmation_review_enabled:=",
+                        LaunchConfiguration("turntable_d435_confirmation_review"),
+                    ],
+                    "-p",
+                    [
+                        "confirmation_save_enabled:=",
+                        LaunchConfiguration("turntable_d435_confirmation_save"),
                     ],
                     "-p",
                     [

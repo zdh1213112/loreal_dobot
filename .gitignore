@@ -38,3 +38,5 @@ __pycache__/
 **/d405_top_barcode_debug_v2/
 **/d405_top_barcode_debug_v3/
 **/d405_fault_snapshots_v3/
+**/d435_barcode_confirmations/
+**/d435_barcode_structure/

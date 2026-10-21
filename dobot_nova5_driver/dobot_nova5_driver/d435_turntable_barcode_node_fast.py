@@ -19,6 +19,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, String
 
 from .barcode_confirmation_fast import BarcodeEvidenceTracks
+from .d435_confirmation_review import BarcodeConfirmationReview
 from .turntable_barcode_detector_fast import (
     DEFAULT_BARCODE_MODEL,
     TurntableBarcodeDetector,
@@ -128,6 +129,12 @@ class D435TurntableBarcodeNode(Node):
         self.declare_parameter("roi_width", 0)
         self.declare_parameter("roi_height", 0)
         self.declare_parameter("preview", True)
+        # V5 opts in; earlier launch files retain their original preview/IO.
+        self.declare_parameter("confirmation_review_enabled", False)
+        self.declare_parameter("confirmation_save_enabled", False)
+        self.declare_parameter("confirmation_review_hold_s", 5.0)
+        self.declare_parameter("confirmation_review_limit", 100)
+        self.declare_parameter("confirmation_review_dir", "/home/zdh/ffs_ws/d435_barcode_confirmations")
         self.declare_parameter(
             "sample_save_dir", "/home/zdh/ffs_ws/d435_barcode_samples"
         )
@@ -212,6 +219,7 @@ class D435TurntableBarcodeNode(Node):
         self.scan_generation = 0
         self.evidence_tracks = BarcodeEvidenceTracks()
         self.detection_frame_id = 0
+        self.last_confirmation_evidence = None
         self.candidate = ""
         self.candidate_source = ""
         self.candidate_rect: tuple[int, int, int, int] | None = None
@@ -292,6 +300,26 @@ class D435TurntableBarcodeNode(Node):
             moving_stripes_enabled=bool(
                 self.get_parameter("moving_stripes_enabled").value
             ),
+        )
+        self.confirmation_review = None
+        review_enabled = bool(self.get_parameter("confirmation_review_enabled").value)
+        save_enabled = bool(self.get_parameter("confirmation_save_enabled").value)
+        if review_enabled or save_enabled:
+            try:
+                self.confirmation_review = BarcodeConfirmationReview(
+                    str(self.get_parameter("confirmation_review_dir").value),
+                    hold_s=float(self.get_parameter("confirmation_review_hold_s").value),
+                    limit=int(self.get_parameter("confirmation_review_limit").value),
+                    preview_enabled=review_enabled,
+                    save_enabled=save_enabled,
+                    on_saved=lambda path: self.get_logger().info(f"D435 confirmation evidence saved: {path}"),
+                    on_error=lambda error: self.get_logger().warning(f"D435 confirmation review: {error}"),
+                )
+            except Exception as error:
+                self.get_logger().warning(f"D435 confirmation review unavailable: {error}")
+        self.get_logger().info(
+            f"D435 confirmation history={'on' if review_enabled else 'off'}, "
+            f"automatic evidence saving={'on' if save_enabled else 'off'}"
         )
         self.capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -806,7 +834,39 @@ class D435TurntableBarcodeNode(Node):
             2,
             cv2.LINE_AA,
         )
+        review = getattr(self, "confirmation_review", None)
+        if review is not None:
+            try:
+                review.render_on(display)
+            except Exception as error:
+                self.get_logger().debug(f"D435 confirmation history rendering failed: {error}")
         return display
+
+    def _record_confirmation(self, image, captured_at, color_frame, acceptance_roi=None):
+        """Preserve the exact accepted frame after success was already published."""
+        review = self.confirmation_review
+        if review is None:
+            return
+        try:
+            metadata = dict(self.last_confirmation_evidence)
+            metadata.update(capture_received_unix_ns=int(captured_at * 1_000_000_000),
+                model_path=str(self.get_parameter("model_path").value),
+                model_confidence_threshold=float(self.get_parameter("model_confidence").value),
+                model_image_size=self.detector.image_size,
+                inference_provider=self.detector.active_provider,
+                detail_roi=self.detector.detail_roi,
+                acceptance_roi=list(self._roi_bounds(image) if acceptance_roi is None else acceptance_roi),
+                camera_settings=self.camera_settings_text,
+                image_size=[int(image.shape[1]), int(image.shape[0])])
+            try:
+                metadata.update(camera_frame_number=int(color_frame.get_frame_number()),
+                    camera_timestamp_ms=float(color_frame.get_timestamp()),
+                    camera_timestamp_domain=str(color_frame.get_frame_timestamp_domain()))
+            except Exception as error:
+                metadata["camera_metadata_error"] = str(error)
+            review.record(image, metadata)
+        except Exception as error:
+            self.get_logger().warning(f"D435 confirmation recording failed: {error}")
 
     def _publish_preview(self, image: np.ndarray) -> None:
         quality = max(
@@ -961,6 +1021,15 @@ class D435TurntableBarcodeNode(Node):
                 self.continuous_last_report_value = value
                 self.continuous_last_report_at = now
                 self.continuous_presence_latched = True
+            self.last_confirmation_evidence = dict(
+                generation=generation, detection_frame_id=frame_id,
+                source=source, value=value, confidence=float(hit.confidence),
+                confidence_is_model_score=source.startswith("yolo"),
+                rect=[int(value) for value in hit.rect],
+                independent_hits=track.hits, required_hits=required,
+                workflow_confirmation=workflow_active,
+                continuous_confirmation=report_continuous,
+            )
             # Start a fresh stability sequence. Continuous inference remains
             # active, but the visible-presence latch suppresses duplicates.
             self.candidate_hits = 0
@@ -968,12 +1037,15 @@ class D435TurntableBarcodeNode(Node):
             self.candidate_first_rect = None
             self.evidence_tracks.clear()
         if workflow_active:
+            confidence_text = f"{float(hit.confidence):.3f}" if source.startswith("yolo") else "n/a"
             result = String()
             result.data = f"success:{value}"
             self.result_publisher.publish(result)
             self._publish_status(
                 f"D435 side barcode confirmed by {source}: {value!r}; "
-                f"independent_hits={track.hits}/{required}; requesting turntable stop"
+                f"independent_hits={track.hits}/{required}; requesting turntable stop; "
+                f"confidence={confidence_text}, rect={tuple(hit.rect)}, "
+                f"detection_frame={frame_id}, generation={generation}"
             )
         if report_continuous:
             result = String()
@@ -1074,6 +1146,7 @@ class D435TurntableBarcodeNode(Node):
                 f"min_candidate_area="
                 f"{self.detector.yolo_min_candidate_area_ratio:.3f}; "
                 "flat-background rejection=on; parallel-bar verification=YOLO+scanner; "
+                "orientation-coherence rejection=on; "
                 "confirmation=independent per source; weak patterns=recheck-only; "
                 f"moving_stripes={'on' if self.detector.moving_stripes_enabled else 'off'}"
             )
@@ -1107,6 +1180,7 @@ class D435TurntableBarcodeNode(Node):
                     generation = self.scan_generation
                 active = workflow_active or continuous_active
                 hit = None
+                confirmation_accepted = False
                 now = time.monotonic()
                 if active and now - last_detect_at >= max(
                     0.0, float(self.get_parameter("detect_interval_s").value)
@@ -1144,6 +1218,7 @@ class D435TurntableBarcodeNode(Node):
                             for candidate in hits:
                                 if self._accept_hit(candidate, generation, self.detection_frame_id):
                                     hit = candidate
+                                    confirmation_accepted = True
                                     break
                             if not any(c.source != "scanner_unverified" for c in hits):
                                 self._note_continuous_no_hit(now)
@@ -1151,11 +1226,13 @@ class D435TurntableBarcodeNode(Node):
                             self._publish_candidate_hint(
                                 hit, generation, captured_at, invalidated=roi_changed,
                             )
+                    if confirmation_accepted:
+                        self._record_confirmation(image, captured_at, color_frame, allowed_roi)
                 preview_interval = max(
                     0.02,
                     float(self.get_parameter("preview_publish_interval_s").value),
                 )
-                if preview and now - last_preview_at >= preview_interval:
+                if preview and (now - last_preview_at >= preview_interval or confirmation_accepted):
                     last_preview_at = now
                     self._publish_preview(
                         self._render_preview(
@@ -1184,6 +1261,8 @@ class D435TurntableBarcodeNode(Node):
         self.running = False
         if self.capture_thread.is_alive():
             self.capture_thread.join(timeout=2.0)
+        if self.confirmation_review is not None:
+            self.confirmation_review.close()
         super().destroy_node()
 
 

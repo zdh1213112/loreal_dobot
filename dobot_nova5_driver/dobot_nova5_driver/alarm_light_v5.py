@@ -15,6 +15,7 @@ CYCLE_TIMING_TOPIC = "/cosmetic_pick_cycle_timing"
 D435_STATUS_TOPIC = "/turntable_barcode_camera_status"
 D435_READY_TOPIC = "/turntable_barcode_camera_ready"
 HANDOFF_STATE_TOPIC = "/d405_handoff_zone_state"
+VLA102_STATE_TOPIC = "/station_v5/vla102_state"
 PROCESS_TOPICS = {"cycle": CYCLE_STATUS_TOPIC, "d405": "/d405_vision_result",
                   "d435": D435_STATUS_TOPIC}
 
@@ -49,6 +50,8 @@ class StationPolicy:
         self.grasp_observation_active = False
         self.handoff_barrier_ns = 0
         self.last_handoff_stamp_ns = 0
+        self.vla102_indication = None
+        self.vla102_last_message = None
         self.operator_paused = False
         self.interlock_wait_stage = None
         self.seen_publishers = set()
@@ -243,6 +246,30 @@ class StationPolicy:
         if text.startswith("FAULT:"):
             self.faults["d435"] = Indication("fault", "d435_fault", text[:512])
 
+    def receive_vla102(self, data):
+        """Separate source ownership: no 101 progress may clear a 102 issue.
+
+        Reject cached/retired-session packets; message silence is not a fault.
+        """
+        if not isinstance(data, dict) or data.get("source") != "vla102":
+            return False
+        session, seq, stamp = data.get("session"), data.get("seq"), data.get("stamp_ns")
+        state, code, reason = data.get("state"), data.get("code"), data.get("reason")
+        if (not isinstance(session, str) or not 1 <= len(session) <= 64
+                or type(seq) is not int or seq < 1 or type(stamp) is not int
+                or not -1_000_000_000 <= self.clock_ns() - stamp <= 10_000_000_000
+                or state not in ("normal", "warning", "fault", "waiting", "initializing")
+                or not isinstance(code, str) or not code.startswith("vla102_")
+                or not isinstance(reason, str)):
+            return False
+        if self.vla102_last_message is not None:
+            old_session, old_seq, old_stamp = self.vla102_last_message
+            if stamp < old_stamp or (session == old_session and seq <= old_seq):
+                return False
+        self.vla102_last_message = session, seq, stamp
+        self.vla102_indication = None if state == "normal" else Indication(state, code[:128], reason[:512])
+        return True
+
     def receive_d435_ready(self, ready):
         if ready:
             self.faults.pop("d435", None)
@@ -270,12 +297,16 @@ class StationPolicy:
     def decide(self, _now=None):
         if self.faults:
             return next(iter(self.faults.values()))
+        if self.vla102_indication is not None and self.vla102_indication.fault:
+            return self.vla102_indication
+        if self.vla102_indication is not None and self.vla102_indication.warning:
+            return self.vla102_indication
         if self.operator_paused or self.interlock_wait_stage is not None:
             return self.base
         for code in ("grasp_obstacle", "bottom_regrasp_recovery", "grasp_recovery", "target_missing"):
             if code in self.warnings:
                 return self.warnings[code]
-        return self.base
+        return self.vla102_indication or self.base
 
 
 class SoundPolicy:
