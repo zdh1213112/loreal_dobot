@@ -737,7 +737,7 @@ class D435TurntableBarcodeNode(Node):
                 if hit.source == "scanner_unverified"
                 else "MOVING STRIPES"
                 if hit.source == "moving_stripes"
-                else f"YOLO {hit.confidence:.2f}"
+                else f"{hit.confidence:.2f}"
             )
             cv2.putText(
                 display,

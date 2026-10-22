@@ -67,7 +67,7 @@ class BarcodeConfirmationReview:
         annotated = raw.copy()
         cv2.rectangle(annotated, (x, y), (x + width, y + height), (255, 0, 255), 3)
         score = f"{data['confidence']:.2f}" if data['source'].startswith('yolo') else "n/a"
-        cv2.putText(annotated, f"CONFIRMED REGION {data['source']} score={score}",
+        cv2.putText(annotated, score,
                     (max(0, x), max(22, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, .65,
                     (255, 0, 255), 2, cv2.LINE_AA)
         snapshot = ConfirmationSnapshot(raw, annotated, data, self.clock())
@@ -110,7 +110,7 @@ class BarcodeConfirmationReview:
                     cv2.FONT_HERSHEY_SIMPLEX, title_scale, (255, 180, 255), 1, cv2.LINE_AA)
         data = snapshot.metadata
         score = f"{data['confidence']:.2f}" if data['source'].startswith('yolo') else "n/a"
-        cv2.putText(display, f"{data['source']}  confidence={score}",
+        cv2.putText(display, score,
                     (left + 5, top - 7), cv2.FONT_HERSHEY_SIMPLEX, min(.55, title_scale),
                     (255, 180, 255), 1, cv2.LINE_AA)
         return display
