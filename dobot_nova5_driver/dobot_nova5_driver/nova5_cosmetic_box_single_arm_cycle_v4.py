@@ -1854,7 +1854,21 @@ class CosmeticBoxSingleArmNode(TurntableBarcodeRecheckMixin, NearCubeMotionSafet
             except Exception:
                 pass
         gripper = DHGripper(dashboard, config)
-        gripper.initialize(timeout_s=float(self.get_parameter("dh_timeout_s").value), init_open=True)
+        # Run the manual button's full stroke calibration once per process,
+        # even if the AG-95 still reports initialized from the previous run.
+        # This blocks construction before the GUI or automatic cycle can start.
+        self.get_logger().warning(
+            "[startup] recalibrating AG-95 min/max stroke; keep the fingers clear"
+        )
+        try:
+            gripper.recalibrate(
+                timeout_s=max(15.0, float(self.get_parameter("dh_timeout_s").value)),
+                open_after=True,
+            )
+        except Exception as exc:
+            self.get_logger().error(f"[startup] AG-95 recalibration failed; startup aborted: {exc}")
+            raise
+        self.get_logger().info("[startup] AG-95 recalibration completed; gripper opened")
         return gripper
 
     def _drop_secondary_safety_feedback(self) -> None:

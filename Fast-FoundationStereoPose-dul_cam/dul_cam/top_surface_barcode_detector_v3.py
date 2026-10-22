@@ -32,6 +32,82 @@ class TopSurfaceBarcode:
     rect: tuple[int, int, int, int] | None = None
 
 
+def verify_parallel_barcode_structure(image: np.ndarray, rect: tuple[int, int, int, int]) -> dict:
+    """Require parallel edges with matching cross-sections along their length.
+
+    Dense lettering can repeatedly score highly in the one-class YOLO model
+    and lie on the box top plane. Unlike bars, its short strokes do not retain
+    the same light/dark profile along several parallel lines. Work in the
+    measured edge direction so arbitrarily rotated, small D405 labels remain
+    eligible without blurring their one- or two-pixel-wide bars away.
+    """
+    evidence = dict(verified=False, parallel_edges=0, profile_correlation=0.0,
+                    profile_contrast=0.0, reason="no consistent parallel bar profiles")
+    if image is None or np.asarray(image).size == 0:
+        return evidence
+    x, y, width, height = (int(value) for value in rect)
+    if min(width, height) < 12:
+        return evidence
+    crop = image[max(0, y):min(image.shape[0], y+height),
+                 max(0, x):min(image.shape[1], x+width)]
+    if crop.size == 0 or min(crop.shape[:2]) < 12:
+        return evidence
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    if max(gray.shape) > 512:
+        scale = 512.0 / max(gray.shape)
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    height, width = gray.shape
+    try:
+        found = cv2.createLineSegmentDetector().detect(gray)[0]
+    except cv2.error:
+        return evidence
+    if found is None:
+        return evidence
+    lines = found.reshape(-1, 4)
+    lengths = np.linalg.norm(lines[:, 2:] - lines[:, :2], axis=1)
+    keep = np.flatnonzero(lengths >= max(6.0, min(width, height) * 0.28))
+    # Bound the work on a large, text-heavy proposal.
+    keep = keep[np.argsort(lengths[keep])[-64:]]
+    lines, lengths = lines[keep], lengths[keep]
+    vectors = lines[:, 2:] - lines[:, :2]
+    angles = np.arctan2(vectors[:, 1], vectors[:, 0])
+    centers = (lines[:, :2] + lines[:, 2:]) * 0.5
+    for angle in angles:
+        selected = np.abs(np.sin(angles - angle)) <= np.sin(np.radians(10))
+        count = int(np.count_nonzero(selected))
+        if count < 4:
+            continue
+        along = np.array([np.cos(angle), np.sin(angle)])
+        across = np.array([-along[1], along[0]])
+        endpoints = lines[selected].reshape(-1, 2, 2) @ along
+        low = float(np.percentile(endpoints.min(axis=1), 75))
+        high = float(np.percentile(endpoints.max(axis=1), 25))
+        if high - low < 0.6 * float(np.median(lengths[selected])):
+            continue
+        cross_centers = centers[selected] @ across
+        left, right = float(cross_centers.min()), float(cross_centers.max())
+        if right - left < 0.3 * min(width, height):
+            continue
+        scan_positions = np.linspace(low, high, 7)
+        cross_positions = np.linspace(left, right, max(12, int(right-left) * 2))
+        pixels = (scan_positions[:, None, None] * along
+                  + cross_positions[None, :, None] * across)
+        scans = cv2.remap(gray, pixels[:, :, 0].astype(np.float32),
+                          pixels[:, :, 1].astype(np.float32), cv2.INTER_LINEAR).astype(float)
+        average_profile = scans.mean(axis=0)
+        contrast = float(np.percentile(average_profile, 90) - np.percentile(average_profile, 10))
+        profiles = scans - scans.mean(axis=1, keepdims=True)
+        profiles /= np.maximum(1e-6, np.linalg.norm(profiles, axis=1, keepdims=True))
+        correlation = float(np.median((profiles @ profiles.T)[np.triu_indices(7, 1)]))
+        if correlation > evidence["profile_correlation"]:
+            evidence.update(parallel_edges=count, profile_correlation=round(correlation, 3),
+                            profile_contrast=round(contrast, 1))
+        if correlation >= 0.87 and contrast >= 8.0:
+            evidence.update(verified=True, reason="consistent parallel bar profiles")
+            return evidence
+    return evidence
+
+
 def verify_top_plane_barcode(
     hit: TopSurfaceBarcode,
     points_xyz: np.ndarray | None,
@@ -308,8 +384,9 @@ class TopSurfaceBarcodeDetector:
         """Locate a barcode with YOLO inside the selected target region.
 
         The top-surface branch only needs face classification.  It deliberately
-        returns as soon as a class-0 barcode box is inside the SAM interior;
-        ZBar/OpenCV string decoding is not required for this decision.
+        requires a class-0 box inside the SAM interior with repeated, consistent
+        bar profiles. ZBar/OpenCV string decoding is not required for this path;
+        the caller still verifies live top-plane depth and independent frames.
         """
 
         if YOLO is None:
@@ -380,6 +457,20 @@ class TopSurfaceBarcodeDetector:
                 }
             )
             if not inside:
+                continue
+            # The padded fallback replicates edge pixels for model context.
+            # Those artificial extensions must never supply the bar evidence.
+            valid_y, valid_x = np.nonzero(interior[top:bottom, left:right])
+            bar_left, bar_top = left + int(valid_x.min()), top + int(valid_y.min())
+            bar_right, bar_bottom = left + int(valid_x.max()) + 1, top + int(valid_y.max()) + 1
+            structure = verify_parallel_barcode_structure(
+                image, (bar_left, bar_top, bar_right-bar_left, bar_bottom-bar_top),
+            )
+            self.last_debug["candidate_boxes"][-1]["bar_structure"] = structure
+            if not structure["verified"]:
+                self.last_debug["bar_structure_rejections"] = (
+                    self.last_debug.get("bar_structure_rejections", 0) + 1
+                )
                 continue
             self.last_debug["accepted_candidate"] = (left, top, right - left, bottom - top)
             self.last_debug["decoder"] = "YOLO"
@@ -582,5 +673,9 @@ class TopSurfaceBarcodeDetector:
             self.last_debug["accepted_candidate"] = result.rect
             self.last_debug["message"] = f"decoded {result.value}"
             return result
-        self.last_debug["message"] = "no barcode decoded"
+        rejected = self.last_debug.get("bar_structure_rejections", 0)
+        self.last_debug["message"] = (
+            f"no barcode decoded; rejected {rejected} YOLO candidates without consistent parallel bars"
+            if rejected else "no barcode decoded"
+        )
         return None

@@ -56,6 +56,15 @@ GRIP_GRIPPED = 2
 GRIP_DROPPED = 3
 
 
+class DobotCommandError(RuntimeError):
+    """A parsed controller rejection, distinct from IO/response parsing errors."""
+
+    def __init__(self, error_id: int, command_name: str, response: str):
+        self.error_id = error_id
+        self.command_name = command_name
+        super().__init__(f"{command_name} failed with ErrorID {error_id}: {response.strip()}")
+
+
 def parse_dobot_response(response: str) -> tuple[int, list[str]]:
     """Parse Dobot responses such as ``0,{1},RobotMode();``."""
     if not isinstance(response, str):
@@ -72,9 +81,7 @@ def raise_if_error(response: str, command_name: str) -> list[str]:
     error_id, values = parse_dobot_response(response)
     if error_id == 0:
         return values
-    raise RuntimeError(
-        f"{command_name} failed with ErrorID {error_id}: {response.strip()}"
-    )
+    raise DobotCommandError(error_id, command_name, response)
 
 
 @dataclass
@@ -226,29 +233,88 @@ class DHGripper:
     ) -> None:
         """Run the AG-95 full min/max calibration (0x0100 = 0xA5)."""
 
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("DH gripper recalibration cancelled")
         self.write_register(REG_INITIALIZE, INIT_TRIGGER)
         start = time.monotonic()
         deadline = start + timeout_s
-        initialization_seen = False
+        # Full-stroke calibration may take several seconds. Some firmware keeps
+        # the previous INIT_DONE feedback during that motion; the old 0.5 s
+        # fallback could issue open while calibration was still running.
+        self._wait_for_recalibration_ready(
+            not_before=start + 3.0, deadline=deadline, cancel_check=cancel_check,
+        )
+        print(f"DH gripper calibration feedback stable after {time.monotonic() - start:.2f}s.")
+
+        for attempt in range(1, 4):
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError("DH gripper recalibration cancelled")
+            try:
+                self.set_force(self.force)
+                if open_after:
+                    # Let the end-tool Modbus proxy finish the preceding write.
+                    time.sleep(0.1)
+                    if cancel_check is not None and cancel_check():
+                        raise RuntimeError("DH gripper recalibration cancelled")
+                    self.open(wait=True, cancel_check=cancel_check)
+                    time.sleep(0.1)
+                    init_state = self.read_init_state()
+                    time.sleep(0.03)
+                    grip_state = self.read_grip_state()
+                    time.sleep(0.03)
+                    position = self.read_position_raw()
+                    if (init_state != INIT_DONE or grip_state != GRIP_REACHED
+                            or not DH_POS_OPEN - 10 <= position <= DH_POS_OPEN):
+                        raise RuntimeError(
+                            "DH gripper full-open after recalibration not confirmed: "
+                            f"init_state={init_state}, grip_state={grip_state}, position_raw={position}"
+                        )
+                    print("DH gripper full-open confirmed after recalibration: "
+                          f"init_state={init_state}, grip_state={grip_state}, position_raw={position}")
+                return
+            except DobotCommandError as exc:
+                # Only repeat idempotent post-calibration force/open writes.
+                # Never restart calibration or mask persistent/other errors.
+                if (exc.error_id != -1 or attempt == 3 or exc.command_name not in
+                        ("SetHoldRegs(0x0101)", "SetHoldRegs(0x0103)")):
+                    raise
+                print(f"DH gripper post-calibration write rejected: {exc}; "
+                      f"waiting for stable feedback before retry {attempt + 1}/3.")
+                self._wait_for_recalibration_ready(
+                    not_before=time.monotonic() + 0.2,
+                    deadline=deadline, cancel_check=cancel_check,
+                )
+
+    def _wait_for_recalibration_ready(
+        self, *, not_before: float, deadline: float,
+        cancel_check: Callable[[], bool] | None,
+    ) -> None:
+        stable_since = None
+        stable_position = None
+        last_feedback = None
         while time.monotonic() < deadline:
             if cancel_check is not None and cancel_check():
                 raise RuntimeError("DH gripper recalibration cancelled")
-            state = self.read_init_state()
-            if state != INIT_DONE:
-                initialization_seen = True
-            if state == INIT_DONE and (
-                initialization_seen or time.monotonic() - start >= 0.5
-            ):
-                break
+            init_state = self.read_init_state()
+            time.sleep(0.03)
+            grip_state = self.read_grip_state()
+            time.sleep(0.03)
+            position = self.read_position_raw()
+            now = time.monotonic()
+            last_feedback = (init_state, grip_state, position)
+            ready = (now >= not_before and init_state == INIT_DONE
+                     and grip_state == GRIP_REACHED and 0 <= position <= DH_POS_OPEN)
+            if not ready:
+                stable_since = stable_position = None
+            elif stable_position is None or abs(position - stable_position) > 2:
+                stable_since, stable_position = now, position
+            elif now - stable_since >= 0.3 and now < deadline:
+                return
             time.sleep(0.1)
-        else:
-            raise TimeoutError(
-                f"DH gripper recalibration timed out after {timeout_s:.1f}s."
-            )
-
-        self.set_force(self.force)
-        if open_after:
-            self.open(wait=True, cancel_check=cancel_check)
+        raise TimeoutError(
+            "DH gripper recalibration timed out waiting for stable initialization/idle feedback; "
+            f"last_feedback(init_state, grip_state, position_raw)={last_feedback}"
+        )
 
     def wait_until_stopped(
         self,

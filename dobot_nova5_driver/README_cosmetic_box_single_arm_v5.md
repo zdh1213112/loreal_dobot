@@ -37,6 +37,22 @@ V5 launch 支持 `alarm_light_enabled:=true/false`，默认 `false`。
 启用时可设置 `alarm_light_port:=/dev/ttyUSB0`；详细灯色、蜂鸣器、
 状态判定和静音操作见 [V5 状态灯说明](README_status_light_v5.md)。
 
+## 启动夹爪标定（V4 / V5）
+
+V4、V5 的 101 控制程序每次启动都会先执行 AG-95 完整行程标定，
+与界面“夹爪重新标定（会运动）”按钮使用同一标定方法。即使夹爪保留了
+上次的初始化状态，也会重新标定最小/最大行程，并在完成后张开夹爪。
+启动前请保持夹爪空载、手指行程内无障碍；界面及自动循环均在标定完成后才启动。
+标定等待上限为 `max(15 秒, dh_timeout_s)`；标定或随后张开确认失败会中止启动。
+发送标定后至少等待 3 秒，再要求初始化完成、夹爪停止、位置连续稳定 0.3 秒；
+不会因读到上次的“已初始化”状态，在 0.5 秒后提前下发全开。
+标定后力值／全开写入若返回 `ErrorID -1`，重新确认稳定状态后最多重试两次，
+不重发标定命令；其他错误直接上报。全开后还会检查实际位置与到位状态，
+夹爪受阻不能被当作启动完成。
+原有启动命令无需增加参数，手动重新标定按钮继续保留。每轮抓取及回初始位不会重复标定。
+
+成功时日志显示 `[startup] AG-95 recalibration completed; gripper opened`。
+
 ## 流程
 
 转盘启用时按“侧面码 → 顶面码 → 底面码”执行：侧面未确认后，继续在
@@ -132,7 +148,7 @@ sudo "$(ros2 pkg prefix dobot_nova5_driver)/share/dobot_nova5_driver/scripts/gra
 - `handeye_flange_to_cam`：当前默认继承原节点矩阵。101 与 D405 `409122274792` 上机前必须确认或重新标定。
 - `command_tool_index=1`：放置点、用户坐标点动和视觉抓取都按 Tool 1 下发。
 - `user_index=0`：用户坐标为 User 0。
-- `auto_start=false`：默认只打开控制界面，不自动运动。可点击“执行完整一轮”或“开始连续循环”。
+- `auto_start=false`：启动时仍自动标定并张开夹爪；机械臂循环等待操作员点击“执行完整一轮”或“开始连续循环”。
 - `barcode_stable_hits=1`：HID 扫码器每次完整解码只输出一条数据，默认一条即成功。
 - `scanner_center_distance_m=0.120`：`transfer_joint` 处 TCP 夹持中心到扫码器的 User-X 距离。
 - `scanner_face_clearance_m=0.030`：自适应靠近后盒子侧面与扫码器之间保留的间隙。
