@@ -1,3 +1,4 @@
+import errno
 import socket
 import numpy as np
 import os
@@ -124,6 +125,7 @@ class DobotApi:
         self.port = port
         self.socket_dobot = 0
         self.__globalLock = threading.Lock()
+        self._close_lock = threading.Lock()
         if args:
             self.text_log = args[0]
 
@@ -176,15 +178,26 @@ class DobotApi:
             return data_str
 
     def close(self):
-        """
-        Close the port
-        """
-        if (self.socket_dobot != 0):
+        """Release this socket once, including failed-connect/destructor cleanup."""
+        # Separate from the command lock: close must not wait for a blocked recv.
+        with getattr(self, "_close_lock", threading.Lock()):
+            channel = getattr(self, "socket_dobot", 0)
+            self.socket_dobot = 0
+        if not channel:
+            return
+        try:
+            channel.shutdown(socket.SHUT_RDWR)
+        except OSError as error:
+            if error.errno not in (errno.EBADF, errno.ENOTCONN):
+                print(f"Error while closing socket: {error}")
+        finally:
+            # shutdown can fail for an unconnected/already-closed socket.
+            # close must still run so that failed Dashboard attempts do not leak.
             try:
-                self.socket_dobot.shutdown(socket.SHUT_RDWR)
-                self.socket_dobot.close()
-            except socket.error as e:
-                print(f"Error while closing socket: {e}")
+                channel.close()
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    print(f"Error while closing socket: {error}")
 
     def sendRecvMsg(self, string):
         """
