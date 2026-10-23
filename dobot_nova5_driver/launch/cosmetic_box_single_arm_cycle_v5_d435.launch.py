@@ -543,6 +543,11 @@ def generate_launch_description() -> LaunchDescription:
                 description="Maximum wait at safe hover for fresh D405 tracking (0 disables; max 2s)",
             ),
             DeclareLaunchArgument(
+                "pregrasp_tracking_recovery_grace_s",
+                default_value="1.0",
+                description="One extra safe-hover wait only for advancing, delayed D405 captures; total capped at 2s",
+            ),
+            DeclareLaunchArgument(
                 "side_barcode_direct_hover_clearance_m",
                 default_value="0.050",
                 description=(
@@ -1349,6 +1354,10 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "pregrasp_fresh_wait_timeout_s": ParameterValue(
                             LaunchConfiguration("pregrasp_fresh_wait_timeout_s"),
+                            value_type=float,
+                        ),
+                        "pregrasp_tracking_recovery_grace_s": ParameterValue(
+                            LaunchConfiguration("pregrasp_tracking_recovery_grace_s"),
                             value_type=float,
                         ),
                         "side_barcode_direct_hover_clearance_m": ParameterValue(

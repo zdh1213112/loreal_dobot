@@ -10,6 +10,52 @@ from queue import Empty, Full, Queue
 import numpy as np
 
 
+def latest_synchronized_frames(pipeline, *, max_poll=32):
+    """Drain available frames without mixing RGB/IR/depth or waiting again."""
+    frames = pipeline.wait_for_frames()
+    poll = getattr(pipeline, "poll_for_frames", None)
+    if poll is None:
+        return frames
+    for _ in range(max(0, min(64, int(max_poll)))):
+        candidate = poll()
+        if not candidate:
+            break
+        # A duplicate synchronized set must not replace a newer color capture.
+        try:
+            if (candidate.get_color_frame().get_frame_number()
+                    <= frames.get_color_frame().get_frame_number()):
+                continue
+        except AttributeError:
+            pass  # Older SDK builds still preserve poll delivery order.
+        frames = candidate
+    return frames
+
+
+def pregrasp_recovery_progress(
+    *, observations, baseline_capture_s, baseline_count, started_s,
+    base_deadline_s, now_monotonic, now_epoch, max_age_s, grace_s,
+):
+    """Permit extra WAITING only; this never makes a stale pose usable."""
+    eligible = []
+    for item in observations:
+        receive_age = now_monotonic - item.received_at_monotonic
+        capture_age = now_epoch - item.frame_time_s
+        if (item.count > baseline_count
+                and math.isfinite(item.frame_time_s)
+                and started_s <= item.received_at_monotonic < base_deadline_s
+                and item.frame_time_s > baseline_capture_s
+                and 0.0 <= receive_age <= 0.20
+                and max_age_s < capture_age <= max_age_s + min(1.0, grace_s)):
+            eligible.append(item)
+    if not eligible:
+        return None
+    latest = max(eligible, key=lambda item: item.frame_time_s)
+    return {
+        "capture_age_ms": round((now_epoch - latest.frame_time_s) * 1000.0, 1),
+        "receive_age_ms": round((now_monotonic - latest.received_at_monotonic) * 1000.0, 1),
+    }
+
+
 class DiagnosticWriter:
     """Bounded, non-blocking diagnostic sink; it never handles robot evidence.
 
@@ -93,6 +139,12 @@ class LocalizationTiming:
     def __init__(self, clock=time.perf_counter):
         self._clock = clock
         self.active = False
+        self.frame_started = None
+        self.last_slow_frame_at = float("-inf")
+
+    def begin_frame(self):
+        self.frame_started = self._clock()
+        self.frame_stages = {}
 
     def start(self):
         self.started = self._clock()
@@ -101,8 +153,26 @@ class LocalizationTiming:
         self.active = True
 
     def record(self, stage, started):
+        elapsed = max(0.0, self._clock() - started)
         if self.active:
-            self.stages[stage] += max(0.0, self._clock() - started)
+            self.stages[stage] += elapsed
+        if self.frame_started is not None:
+            # Geometry is recorded at initial publication and again at its end.
+            # Keep the final span, rather than counting it twice in frame timing.
+            self.frame_stages[stage] = elapsed
+
+    def slow_frame_report(self, *, capture_s, returned_s, now_epoch, limit_s=0.65):
+        now = self._clock()
+        if (self.frame_started is None or not math.isfinite(capture_s) or capture_s <= 0
+                or now_epoch - capture_s <= limit_s or now - self.last_slow_frame_at < 2.0):
+            return None
+        self.last_slow_frame_at = now
+        return {
+            "capture_age_ms": round((now_epoch - capture_s) * 1000.0, 1),
+            "age_at_camera_read_ms": round((returned_s - capture_s) * 1000.0, 1),
+            "loop_ms": round((now - self.frame_started) * 1000.0, 1),
+            "stage_ms": {key: round(value * 1000.0, 1) for key, value in self.frame_stages.items()},
+        }
 
     def finish(self, *, geometry_started):
         self.record("geometry", geometry_started)

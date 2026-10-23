@@ -55,6 +55,7 @@ from dobot_nova5_driver.d405_pipeline_performance import (
     DiagnosticWriter,
     LocalizationTiming,
     paint_depth_sorted_points,
+    latest_synchronized_frames,
 )
 from dobot_nova5_driver.top_surface_geometry_v3 import (
     fit_top_surface_axes,
@@ -1044,7 +1045,7 @@ def frame_capture_stamp(frames, host_return_s: float) -> tuple[float, str]:
             # replace the capture timestamp with wait_for_frames() return time;
             # that would reintroduce the robot-motion latency we are removing.
             mapped_s = device_timestamp_ms * 1e-3
-            if abs(mapped_s - float(host_return_s)) > 0.25:
+            if mapped_s - float(host_return_s) > 0.25:
                 raise ValueError("system-domain frame timestamp is too far from host time")
             camera_timestamp_source = "d405_system_time"
         else:
@@ -1053,9 +1054,9 @@ def frame_capture_stamp(frames, host_return_s: float) -> tuple[float, str]:
             mapped_s = device_timestamp_ms * 1e-3 + float(
                 np.median(np.asarray(camera_clock_offset_samples, dtype=np.float64))
             )
-            # A disconnected/restarted device can reset its clock.  Do not
-            # pass a wildly wrong stamp to the hand-eye transform in that case.
-            if abs(mapped_s - float(host_return_s)) > 0.25:
+            # Reject a future clock jump. Old captures keep their original age
+            # so the acquisition barrier/freshness check can reject them.
+            if mapped_s - float(host_return_s) > 0.25:
                 raise ValueError("mapped device timestamp is too far from host time")
             camera_timestamp_source = "d405_hardware_clock_mapped_to_host"
         if not camera_timestamp_logged:
@@ -1070,9 +1071,13 @@ def frame_capture_stamp(frames, host_return_s: float) -> tuple[float, str]:
             )
             camera_timestamp_logged = True
         return float(mapped_s), camera_timestamp_source
-    except (AttributeError, TypeError, ValueError, FloatingPointError):
-        camera_timestamp_source = "host_return"
-        return float(host_return_s), camera_timestamp_source
+    except (AttributeError, TypeError, ValueError, FloatingPointError) as exc:
+        # Invalid/unknown capture time cannot be relabelled as a new image.
+        # A zero stamp fails the existing acquisition barrier/freshness checks.
+        if camera_timestamp_source != "invalid_capture_time":
+            logging.warning("[camera] Invalid D405 capture time; pose publication blocked: %s", exc)
+        camera_timestamp_source = "invalid_capture_time"
+        return 0.0, camera_timestamp_source
 
 
 def host_seconds_to_ros_time(timestamp_s: float) -> RosTime:
@@ -2086,7 +2091,9 @@ if ENABLE_LOCAL_WINDOWS:
 try:
     while not quit_requested:
         loop_start = time.time()
+        localization_timing.begin_frame()
         detection_frames_for_loop = None
+        detection_frame_return_s = None
 
         # In V4 standby mode the camera keeps trying to acquire a target while
         # 101 is parked at startup.  This overlaps D405 inference with the
@@ -2164,7 +2171,8 @@ try:
                 )
             for _ in range(flush_frames):
                 pipeline.wait_for_frames()
-            detection_frames = pipeline.wait_for_frames()
+            detection_frames = latest_synchronized_frames(pipeline)
+            detection_frame_return_s = time.time()
             detection_frames_for_loop = detection_frames
             detection_color = np.asanyarray(detection_frames.get_color_frame().get_data())
             if SAVE_INITIAL_POSITION_FRAMES and not initial_position_frames_saved_for_startup:
@@ -2250,11 +2258,15 @@ try:
         # Use the exact capture that YOLO saw for the first FFS ranking and
         # SAM2 prompt. A moving turntable can shift the box substantially
         # between successive RealSense frames.
+        capture_started = time.perf_counter()
         frames = (
             detection_frames_for_loop
             if detection_frames_for_loop is not None
-            else pipeline.wait_for_frames()
+            else latest_synchronized_frames(pipeline)
         )
+        frame_return_s = detection_frame_return_s if detection_frame_return_s is not None else time.time()
+        if detection_frames_for_loop is None:
+            localization_timing.record("capture", capture_started)
         camera_frame_index += 1
         if localization_timing.active:
             localization_timing.frames += 1
@@ -2262,7 +2274,6 @@ try:
         # Dobot feedback history uses the controller's Unix-ms TimeStamp, so
         # both sides now refer to the same physical instant rather than the
         # later ROS callback/packet-arrival time.
-        frame_return_s = time.time()
         frame_stamp_s, _ = frame_capture_stamp(frames, frame_return_s)
         frame_stamp = host_seconds_to_ros_time(frame_stamp_s)
         color_bgr = np.asanyarray(frames.get_color_frame().get_data())
@@ -3904,6 +3915,12 @@ try:
             if local_key != 0xFF:
                 handle_key(local_key)
         localization_timing.record("preview", preview_started)
+        if locked_target_ready:
+            latency = localization_timing.slow_frame_report(
+                capture_s=frame_stamp_s, returned_s=frame_return_s, now_epoch=time.time(),
+            )
+            if latency is not None:
+                logging.warning("[D405 tracking latency] %s", json.dumps(latency))
 
 except KeyboardInterrupt:
     pass

@@ -67,6 +67,7 @@ def rig(request, monkeypatch):
     values = dict(
         pregrasp_pose_max_age_s=.65,
         pregrasp_fresh_wait_timeout_s=.6,
+        pregrasp_tracking_recovery_grace_s=1.0,
         pregrasp_min_hover_clearance_m=.02,
         d405_post_stop_samples=2,
         d405_post_stop_wait_timeout_s=.4,
@@ -450,3 +451,95 @@ def test_frame_arriving_after_hover_deadline_does_not_authorize_descent(rig):
     with pytest.raises(rig.mod.RecoverableGraspError, match='no fresh D405'):
         rig.node._wait_for_fresh_pregrasp_observations(0)
     assert rig.node.controller.mock_calls == []
+
+
+def progressing_frames(rig, *, eventually_fresh=False, duplicate=False,
+                       frame_age=.985, stop_after=None, first_delivery=100.4):
+    """Deliver distinct camera captures at 10 Hz, independently of wait polling."""
+    initial = rig.sample(frame_age=frame_age)
+    last = [100.0]
+
+    def deliver():
+        now = rig.clock.now
+        if now < first_delivery or now - last[0] < .099 or (stop_after is not None and now > stop_after):
+            return
+        last[0] = now
+        age = .1 if eventually_fresh and now >= 101.2 else frame_age
+        if duplicate:
+            age = rig.clock.time() - initial.frame_time_s
+        rig.sample(frame_age=age)
+
+    rig.clock.on_sleep = deliver
+
+
+def test_short_processing_stall_recovers_at_hover_without_restarting_or_using_old_pose(rig):
+    progressing_frames(rig, eventually_fresh=True)
+    observations, _ = rig.node._wait_for_fresh_pregrasp_observations(0)
+    assert 101.2 <= rig.clock.now < 101.4
+    assert all(rig.clock.time() - item.frame_time_s <= .65 for item in observations)
+    messages = [call.args[0] for call in rig.node._publish_status.call_args_list]
+    assert sum('extending safe-hover wait once' in text for text in messages) == 1
+    rig.node.trigger_publisher.publish.assert_not_called()
+    assert rig.node.controller.mock_calls == []
+
+
+def test_progressing_but_permanently_stale_frames_exhaust_one_fixed_grace(rig):
+    progressing_frames(rig)
+    with pytest.raises(rig.mod.RecoverableGraspError, match='no fresh D405'):
+        rig.node._wait_for_fresh_pregrasp_observations(0)
+    assert rig.clock.now == pytest.approx(101.6)
+    assert rig.node.controller.mock_calls == []
+
+
+@pytest.mark.parametrize('failure', ['duplicate_capture', 'ancient_capture', 'stream_stopped', 'pending_request'])
+def test_inactive_or_invalid_tracking_cannot_extend_hover_wait(rig, failure):
+    progressing_frames(
+        rig, duplicate=failure == 'duplicate_capture',
+        frame_age=2.6 if failure == 'ancient_capture' else .985,
+        # No arrivals for more than the 200 ms progress interval at the deadline.
+        first_delivery=100.2 if failure == 'stream_stopped' else 100.4,
+        stop_after=100.31 if failure == 'stream_stopped' else None,
+    )
+    if failure == 'pending_request':
+        rig.node._mark_d405_reacquisition()
+    with pytest.raises(rig.mod.RecoverableGraspError, match='no fresh D405'):
+        rig.node._wait_for_fresh_pregrasp_observations(0)
+    assert rig.clock.now == pytest.approx(100.6)
+    assert rig.node.controller.mock_calls == []
+
+
+def test_recovery_grace_can_be_disabled(rig):
+    rig.values['pregrasp_tracking_recovery_grace_s'] = 0.
+    progressing_frames(rig, eventually_fresh=True)
+    with pytest.raises(rig.mod.RecoverableGraspError):
+        rig.node._wait_for_fresh_pregrasp_observations(0)
+    assert rig.clock.now == pytest.approx(100.6)
+
+
+def test_recovery_wait_always_respects_two_second_total_cap(rig):
+    rig.values['pregrasp_tracking_recovery_grace_s'] = 2.
+    progressing_frames(rig)
+    with pytest.raises(rig.mod.RecoverableGraspError):
+        rig.node._wait_for_fresh_pregrasp_observations(0)
+    assert rig.clock.now == pytest.approx(102.)
+
+
+def test_stop_interrupts_the_extra_wait_immediately(rig):
+    progressing_frames(rig)
+
+    def check(_stage):
+        if rig.clock.now >= 100.8:
+            raise RuntimeError('safety Stop')
+
+    rig.node._require_cycle_active = check
+    with pytest.raises(RuntimeError, match='safety Stop'):
+        rig.node._wait_for_fresh_pregrasp_observations(0)
+    assert 100.8 <= rig.clock.now < 100.81
+    assert rig.node.controller.mock_calls == []
+
+
+@pytest.mark.parametrize('value', [-.1, float('nan'), float('inf'), 2.1])
+def test_invalid_recovery_grace_is_rejected(rig, value):
+    rig.values['pregrasp_tracking_recovery_grace_s'] = value
+    with pytest.raises(ValueError, match='pregrasp_tracking_recovery_grace_s'):
+        rig.node._wait_for_fresh_pregrasp_observations(0)

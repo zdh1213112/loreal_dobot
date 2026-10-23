@@ -60,7 +60,7 @@ except ImportError:
 from .offset_grasp_geometry_v3 import camera_rotation_at_target_tcp, plan_offset
 
 from .controller_v3 import DobotNova5Controller, TcpPose
-from .d405_pipeline_performance import post_stop_wait_diagnostics
+from .d405_pipeline_performance import post_stop_wait_diagnostics, pregrasp_recovery_progress
 from .alarm_light_display_v5 import AlarmLightDisplayMixin
 from .turntable_barcode_recheck import TurntableBarcodeRecheckMixin
 from .near_cube_motion_safety import (
@@ -617,6 +617,9 @@ class CosmeticBoxSingleArmNode(AlarmLightDisplayMixin, TurntableBarcodeRecheckMi
         self.declare_parameter("pregrasp_pose_max_age_s", 0.65)
         # 仅在安全悬停位缺少合格帧时等待；有新鲜帧立即继续，0 可关闭。
         self.declare_parameter("pregrasp_fresh_wait_timeout_s", 0.60)
+        # Extra waiting is allowed once only when capture timestamps advance.
+        # The 650 ms freshness check for actual descent is never relaxed.
+        self.declare_parameter("pregrasp_tracking_recovery_grace_s", 1.0)
         # 允许后台预抓取跟踪修正目标位置。目标帧在 move-above 期间
         # 异步累积；悬停时已有合格帧立即消费，缺帧时才有限等待。
         self.declare_parameter("pregrasp_use_live_pose_for_descent", True)
@@ -6476,21 +6479,56 @@ class CosmeticBoxSingleArmNode(AlarmLightDisplayMixin, TurntableBarcodeRecheckMi
         timeout_s = float(self.get_parameter("pregrasp_fresh_wait_timeout_s").value)
         if not math.isfinite(timeout_s) or not 0.0 <= timeout_s <= 2.0:
             raise ValueError("pregrasp_fresh_wait_timeout_s must be within [0, 2] seconds")
+        grace_s = float(self.get_parameter("pregrasp_tracking_recovery_grace_s").value)
+        if not math.isfinite(grace_s) or not 0.0 <= grace_s <= 2.0:
+            raise ValueError("pregrasp_tracking_recovery_grace_s must be within [0, 2] seconds")
         started = time.monotonic()
-        deadline = started + timeout_s
+        base_deadline = deadline = started + timeout_s
+        recovery_deadline = started + min(2.0, timeout_s + grace_s)
+        with self.data_lock:
+            baseline_capture = max(
+                (item.frame_time_s for item in self.pregrasp_observations
+                 if item.count > previous_count and math.isfinite(item.frame_time_s)),
+                default=0.0,
+            )
+        extended = False
         waiting = False
         last_error: Optional[RecoverableGraspError] = None
         while True:
             self._require_cycle_active("while validating D405 at safe hover")
             if last_error is not None and time.monotonic() >= deadline:
-                raise last_error
+                progress = None
+                if (not extended and timeout_s > 0.0 and grace_s > 0.0
+                        and time.monotonic() < recovery_deadline):
+                    with self.data_lock:
+                        candidates = list(self.pregrasp_observations)
+                    candidates = [item for item in candidates
+                                  if self._d405_frame_after_reacquire(item.frame_time_s)]
+                    progress = pregrasp_recovery_progress(
+                        observations=candidates, baseline_capture_s=baseline_capture,
+                        baseline_count=previous_count, started_s=started,
+                        base_deadline_s=base_deadline, now_monotonic=time.monotonic(),
+                        now_epoch=time.time(),
+                        max_age_s=max(0.05, float(self.get_parameter("pregrasp_pose_max_age_s").value)),
+                        grace_s=grace_s,
+                    )
+                if progress is None:
+                    raise last_error
+                extended = True
+                deadline = recovery_deadline
+                self._publish_status(
+                    "D405 tracking is updating but delayed; extending safe-hover wait once to "
+                    f"{deadline - started:.2f}s total "
+                    f"(capture_age={progress['capture_age_ms']:.0f}ms); "
+                    "descent still requires a fresh D405 pose"
+                )
             try:
                 result = self._fresh_pregrasp_observations(previous_count)
             except RecoverableGraspError as exc:
                 last_error = exc
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
-                    raise
+                    continue  # Apply the single bounded recovery decision above.
                 if not waiting:
                     self._publish_status(
                         "D405 tracking gap at safe hover; holding for up to "
